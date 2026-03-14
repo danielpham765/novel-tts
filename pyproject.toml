@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novel-tts"
+version = "0.1.0"
+description = "Generic Python CLI pipeline for crawling, translating, voicing, and rendering novels."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "gradio-client>=1.12.1",
+  "openai>=1.68.2",
+  "playwright>=1.54.0",
+  "PyYAML>=6.0.2",
+  "redis>=5.2.1",
+  "requests>=2.32.3",
+]
+
+[project.scripts]
+novel-tts = "novel_tts.cli.main:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+]
+
+[tool.uv]
+package = true
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["novel_tts*"]

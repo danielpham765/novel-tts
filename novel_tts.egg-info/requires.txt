@@ -1,0 +1,7 @@
+beautifulsoup4>=4.12.3
+gradio-client>=1.12.1
+openai>=1.68.2
+playwright>=1.54.0
+PyYAML>=6.0.2
+redis>=5.2.1
+requests>=2.32.3

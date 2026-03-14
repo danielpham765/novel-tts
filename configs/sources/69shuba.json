@@ -1,0 +1,26 @@
+{
+  "source_id": "69shuba",
+  "resolver_id": "69shuba",
+  "crawl": {
+    "site_id": "69shuba",
+    "chapter_batch_size": 10,
+    "chapter_regex": "^第(\\d+)章([^\\n]*)",
+    "preferred_fetch_mode": "browser-bootstrap-http",
+    "request_timeout_seconds": 120,
+    "content_wait_timeout_seconds": 45,
+    "delay_between_chapters_seconds": 0.6,
+    "max_fetch_retries": 4,
+    "retry_backoff_seconds": 20.0,
+    "rate_limit_cooldown_seconds": 11.0
+  },
+  "browser_debug": {
+    "mode": "debug-attach",
+    "remote_debugging_url": "http://127.0.0.1:9222",
+    "remote_debugging_port": 9222,
+    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "user_data_dir": "/Users/danielpham/sync-workspace/05_Stories/novel-tts/tmp/chrome-69shuba",
+    "profile_directory": "Default",
+    "headless": false,
+    "debug_image_dir": "debug/img"
+  }
+}

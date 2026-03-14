@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+input/
+output/
+tmp/
+debug/
+.logs/
+.secrets/
+image/

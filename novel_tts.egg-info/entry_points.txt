@@ -1,0 +1,2 @@
+[console_scripts]
+novel-tts = novel_tts.cli.main:main

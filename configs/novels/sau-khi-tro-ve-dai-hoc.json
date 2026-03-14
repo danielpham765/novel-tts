@@ -1,0 +1,48 @@
+{
+  "novel_id": "sau-khi-tro-ve-dai-hoc",
+  "title": "Sau Khi Tro Ve Dai Hoc",
+  "slug": "sau-khi-tro-ve-dai-hoc",
+  "source_language": "zh",
+  "target_language": "vi",
+  "source_id": "69shuba",
+  "storage": {
+    "input_dir": "input/sau-khi-tro-ve-dai-hoc",
+    "output_dir": "output/sau-khi-tro-ve-dai-hoc",
+    "image_dir": "image/sau-khi-tro-ve-dai-hoc",
+    "logs_dir": ".logs",
+    "tmp_dir": "tmp"
+  },
+  "crawl": {
+    "directory_url": "https://69shuba.tw/indexlist/85400/"
+  },
+  "translation": {
+    "provider": "gemini_http",
+    "model": "gemma-3-27b-it",
+    "chunk_max_len": 800,
+    "chunk_sleep_seconds": 0.1,
+    "repair_mode": true,
+    "chapter_regex": "^第(\\d+)章([^\\n]*)",
+    "line_token": "QZXBRQ",
+    "base_rules": "Ngươi là chuyên gia dịch tiểu thuyết mạng Trung Quốc sang tiếng Việt.\nYêu cầu bắt buộc:\n- Chỉ trả về đúng phần nội dung đã dịch. Không giải thích. Không ghi chú.\n- Dịch mượt, tự nhiên, nghe như văn truyện.\n- Dịch hết toàn bộ chữ Hán. Không để sót tiếng Trung.\n- Dịch toàn bộ tên riêng sang dạng Hán Việt/Việt hóa nhất quán theo glossary.\n- Ưu tiên xưng hô phù hợp văn truyện, tránh văn nói hiện đại nếu không cần.\n- Giữ nguyên thứ tự nội dung, không thêm bớt ý.\n- Phải giữ nguyên các token placeholder như ZXQ000QXZ và token xuống dòng QZXBRQ, không được sửa đổi.\n",
+    "glossary_file": "configs/glossaries/sau-khi-tro-ve-dai-hoc.json",
+    "post_replacements": {},
+    "han_fallback_replacements": {}
+  },
+  "captions": {
+    "provider": "gemini_http",
+    "model": "gemma-3-27b-it"
+  },
+  "queue": {},
+  "tts": {
+    "provider": "gradio_vie_tts",
+    "voice": "Tuyen"
+  },
+  "visual": {
+    "background_video": "background.mp4",
+    "tag_text": "Sau Khi Tro Ve Dai Hoc",
+    "line1": "Sau Khi Tro Ve Dai Hoc",
+    "line2": "Audio novel",
+    "line3": "69shuba.tw"
+  },
+  "video": {}
+}

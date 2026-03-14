@@ -1,0 +1,14 @@
+{
+  "macos": [
+    "vi",
+    "macos",
+    true,
+    false
+  ],
+  "cpu": [
+    "vi",
+    "cpu",
+    true,
+    false
+  ]
+}
