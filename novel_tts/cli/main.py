@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -11,9 +14,38 @@ from novel_tts.common.logging import (
     install_exception_logging,
 )
 from novel_tts.common.text import parse_range
-from novel_tts.config import load_novel_config
+from novel_tts.config import load_novel_config, NovelConfig
 
 LOGGER = get_logger(__name__)
+
+
+def get_translated_ranges(config: NovelConfig, search_start: int, search_end: int) -> list[tuple[int, int, str]]:
+    ranges = []
+    pattern = re.compile(r"^chuong_(\d+)-(\d+)\.txt$")
+    config_dir = config.storage.translated_dir
+    
+    if not config_dir.exists():
+        return [(search_start, search_end, f"chuong_{search_start}-{search_end}")]
+        
+    for file_path in config_dir.iterdir():
+        if not file_path.is_file():
+            continue
+        match = pattern.match(file_path.name)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2))
+            
+            overlap_start = max(start, search_start)
+            overlap_end = min(end, search_end)
+            
+            if overlap_start <= overlap_end:
+                ranges.append((overlap_start, overlap_end, f"chuong_{start}-{end}"))
+                
+    if not ranges:
+        return [(search_start, search_end, f"chuong_{search_start}-{search_end}")]
+        
+    ranges.sort(key=lambda x: x[0])
+    return ranges
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -322,7 +354,8 @@ def main(argv: list[str] | None = None) -> int:
 
             config = load_novel_config(args.novel_id)
             start, end = parse_range(args.range)
-            LOGGER.info("Merged audio: %s", run_tts(config, start, end))
+            for c_start, c_end, r_key in get_translated_ranges(config, start, end):
+                LOGGER.info("Merged audio: %s", run_tts(config, c_start, c_end, r_key))
             return 0
 
         if args.command == "visual":
@@ -330,9 +363,10 @@ def main(argv: list[str] | None = None) -> int:
 
             config = load_novel_config(args.novel_id)
             start, end = parse_range(args.range)
-            visual, thumbnail = generate_visual(config, start, end)
-            LOGGER.info("Visual video: %s", visual)
-            LOGGER.info("Thumbnail: %s", thumbnail)
+            for c_start, c_end, _ in get_translated_ranges(config, start, end):
+                visual, thumbnail = generate_visual(config, c_start, c_end)
+                LOGGER.info("Visual video: %s", visual)
+                LOGGER.info("Thumbnail: %s", thumbnail)
             return 0
 
         if args.command == "video":
@@ -340,7 +374,8 @@ def main(argv: list[str] | None = None) -> int:
 
             config = load_novel_config(args.novel_id)
             start, end = parse_range(args.range)
-            LOGGER.info("Video: %s", create_video(config, start, end))
+            for c_start, c_end, _ in get_translated_ranges(config, start, end):
+                LOGGER.info("Video: %s", create_video(config, c_start, c_end))
             return 0
 
         if args.command == "pipeline":
@@ -366,11 +401,14 @@ def main(argv: list[str] | None = None) -> int:
                 except FileNotFoundError:
                     LOGGER.warning("Caption source missing, skipping caption translation")
             if not args.skip_tts:
-                run_tts(config, start, end)
+                for c_start, c_end, r_key in get_translated_ranges(config, start, end):
+                    run_tts(config, c_start, c_end, r_key)
             if not args.skip_visual:
-                generate_visual(config, start, end)
+                for c_start, c_end, _ in get_translated_ranges(config, start, end):
+                    generate_visual(config, c_start, c_end)
             if not args.skip_video:
-                create_video(config, start, end)
+                for c_start, c_end, _ in get_translated_ranges(config, start, end):
+                    create_video(config, c_start, c_end)
             return 0
 
         parser.error("Unhandled command")

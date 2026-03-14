@@ -40,9 +40,11 @@ def _range_key(start: int, end: int) -> str:
     return f"chuong_{start}-{end}"
 
 
-def _translated_text_path(config: NovelConfig, start: int, end: int) -> Path:
-    key = _range_key(start, end)
-    direct = config.storage.translated_dir / f"{key}.txt"
+def _translated_text_path(config: NovelConfig, start: int, end: int, range_key: str | None = None) -> Path:
+    if range_key is None:
+        range_key = _range_key(start, end)
+        
+    direct = config.storage.translated_dir / f"{range_key}.txt"
     if direct.exists():
         return direct
     raise FileNotFoundError(f"Translated range file not found: {direct}")
@@ -70,11 +72,25 @@ def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[di
     return menu_path
 
 
-def run_tts(config: NovelConfig, start: int, end: int) -> Path:
-    source_path = _translated_text_path(config, start, end)
+def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = None) -> Path:
+    source_path = _translated_text_path(config, start, end, range_key)
     text = source_path.read_text(encoding="utf-8")
     chunks, chapter_info = split_text_into_chunks(text)
-    range_key = _range_key(start, end)
+    
+    # Filter chunks cleanly based on the slice we want
+    filtered_chunks = []
+    filtered_chapter_info = []
+    for chunk, info in zip(chunks, chapter_info):
+        if start <= info["number"] <= end:
+            filtered_chunks.append(chunk)
+            filtered_chapter_info.append(info)
+            
+    chunks = filtered_chunks
+    chapter_info = filtered_chapter_info
+    
+    if range_key is None:
+        range_key = _range_key(start, end)
+        
     output_dir = config.storage.audio_dir / range_key
     output_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info(

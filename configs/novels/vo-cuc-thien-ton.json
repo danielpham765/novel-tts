@@ -57,7 +57,7 @@
   },
   "tts": {
     "provider": "gradio_vie_tts",
-    "voice": "Tuyen",
+    "voice": "Ly",
     "server_name": "local",
     "model_name": "macos",
     "generation_mode": "Standard (Một lần)",
