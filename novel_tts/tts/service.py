@@ -134,16 +134,23 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
             output_path,
         )
         chapter_started_at = time.monotonic()
+        
+        # State for throttling logs
+        last_iterating_time = [0.0]
+
+        def _throttled_progress(message: str, cl=chapter_label, i=idx, t=len(chunks)):
+            if message == "ITERATING":
+                now = time.monotonic()
+                if now - last_iterating_time[0] >= 15.0:
+                    last_iterating_time[0] = now
+                    LOGGER.info("TTS chapter progress | %s index=%s/%s %s", cl, i + 1, t, message)
+            else:
+                LOGGER.info("TTS chapter progress | %s index=%s/%s %s", cl, i + 1, t, message)
+
         result = provider.synthesize(
             client,
             chunk,
-            progress_callback=lambda message, chapter_label=chapter_label, idx=idx, total=len(chunks): LOGGER.info(
-                "TTS chapter progress | %s index=%s/%s %s",
-                chapter_label,
-                idx + 1,
-                total,
-                message,
-            ),
+            progress_callback=_throttled_progress,
         )
         if isinstance(result, dict) and "path" in result:
             source_audio = Path(result["path"])

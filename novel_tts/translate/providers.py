@@ -5,8 +5,11 @@ import math
 import os
 import time
 import uuid
+import logging
 
 import requests
+
+LOGGER = logging.getLogger(__name__)
 
 
 class TranslationProvider:
@@ -186,6 +189,7 @@ class GeminiHttpProvider(TranslationProvider):
                         if retry_after and retry_after.isdigit()
                         else 30 + attempt * 15
                     )
+                    LOGGER.warning("Gemini API Rate Limit (429) hit. Attempt %d/12. Sleeping for %ds", attempt + 1, wait_seconds)
                     time.sleep(wait_seconds)
                     continue
                 response.raise_for_status()
@@ -204,7 +208,8 @@ class GeminiHttpProvider(TranslationProvider):
                 return text
             except PromptBlockedError:
                 raise
-            except Exception:
+            except Exception as e:
+                LOGGER.warning("Gemini API generation error (attempt %d/12): %s", attempt + 1, e)
                 if attempt == 11:
                     raise
                 time.sleep(5 + attempt * 5)

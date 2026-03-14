@@ -162,6 +162,15 @@ def normalize_text(text: str, chapter_num: str) -> str:
     text = re.sub(r'([.!?…])"([A-ZÀ-Ỵ])', r'\1"\n\n\2', text)
     text = re.sub(r'([.!?…])”([“"])', r'\1”\n\n\2', text)
     text = re.sub(r'([.!?…])"([“"])', r'\1"\n\n\2', text)
+
+    # Remove duplicated proper nouns and multi-word phrases (e.g., "Phong Vân bảng Phong Vân bảng")
+    duplicate_pattern = r'\b([A-ZÀ-ỴĐ][a-zà-ỹđA-ZÀ-ỴĐ]*(?:[ \t]+[a-zà-ỹđA-ZÀ-ỴĐ]+){1,5})\s+\1\b'
+    while True:
+        cleaned = re.sub(duplicate_pattern, r'\1', text)
+        if cleaned == text:
+            break
+        text = cleaned
+
     text = re.sub(r"(?m)^[ \t]+", "", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"([.!?…,:;])([A-Za-zÀ-ỹ“\"'])", r"\1 \2", text)

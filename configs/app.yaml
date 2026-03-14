@@ -25,7 +25,7 @@ queue:
       rpd_limit: 14400
       chunk_max_len: 900
     gemini-3.1-flash-lite-preview:
-      worker_count: 3
+      worker_count: 2
       rpm_limit: 15
       tpm_limit: 250000
       rpd_limit: 500

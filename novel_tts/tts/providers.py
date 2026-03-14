@@ -138,7 +138,7 @@ class GradioTtsProvider:
         while not job.done():
             self._drain_job_updates(job, progress_callback)
             now = time.monotonic()
-            if (now - last_heartbeat) >= 30:
+            if (now - last_heartbeat) >= 60:
                 status = job.status()
                 code = getattr(getattr(status, "code", None), "value", None) or str(getattr(status, "code", "unknown"))
                 if progress_callback is not None:

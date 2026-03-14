@@ -82,6 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
     translate_polish_parser = translate_sub.add_parser("polish")
     translate_polish_parser.add_argument("novel_id")
     translate_polish_parser.add_argument("--file", action="append", default=[])
+    translate_polish_parser.add_argument("--range", help="Optional range of chapters, e.g. 101-500")
 
     translate_captions_parser = translate_sub.add_parser("captions")
     translate_captions_parser.add_argument("novel_id")
@@ -286,7 +287,15 @@ def main(argv: list[str] | None = None) -> int:
                     LOGGER.info("Rebuilt file: %s", rebuilt)
                 return 0
             if args.translate_command == "polish":
-                changed_parts, rebuilt_files = polish_translations(config, filenames=args.file or None)
+                filenames = args.file or []
+                if getattr(args, "range", None):
+                    start, end = parse_range(args.range)
+                    for _, _, r_key in get_translated_ranges(config, start, end):
+                        fname = f"{r_key}.txt"
+                        if fname not in filenames:
+                            filenames.append(fname)
+                
+                changed_parts, rebuilt_files = polish_translations(config, filenames=filenames or None)
                 LOGGER.info("Polished translations | changed_parts=%s rebuilt_files=%s", changed_parts, rebuilt_files)
                 return 0
             if args.translate_command == "captions":
