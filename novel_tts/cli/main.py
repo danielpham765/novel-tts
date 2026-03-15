@@ -191,6 +191,28 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run.add_argument("--skip-visual", action="store_true")
     pipeline_run.add_argument("--skip-video", action="store_true")
 
+    ai_key_parser = subparsers.add_parser("ai-key")
+    ai_key_sub = ai_key_parser.add_subparsers(dest="ai_key_command", required=True)
+    ai_key_ps = ai_key_sub.add_parser("ps")
+    ai_key_ps.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Watch mode (refresh every 1s). Ctrl+C to stop.",
+    )
+    ai_key_ps.add_argument(
+        "--filter",
+        action="append",
+        default=[],
+        help="Filter keys by kN/N/last4. Repeatable or comma-separated (e.g. --filter k1,k2 --filter 3).",
+    )
+    ai_key_ps.add_argument(
+        "--filter-raw",
+        action="append",
+        default=[],
+        help="Filter by raw API key(s) (exact match). Repeatable or comma-separated. Raw keys are never printed.",
+    )
+
     return parser
 
 
@@ -507,6 +529,36 @@ def main(argv: list[str] | None = None) -> int:
                 for c_start, c_end, _ in get_translated_ranges(config, start, end):
                     create_video(config, c_start, c_end)
             return 0
+
+        if args.command == "ai-key":
+            from novel_tts.ai_key import ai_key_ps
+
+            if args.ai_key_command != "ps":
+                parser.error("ai-key: unsupported subcommand")
+            if getattr(args, "follow", False):
+                sys.stdout.write("\033[?1049h\033[?25l")
+                sys.stdout.flush()
+                try:
+                    while True:
+                        buf = io.StringIO()
+                        buf.write(
+                            f"watch: ai-key ps | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (refresh 1s, Ctrl+C to stop)\n\n"
+                        )
+                        with contextlib.redirect_stdout(buf):
+                            rc = ai_key_ps(filters=args.filter or [], filters_raw=getattr(args, "filter_raw", []) or [])
+                        if rc != 0:
+                            return rc
+                        frame = buf.getvalue()
+                        sys.stdout.write("\033[H\033[J")
+                        sys.stdout.write(frame)
+                        sys.stdout.flush()
+                        time.sleep(1.0)
+                except KeyboardInterrupt:
+                    return 0
+                finally:
+                    sys.stdout.write("\033[?25h\033[?1049l")
+                    sys.stdout.flush()
+            return ai_key_ps(filters=args.filter or [], filters_raw=getattr(args, "filter_raw", []) or [])
 
         parser.error("Unhandled command")
         return 2

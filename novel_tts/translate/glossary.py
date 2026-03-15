@@ -100,6 +100,7 @@ SUSPICIOUS_TARGET_FRAGMENTS = {
     "quý khách hàng",
 }
 
+PLACEHOLDER_LIKE_TARGET_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}Q(?:XZ)?")
 PROPER_NOUN_SUFFIXES = {
     "大学",
     "大學",
@@ -202,7 +203,8 @@ def _looks_like_long_term_proper_noun(source: str, target: str) -> bool:
 def _is_suspicious_target(target: str) -> bool:
     lowered = target.lower()
     # Drop placeholder-like tokens that indicate glossary corruption (e.g. "ZXQ1156QXZ").
-    if re.search(r"(?:ZXQ|QZX)\d{1,6}QXZ", target):
+    # Also drop partially-mangled variants like "ZXQ731QTrường ..." (missing trailing "XZ").
+    if PLACEHOLDER_LIKE_TARGET_RE.search(target):
         return True
     if "?" in target:
         return True

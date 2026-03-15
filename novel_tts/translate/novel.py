@@ -17,6 +17,7 @@ LOGGER = get_logger(__name__)
 HAN_REGEX = re.compile(r"[\u4e00-\u9fff]")
 JSON_BLOCK_REGEX = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 PLACEHOLDER_TOKEN_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}QXZ")
+PLACEHOLDER_LIKE_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}Q(?:XZ)?")
 GLOSSARY_STATUS_PENDING = "pending"
 GLOSSARY_STATUS_DONE = "done"
 
@@ -26,9 +27,9 @@ def make_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[st
     for idx, key in enumerate(sorted(glossary, key=len, reverse=True)):
         token = f"ZXQ{idx:03d}QXZ"
         value = glossary.get(key, "")
-        # Guard against glossary corruption where the "translation" is itself a placeholder token.
-        # In that case we skip placeholdering so the model can translate from the original term instead.
-        if isinstance(value, str) and PLACEHOLDER_TOKEN_RE.fullmatch(value):
+        # Guard against glossary corruption where the "translation" contains placeholder tokens (e.g. "ZXQ1156QXZ"
+        # or "Biến cố ZXQ125QXZ"). In that case we skip placeholdering so the model can translate from the original term.
+        if isinstance(value, str) and PLACEHOLDER_LIKE_RE.search(value):
             continue
         if key in text:
             text = text.replace(key, token)
@@ -397,6 +398,11 @@ def _merge_glossary_file(config: NovelConfig, updates: dict[str, str]) -> tuple[
             changed = True
             added += 1
         if changed:
+            # Never persist placeholder tokens in glossary values. These tokens are internal translation placeholders
+            # and will poison future translations if they survive into the glossary file.
+            merged = {
+                key: value for key, value in merged.items() if isinstance(value, str) and (not PLACEHOLDER_LIKE_RE.search(value))
+            }
             ordered = {key: merged[key] for key in sorted(merged)}
             path.write_text(json.dumps(ordered, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             merged = ordered
@@ -938,6 +944,11 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
     part_path.parent.mkdir(parents=True, exist_ok=True)
     source_text = chapter_map[chapter_num]
     unit_key = f"{source_path.name}__{chapter_num}"
+
+    # Force runs should not resume stale progress snapshots. Glossary changes can shift placeholder tokens and
+    # leave orphan ZXQ...QXZ tokens in the merged output if we resume old chunks.
+    if force:
+        clear_progress(config, unit_key)
 
     needs_translate = force or (not part_path.exists()) or part_path.stat().st_mtime < source_path.stat().st_mtime
     if needs_translate:

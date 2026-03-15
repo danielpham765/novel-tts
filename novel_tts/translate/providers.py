@@ -207,9 +207,111 @@ def _acquire_gemini_rate_slot(model: str, estimated_tokens: int) -> None:
         except redis.exceptions.WatchError:
             time.sleep(0.01)
             continue
+        except RateLimitExceededError:
+            raise
         except Exception as e:
             LOGGER.warning("Redis error in rate limit tracking: %s", e)
             return
+
+
+def _record_gemini_api_attempt(model: str) -> None:
+    """
+    Record a single HTTP attempt to the Gemini API in a 60s rolling window.
+
+    This is used by `novel-tts ai-key ps` to report "api call count" (including retries).
+
+    Key shape (when running in queue worker mode):
+      {GEMINI_RATE_LIMIT_KEY_PREFIX}:{model}:api:reqs
+
+    If Redis isn't configured via GEMINI_REDIS_* or if the key prefix is missing, this is a no-op.
+    """
+
+    key_prefix = os.environ.get("GEMINI_RATE_LIMIT_KEY_PREFIX", "").strip()
+    key = f"{key_prefix}:{model}" if key_prefix else os.environ.get("GEMINI_RATE_LIMIT_KEY", "").strip()
+    if not key:
+        return
+
+    client = _get_rate_limit_client()
+    if client is None:
+        return
+
+    now = time.time()
+    window_start = now - 60.0
+    api_key = f"{key}:api:reqs"
+    member = f"{now:.6f}:{os.getpid()}:{uuid.uuid4().hex}"
+    try:
+        with client.pipeline() as pipe:
+            pipe.zremrangebyscore(api_key, 0, window_start)
+            pipe.zadd(api_key, {member: now})
+            pipe.expire(api_key, 120)
+            pipe.execute()
+    except Exception as exc:
+        # Never fail the translation call due to stats tracking.
+        LOGGER.debug("Failed to record Gemini api attempt: %s", exc)
+
+
+def _record_gemini_429_attempt(model: str) -> None:
+    """
+    Record a single HTTP 429 response from the Gemini API in a 60s rolling window.
+
+    Key shape:
+      {GEMINI_RATE_LIMIT_KEY_PREFIX}:{model}:api:429
+      OR {GEMINI_RATE_LIMIT_KEY}:api:429
+    """
+
+    key_prefix = os.environ.get("GEMINI_RATE_LIMIT_KEY_PREFIX", "").strip()
+    key = f"{key_prefix}:{model}" if key_prefix else os.environ.get("GEMINI_RATE_LIMIT_KEY", "").strip()
+    if not key:
+        return
+
+    client = _get_rate_limit_client()
+    if client is None:
+        return
+
+    now = time.time()
+    window_start = now - 60.0
+    stat_key = f"{key}:api:429"
+    member = f"{now:.6f}:{os.getpid()}:{uuid.uuid4().hex}"
+    try:
+        with client.pipeline() as pipe:
+            pipe.zremrangebyscore(stat_key, 0, window_start)
+            pipe.zadd(stat_key, {member: now})
+            pipe.expire(stat_key, 120)
+            pipe.execute()
+    except Exception as exc:
+        LOGGER.debug("Failed to record Gemini 429 attempt: %s", exc)
+
+
+def _record_gemini_llm_call(model: str) -> None:
+    """
+    Record a single logical LLM call (one generate() invocation) in a 60s rolling window.
+
+    Key shape:
+      {GEMINI_RATE_LIMIT_KEY_PREFIX}:{model}:llm:reqs
+      OR {GEMINI_RATE_LIMIT_KEY}:llm:reqs
+    """
+
+    key_prefix = os.environ.get("GEMINI_RATE_LIMIT_KEY_PREFIX", "").strip()
+    key = f"{key_prefix}:{model}" if key_prefix else os.environ.get("GEMINI_RATE_LIMIT_KEY", "").strip()
+    if not key:
+        return
+
+    client = _get_rate_limit_client()
+    if client is None:
+        return
+
+    now = time.time()
+    window_start = now - 60.0
+    llm_key = f"{key}:llm:reqs"
+    member = f"{now:.6f}:{os.getpid()}:{uuid.uuid4().hex}"
+    try:
+        with client.pipeline() as pipe:
+            pipe.zremrangebyscore(llm_key, 0, window_start)
+            pipe.zadd(llm_key, {member: now})
+            pipe.expire(llm_key, 120)
+            pipe.execute()
+    except Exception as exc:
+        LOGGER.debug("Failed to record Gemini llm call: %s", exc)
 
 
 class GeminiHttpProvider(TranslationProvider):
@@ -222,6 +324,7 @@ class GeminiHttpProvider(TranslationProvider):
             "contents": [{"parts": [{"text": f"{system_prompt}\n\n{prompt}".strip()}]}],
             "generationConfig": {"temperature": 0.2, "topP": 0.9},
         }
+        _record_gemini_llm_call(model)
         _acquire_gemini_rate_slot(model, _estimate_gemini_tokens(prompt, system_prompt))
         max_429_attempts_raw = os.environ.get("NOVEL_TTS_RATE_LIMIT_MAX_ATTEMPTS", "").strip()
         try:
@@ -234,6 +337,7 @@ class GeminiHttpProvider(TranslationProvider):
         generic_attempt = 0
         while True:
             try:
+                _record_gemini_api_attempt(model)
                 response = requests.post(
                     url,
                     params={"key": api_key},
@@ -242,6 +346,7 @@ class GeminiHttpProvider(TranslationProvider):
                     timeout=90,
                 )
                 if response.status_code == 429:
+                    _record_gemini_429_attempt(model)
                     rate_attempt += 1
                     # Parse Google's recommended retry delay as base
                     import random, re
