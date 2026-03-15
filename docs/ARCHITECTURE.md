@@ -383,6 +383,7 @@ Supported providers:
 - source-vs-translation repair pass
 - aggressive segmentation repair
 - final forced stripping for small remaining Han residue
+- a final placeholder restoration + hard fail if any `ZXQ...QXZ`/`QZX...QXZ` survive (to avoid writing poisoned `.parts`)
 
 This is not a pure “translate once” pipeline. It is a multi-pass cleanup pipeline optimized for noisy long-form outputs.
 
@@ -472,11 +473,11 @@ That keeps worker logic simple and reuses the regular CLI path.
 
 - 1 supervisor
 - 1 status monitor
-- N workers per key, one per configured model
+- N workers per key/model, based on config
 
-By default the worker count is:
+Worker count is derived from:
 
-- `number_of_keys * len(worker_models)`
+- `len(.secrets/gemini-keys.txt) * sum(queue.model_configs[model].worker_count for model in queue.enabled_models)`
 
 ### Operational caveats
 
@@ -484,6 +485,7 @@ By default the worker count is:
 - worker success is determined by subprocess exit code
 - the launch helper currently discards child stdout/stderr to `/dev/null`, while subsystem logs go through normal logger wiring when those processes run
 - process restart uses `pkill -f`, so command naming consistency matters
+- the supervisor reconciles worker processes against the current keys/models config (spawns missing workers; stops out-of-range key indices and excess workers if worker_count is reduced)
 
 ## TTS Subsystem
 

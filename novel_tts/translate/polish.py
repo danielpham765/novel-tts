@@ -149,7 +149,6 @@ def _merge_broken_paragraphs(lines: list[str]) -> list[str]:
 
 def normalize_text(text: str, chapter_num: str) -> str:
     text = text.replace("QZXBRQ", "\n\n")
-    text = re.sub(r"\bZXQ\d{3}QXZ\b", "", text)
     text = _normalize_heading(text, chapter_num)
     for src, dst in POLISH_REPLACEMENTS.items():
         text = text.replace(src, dst)

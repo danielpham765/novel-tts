@@ -1,3 +1,36 @@
+models:
+  provider: gemini_http
+  enabled_models:
+    - gemma-3-27b-it
+    - gemini-3.1-flash-lite-preview
+  repair_model: gemma-3-27b-it
+  model_configs:
+    gemma-3-27b-it:
+      worker_count: 3
+      rpm_limit: 30
+      tpm_limit: 15000
+      rpd_limit: 14400
+      chunk_max_len: 800
+    gemini-3.1-flash-lite-preview:
+      worker_count: 1
+      rpm_limit: 15
+      tpm_limit: 250000
+      rpd_limit: 500
+      repair_model: gemma-3-27b-it
+      chunk_max_len: 5000
+    gemma-3-12b-it:
+      worker_count: 5
+      rpm_limit: 30
+      tpm_limit: 15000
+      rpd_limit: 14400
+      chunk_max_len: 900
+    gemini-2.5-flash-lite:
+      worker_count: 2
+      rpm_limit: 10
+      tpm_limit: 250000
+      rpd_limit: 20
+      chunk_max_len: 2000
+
 queue:
   redis:
     host: 127.0.0.1
@@ -8,32 +41,3 @@ queue:
   inflight_ttl_seconds: 3600
   supervisor_interval_seconds: 15
   status_interval_seconds: 60
-  enabled_models:
-    - gemma-3-27b-it
-    - gemini-3.1-flash-lite-preview
-  model_configs:
-    gemma-3-27b-it:
-      worker_count: 3
-      rpm_limit: 30
-      tpm_limit: 15000
-      rpd_limit: 14400
-      chunk_max_len: 800
-    gemma-3-12b-it:
-      worker_count: 5
-      rpm_limit: 30
-      tpm_limit: 15000
-      rpd_limit: 14400
-      chunk_max_len: 900
-    gemini-3.1-flash-lite-preview:
-      worker_count: 2
-      rpm_limit: 15
-      tpm_limit: 250000
-      rpd_limit: 500
-      repair_model: gemma-3-27b-it
-      chunk_max_len: 5000
-    gemini-2.5-flash-lite:
-      worker_count: 2
-      rpm_limit: 10
-      tpm_limit: 250000
-      rpd_limit: 20
-      chunk_max_len: 2000

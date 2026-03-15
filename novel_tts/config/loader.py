@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from .models import (
     VisualConfig,
 )
 from novel_tts.translate.glossary import sanitize_glossary_entries
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _root_dir() -> Path:
@@ -114,6 +117,43 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         raise FileNotFoundError(f"Novel config not found: {path}")
     raw = json.loads(path.read_text(encoding="utf-8"))
     app_raw = _load_app_config()
+    models_raw = _deep_merge(app_raw.get("models", {}), raw.get("models", {}))
+    # New schema (preferred):
+    # - translation: common settings shared by chapter + captions (provider, glossary_file, line_token, replacements, etc.)
+    # - translation.chapter: settings specific to translate chapter (chapter_regex, base_rules, etc.)
+    # - translation.captions: settings specific to translate captions (input_file, output_file, etc.)
+    #
+    # Legacy schema support:
+    # - root.chapter (renamed from earlier refactor) or root.translation containing chapter fields.
+    # - root.captions containing captions fields.
+    app_translation_root = app_raw.get("translation", {})
+    if app_translation_root is None:
+        app_translation_root = {}
+    if not isinstance(app_translation_root, dict):
+        raise ValueError('Invalid app config "translation" (expected object)')
+
+    novel_translation_root = raw.get("translation")
+    if novel_translation_root is None:
+        legacy = raw.get("chapter") if isinstance(raw.get("chapter"), dict) else raw.get("translation")
+        if isinstance(legacy, dict):
+            novel_translation_root = {"chapter": legacy, "captions": raw.get("captions", {})}
+            LOGGER.warning('Using legacy config keys; please migrate to translation.chapter/translation.captions | novel=%s', novel_id)
+        else:
+            raise KeyError('Missing translation config (expected "translation")')
+    if not isinstance(novel_translation_root, dict):
+        raise ValueError('Invalid novel "translation" config (expected object)')
+
+    translation_root = _deep_merge(app_translation_root, novel_translation_root)
+    chapter_section = translation_root.get("chapter", {})
+    if chapter_section is None:
+        chapter_section = {}
+    if not isinstance(chapter_section, dict):
+        raise ValueError('Invalid translation.chapter config (expected object)')
+    captions_section = translation_root.get("captions", {})
+    if captions_section is None:
+        captions_section = {}
+    if not isinstance(captions_section, dict):
+        raise ValueError('Invalid translation.captions config (expected object)')
     source_id = raw["source_id"]
     source_path = _source_config_path(source_id)
     if not source_path.exists():
@@ -136,6 +176,25 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     merged_crawl_raw = _deep_merge(source_raw["crawl"], raw.get("crawl", {}))
     merged_browser_debug_raw = _deep_merge(source_raw.get("browser_debug", {}), raw.get("browser_debug", {}))
     merged_queue_raw = _deep_merge(app_raw.get("queue", {}), raw.get("queue", {}))
+    # Model pool settings are shared across queue and direct translate, so we support a top-level
+    # "models" section in configs/app.yaml and per-novel overrides in configs/novels/*.json.
+    # Keep backward compatibility with legacy queue.enabled_models / queue.model_configs.
+    if "enabled_models" not in merged_queue_raw and isinstance(models_raw.get("enabled_models"), list):
+        merged_queue_raw["enabled_models"] = models_raw["enabled_models"]
+    elif "enabled_models" in merged_queue_raw and isinstance(models_raw.get("enabled_models"), list):
+        if merged_queue_raw["enabled_models"] != models_raw["enabled_models"]:
+            LOGGER.warning(
+                "Conflicting enabled_models in queue vs models; using queue.enabled_models | novel=%s",
+                novel_id,
+            )
+    if "model_configs" not in merged_queue_raw and isinstance(models_raw.get("model_configs"), dict):
+        merged_queue_raw["model_configs"] = models_raw["model_configs"]
+    elif "model_configs" in merged_queue_raw and isinstance(models_raw.get("model_configs"), dict):
+        if merged_queue_raw["model_configs"] != models_raw["model_configs"]:
+            LOGGER.warning(
+                "Conflicting model_configs in queue vs models; using queue.model_configs | novel=%s",
+                novel_id,
+            )
     merged_queue_raw = _normalize_queue_config(merged_queue_raw)
     if "redis" not in merged_queue_raw:
         merged_queue_raw["redis"] = {}
@@ -148,7 +207,63 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     for key, value in legacy_redis.items():
         if value is not None and key not in merged_queue_raw["redis"]:
             merged_queue_raw["redis"][key] = value
-    translation_raw = dict(raw["translation"])
+    # Build TranslationConfig from translation(common) + translation.chapter(specific).
+    translation_common_raw = {key: value for key, value in translation_root.items() if key not in {"chapter", "captions"}}
+    translation_raw = _deep_merge(translation_common_raw, chapter_section)
+    # Backward/forward compatible translation model key.
+    # Default comes from the shared model pool: models.enabled_models[0].
+    # Keep supporting historical nested keys in translation config.
+    model_aliases = [
+        (
+            "models.enabled_models[0]",
+            (models_raw.get("enabled_models") or [None])[0]
+            if isinstance(models_raw.get("enabled_models"), list)
+            else None,
+        ),
+        ("translation.model", translation_root.get("model")),
+        ("translation.translate_model", translation_root.get("translate_model")),
+        ("translation.translation_model", translation_root.get("translation_model")),
+        ("translation.chapter.model", chapter_section.get("model")),
+    ]
+    model_values = [(k, v) for k, v in model_aliases if isinstance(v, str) and v.strip()]
+    if not model_values:
+        raise KeyError(
+            'Missing translation model (expected one of: "models.enabled_models[0]", "translation.model")'
+        )
+    preferred_key, preferred_value = model_values[0]
+    default_caption_model = preferred_value
+    for other_key, other_value in model_values[1:]:
+        if other_value != preferred_value:
+            LOGGER.warning(
+                'Conflicting translation model keys: %s="%s" vs %s="%s" (using %s)',
+                preferred_key,
+                preferred_value,
+                other_key,
+                other_value,
+                preferred_key,
+            )
+            break
+    translation_raw["model"] = preferred_value
+    translation_raw.pop("translation_model", None)
+    translation_raw.pop("translate_model", None)
+    if "provider" not in translation_raw or not str(translation_raw.get("provider", "")).strip():
+        translation_raw["provider"] = str(models_raw.get("provider", "")).strip() or "gemini_http"
+
+    model_pool_cfg = models_raw.get("model_configs", {}) if isinstance(models_raw.get("model_configs"), dict) else {}
+    resolved_model_cfg = model_pool_cfg.get(translation_raw["model"], {}) if isinstance(model_pool_cfg, dict) else {}
+    if isinstance(resolved_model_cfg, dict):
+        if ("chunk_max_len" not in translation_raw) or int(translation_raw.get("chunk_max_len") or 0) <= 0:
+            if "chunk_max_len" in resolved_model_cfg and int(resolved_model_cfg.get("chunk_max_len") or 0) > 0:
+                translation_raw["chunk_max_len"] = int(resolved_model_cfg["chunk_max_len"])
+        if "chunk_sleep_seconds" not in translation_raw:
+            if "chunk_sleep_seconds" in resolved_model_cfg:
+                translation_raw["chunk_sleep_seconds"] = float(resolved_model_cfg["chunk_sleep_seconds"])
+            else:
+                translation_raw["chunk_sleep_seconds"] = 0.1
+    if ("chunk_max_len" not in translation_raw) or int(translation_raw.get("chunk_max_len") or 0) <= 0:
+        raise KeyError(
+            f'Missing translation.chunk_max_len for model "{translation_raw["model"]}" (set in models.model_configs or translation.chunk_max_len)'
+        )
     glossary_file = translation_raw.get("glossary_file", "")
     glossary_path = root / glossary_file if glossary_file else _glossary_path(novel_id)
     if glossary_path.exists():
@@ -161,9 +276,14 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         translation_raw["glossary_file"] = glossary_file
     translation_raw["model"] = os.environ.get(
         "NOVEL_TTS_TRANSLATION_MODEL",
-        os.environ.get("GEMINI_MODEL", translation_raw["model"]),
+        os.environ.get("NOVEL_TTS_TRANSLATE_MODEL", os.environ.get("GEMINI_MODEL", translation_raw["model"])),
     )
-    translation_raw["repair_model"] = os.environ.get("REPAIR_MODEL", translation_raw.get("repair_model", ""))
+    translation_raw["repair_model"] = os.environ.get(
+        "REPAIR_MODEL",
+        str(translation_root.get("repair_model", "")).strip()
+        or translation_raw.get("repair_model")
+        or str(models_raw.get("repair_model", "")).strip(),
+    )
     if "CHUNK_MAX_LEN" in os.environ:
         translation_raw["chunk_max_len"] = int(os.environ["CHUNK_MAX_LEN"])
     if "CHUNK_SLEEP_SECONDS" in os.environ:
@@ -178,6 +298,18 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         browser_debug=BrowserDebugConfig(**merged_browser_debug_raw),
     )
 
+    # Build CaptionConfig from translation.captions, defaulting to the same provider+model as chapter translation.
+    captions_raw = dict(captions_section)
+    if "provider" not in captions_raw or not str(captions_raw.get("provider", "")).strip():
+        captions_raw["provider"] = translation_raw["provider"]
+    if "model" not in captions_raw or not str(captions_raw.get("model", "")).strip():
+        # In queue mode, GEMINI_MODEL is used to select the chapter translation model.
+        # Captions should remain stable unless explicitly overridden.
+        captions_raw["model"] = default_caption_model
+    captions_model_override = os.environ.get("NOVEL_TTS_CAPTIONS_MODEL", os.environ.get("CAPTIONS_MODEL", "")).strip()
+    if captions_model_override:
+        captions_raw["model"] = captions_model_override
+
     return NovelConfig(
         novel_id=raw["novel_id"],
         title=raw["title"],
@@ -190,7 +322,7 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         crawl=source.crawl,
         browser_debug=source.browser_debug,
         translation=TranslationConfig(**translation_raw),
-        captions=CaptionConfig(**raw["captions"]),
+        captions=CaptionConfig(**captions_raw),
         queue=QueueConfig(
             redis=RedisConfig(**merged_queue_raw.pop("redis", {})),
             model_configs={

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import logging
 import os
 import re
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from novel_tts.common.logging import (
@@ -14,6 +18,7 @@ from novel_tts.common.logging import (
     install_exception_logging,
 )
 from novel_tts.common.text import parse_range
+from novel_tts.common.errors import RateLimitExceededError
 from novel_tts.config import load_novel_config, NovelConfig
 
 LOGGER = get_logger(__name__)
@@ -84,6 +89,10 @@ def _build_parser() -> argparse.ArgumentParser:
     translate_polish_parser.add_argument("--file", action="append", default=[])
     translate_polish_parser.add_argument("--range", help="Optional range of chapters, e.g. 101-500")
 
+    translate_repair_parser = translate_sub.add_parser("repair")
+    translate_repair_parser.add_argument("novel_id")
+    translate_repair_parser.add_argument("--range", required=True, help="Chapter range to scan and enqueue for repair, e.g. 1401-1410")
+
     translate_captions_parser = translate_sub.add_parser("captions")
     translate_captions_parser.add_argument("novel_id")
 
@@ -119,9 +128,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Alias for --all (include translate-chapter subprocesses)",
     )
+    queue_ps_all_parser.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Watch mode (refresh every 1s). Ctrl+C to stop.",
+    )
     queue_stop_parser = queue_sub.add_parser("stop")
     queue_stop_parser.add_argument("novel_id")
-    queue_stop_parser.add_argument("--pid", type=int, help="PID of a specific queue process to stop")
+    queue_stop_parser.add_argument(
+        "--pid",
+        action="append",
+        default=[],
+        help="PID(s) of specific queue process(es) to stop. Repeatable or comma-separated (e.g. --pid 123 --pid 456 or --pid 123,456).",
+    )
     queue_stop_parser.add_argument(
         "--role",
         action="append",
@@ -139,6 +159,11 @@ def _build_parser() -> argparse.ArgumentParser:
     queue_launch_parser = queue_sub.add_parser("launch")
     queue_launch_parser.add_argument("novel_id")
     queue_launch_parser.add_argument("--restart", action="store_true")
+
+    queue_add_parser = queue_sub.add_parser("add")
+    queue_add_parser.add_argument("novel_id")
+    queue_add_parser.add_argument("--range", required=True, help="Chapter range to enqueue, e.g. 2001-2500")
+    queue_add_parser.add_argument("--force", action="store_true", help="Enqueue even if already translated (force re-translate)")
 
     tts_parser = subparsers.add_parser("tts")
     tts_parser.add_argument("novel_id")
@@ -271,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "translate":
             from novel_tts.translate import polish_translations, translate_captions, translate_novel
             from novel_tts.translate.novel import rebuild_translated_file, translate_chapter
+            from novel_tts.translate.repair import enqueue_repair_jobs, find_repair_jobs_in_range
 
             config = load_novel_config(args.novel_id)
             if args.translate_command == "novel":
@@ -302,9 +328,24 @@ def main(argv: list[str] | None = None) -> int:
                 output = translate_captions(config)
                 LOGGER.info("Translated captions: %s", output)
                 return 0
+            if args.translate_command == "repair":
+                start, end = parse_range(args.range)
+                jobs = find_repair_jobs_in_range(config, start, end)
+                if not jobs:
+                    LOGGER.info("No repair needed in range %s-%s", start, end)
+                    print(f"No repair needed for novel {config.novel_id} chapters {start}-{end}.")
+                    return 0
+                LOGGER.info("Translate repair found %s job(s) in range %s-%s", len(jobs), start, end)
+                # Print a compact summary for operator visibility.
+                for job in jobs[:50]:
+                    print(f"- {job.job_id} reasons={','.join(job.reasons)}")
+                if len(jobs) > 50:
+                    print(f"... and {len(jobs) - 50} more")
+                return enqueue_repair_jobs(config, jobs)
 
         if args.command == "queue":
             from novel_tts.queue import (
+                add_jobs_to_queue,
                 launch_queue_stack,
                 list_all_queue_processes,
                 list_queue_processes,
@@ -331,10 +372,52 @@ def main(argv: list[str] | None = None) -> int:
                 return list_queue_processes(config, include_all=include_all)
             if args.queue_command == "ps-all":
                 include_all = bool(getattr(args, "all", False) or getattr(args, "show_translate", False))
+                if getattr(args, "follow", False):
+                    # Use alternate screen + hide cursor to reduce flicker.
+                    # We also buffer the full frame before writing once.
+                    sys.stdout.write("\033[?1049h\033[?25l")
+                    sys.stdout.flush()
+                    try:
+                        while True:
+                            buf = io.StringIO()
+                            buf.write(
+                                f"watch: queue ps-all --all={include_all} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (refresh 1s, Ctrl+C to stop)\n\n"
+                            )
+                            with contextlib.redirect_stdout(buf):
+                                rc = list_all_queue_processes(include_all=include_all)
+                            if rc != 0:
+                                return rc
+                            frame = buf.getvalue()
+                            # Move cursor home + clear-to-end, then write the full frame once.
+                            sys.stdout.write("\033[H\033[J")
+                            sys.stdout.write(frame)
+                            sys.stdout.flush()
+                            time.sleep(1.0)
+                    except KeyboardInterrupt:
+                        return 0
+                    finally:
+                        # Restore cursor + leave alternate screen.
+                        sys.stdout.write("\033[?25h\033[?1049l")
+                        sys.stdout.flush()
                 return list_all_queue_processes(include_all=include_all)
             if args.queue_command == "stop":
                 if config is None:
                     parser.error("queue stop requires a novel_id")
+                raw_pids = getattr(args, "pid", None) or []
+                pids: list[int] | None = None
+                if raw_pids:
+                    parsed: list[int] = []
+                    for value in raw_pids:
+                        for part in str(value).split(","):
+                            part = part.strip()
+                            if not part:
+                                continue
+                            try:
+                                parsed.append(int(part))
+                            except ValueError:
+                                parser.error(f"queue stop: invalid --pid value: {part!r}")
+                    pids = parsed or None
+
                 raw_roles = getattr(args, "role", None)
                 roles: list[str] | None = None
                 if raw_roles:
@@ -346,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
                                 roles.append(part)
                 return stop_queue_processes(
                     config,
-                    pid=getattr(args, "pid", None),
+                    pids=pids,
                     roles=roles,
                 )
             if args.queue_command == "worker":
@@ -357,6 +440,11 @@ def main(argv: list[str] | None = None) -> int:
                 if config is None:
                     parser.error("queue launch requires a novel_id")
                 return launch_queue_stack(config, restart=args.restart)
+            if args.queue_command == "add":
+                if config is None:
+                    parser.error("queue add requires a novel_id")
+                start, end = parse_range(args.range)
+                return add_jobs_to_queue(config, start, end, force=bool(getattr(args, "force", False)))
 
         if args.command == "tts":
             from novel_tts.tts import run_tts
@@ -422,6 +510,10 @@ def main(argv: list[str] | None = None) -> int:
 
         parser.error("Unhandled command")
         return 2
+    except RateLimitExceededError as exc:
+        # Used by queue workers: treat as a transient condition so the worker can release/requeue the job.
+        LOGGER.warning("Rate limited: %s", exc)
+        return 75
     except Exception:
         LOGGER.exception("Command failed")
         return 1

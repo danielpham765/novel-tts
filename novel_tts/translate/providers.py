@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import requests
+import sys
 import time
 import uuid
 import logging
+import redis
 
-import requests
+from novel_tts.common.errors import RateLimitExceededError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -105,6 +108,13 @@ def _acquire_gemini_rate_slot(model: str, estimated_tokens: int) -> None:
     token_key = f"{key}:quota:tokens"
     daily_key = f"{key}:quota:daily_reqs"
     member = f"{time.time():.6f}:{os.getpid()}:{uuid.uuid4().hex}"
+    quota_mode = os.environ.get("NOVEL_TTS_QUOTA_MODE", "wait").strip().lower()
+    max_wait_raw = os.environ.get("NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS", "").strip()
+    try:
+        max_wait_seconds = float(max_wait_raw) if max_wait_raw else 0.0
+    except ValueError:
+        max_wait_seconds = 0.0
+    started = time.time()
     while True:
         now = time.time()
         window_start = now - 60.0
@@ -151,14 +161,54 @@ def _acquire_gemini_rate_slot(model: str, estimated_tokens: int) -> None:
                 wait_rpm = max(0.05, 60.0 - (now - float(oldest[0][1])) + 0.05)
             wait_tpm = 0.0
             if tpm > 0 and (current_tokens + estimated_tokens) > tpm and oldest_active:
-                # Wait until at least one in-window request expires.
                 wait_tpm = max(0.05, 60.0 - (now - float(oldest_active[0][1])) + 0.05)
             wait_rpd = 0.0
             if rpd > 0 and daily_count >= rpd and oldest_daily:
                 wait_rpd = max(1.0, 86400.0 - (now - float(oldest_daily[0][1])) + 0.05)
             wait_seconds = max(wait_rpm, wait_tpm, wait_rpd, 0.25)
+            reasons: list[str] = []
+            if wait_rpm > 0:
+                reasons.append("RPM")
+            if wait_tpm > 0:
+                reasons.append("TPM")
+            if wait_rpd > 0:
+                reasons.append("RPD")
+            reason_text = ",".join(reasons) if reasons else "UNKNOWN"
+            if wait_seconds >= 3.0:
+                LOGGER.info(
+                    "Gemini quota wait %.1fs | model=%s reasons=%s reqs=%s/%s tokens=%s+%s/%s daily=%s/%s",
+                    wait_seconds,
+                    model,
+                    reason_text,
+                    current_requests,
+                    rpm if rpm > 0 else "-",
+                    current_tokens,
+                    estimated_tokens,
+                    tpm if tpm > 0 else "-",
+                    daily_count,
+                    rpd if rpd > 0 else "-",
+                )
+            if quota_mode == "raise":
+                raise RateLimitExceededError(
+                    f"Gemini quota exceeded (model={model} reasons={reason_text} suggested_wait={wait_seconds:.2f}s)"
+                )
+            if quota_mode == "wait_then_raise":
+                # Allow short waits to smooth bursts, but release quickly when the wait is long.
+                if max_wait_seconds <= 0:
+                    raise RateLimitExceededError(
+                        f"Gemini quota exceeded (model={model} reasons={reason_text} suggested_wait={wait_seconds:.2f}s)"
+                    )
+                waited = max(0.0, time.time() - started)
+                if waited + wait_seconds > max_wait_seconds:
+                    raise RateLimitExceededError(
+                        f"Gemini quota exceeded (model={model} reasons={reason_text} suggested_wait={wait_seconds:.2f}s)"
+                    )
             time.sleep(wait_seconds)
-        except Exception:
+        except redis.exceptions.WatchError:
+            time.sleep(0.01)
+            continue
+        except Exception as e:
+            LOGGER.warning("Redis error in rate limit tracking: %s", e)
             return
 
 
@@ -172,9 +222,18 @@ class GeminiHttpProvider(TranslationProvider):
             "contents": [{"parts": [{"text": f"{system_prompt}\n\n{prompt}".strip()}]}],
             "generationConfig": {"temperature": 0.2, "topP": 0.9},
         }
-        for attempt in range(12):
+        _acquire_gemini_rate_slot(model, _estimate_gemini_tokens(prompt, system_prompt))
+        max_429_attempts_raw = os.environ.get("NOVEL_TTS_RATE_LIMIT_MAX_ATTEMPTS", "").strip()
+        try:
+            max_429_attempts = int(max_429_attempts_raw) if max_429_attempts_raw else 20
+        except ValueError:
+            max_429_attempts = 20
+        max_429_attempts = max(1, max_429_attempts)
+
+        rate_attempt = 0
+        generic_attempt = 0
+        while True:
             try:
-                _acquire_gemini_rate_slot(model, _estimate_gemini_tokens(prompt, system_prompt))
                 response = requests.post(
                     url,
                     params={"key": api_key},
@@ -183,13 +242,38 @@ class GeminiHttpProvider(TranslationProvider):
                     timeout=90,
                 )
                 if response.status_code == 429:
-                    retry_after = response.headers.get("retry-after")
-                    wait_seconds = (
-                        int(retry_after)
-                        if retry_after and retry_after.isdigit()
-                        else 30 + attempt * 15
+                    rate_attempt += 1
+                    # Parse Google's recommended retry delay as base
+                    import random, re
+                    base_delay = 8.0
+                    try:
+                        msg = response.json().get("error", {}).get("message", "")
+                        m = re.search(r"retry in (\d+\.?\d*)s", msg, re.IGNORECASE)
+                        if m:
+                            base_delay = max(float(m.group(1)), 3.0)
+                        else:
+                            for detail in response.json().get("error", {}).get("details", []):
+                                if detail.get("@type", "").endswith("RetryInfo"):
+                                    ds = detail.get("retryDelay", "")
+                                    if ds.endswith("s"):
+                                        base_delay = max(float(ds[:-1]), 3.0)
+                    except Exception:
+                        pass
+                    # Exponential backoff: base * 2^attempt, capped at 120s
+                    wait_seconds = min(base_delay * (2 ** (rate_attempt - 1)), 120.0)
+                    # Wide jitter (±50%) to desynchronize workers
+                    jitter = wait_seconds * 0.5
+                    wait_seconds = max(wait_seconds + random.uniform(-jitter, jitter), 3.0)
+                    if rate_attempt >= max_429_attempts:
+                        raise RateLimitExceededError(
+                            f"Gemini 429 persisted after {rate_attempt}/{max_429_attempts} attempts (model={model})"
+                        )
+                    LOGGER.warning(
+                        "Gemini API Rate Limit (429) hit. Attempt %d/%d. Sleeping for %.1fs",
+                        rate_attempt,
+                        max_429_attempts,
+                        wait_seconds,
                     )
-                    LOGGER.warning("Gemini API Rate Limit (429) hit. Attempt %d/12. Sleeping for %ds", attempt + 1, wait_seconds)
                     time.sleep(wait_seconds)
                     continue
                 response.raise_for_status()
@@ -208,12 +292,14 @@ class GeminiHttpProvider(TranslationProvider):
                 return text
             except PromptBlockedError:
                 raise
+            except RateLimitExceededError:
+                raise
             except Exception as e:
-                LOGGER.warning("Gemini API generation error (attempt %d/12): %s", attempt + 1, e)
-                if attempt == 11:
+                generic_attempt += 1
+                LOGGER.warning("Gemini API generation error (attempt %d/12): %s", generic_attempt, e)
+                if generic_attempt >= 12:
                     raise
-                time.sleep(5 + attempt * 5)
-        raise RuntimeError("Unreachable Gemini retry state")
+                time.sleep(5 + (generic_attempt - 1) * 5)
 
 
 class OpenAIChatProvider(TranslationProvider):

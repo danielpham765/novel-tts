@@ -1,4 +1,5 @@
 from .translation_queue import (
+    add_jobs_to_queue,
     launch_queue_stack,
     list_all_queue_processes,
     list_queue_processes,
@@ -9,6 +10,7 @@ from .translation_queue import (
 )
 
 __all__ = [
+    "add_jobs_to_queue",
     "launch_queue_stack",
     "list_all_queue_processes",
     "list_queue_processes",
