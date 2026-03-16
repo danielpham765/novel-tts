@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import requests
 import sys
 import time
@@ -13,6 +14,8 @@ import redis
 from novel_tts.common.errors import RateLimitExceededError
 
 LOGGER = logging.getLogger(__name__)
+
+_HAN_REGEX = re.compile(r"[\u4e00-\u9fff]")
 
 
 class TranslationProvider:
@@ -70,12 +73,128 @@ def _get_rate_limit_configs() -> dict[str, dict]:
     return _RATE_LIMIT_CONFIGS
 
 
+def _redis_now_seconds(client) -> float:
+    try:
+        sec, usec = client.time()
+        return float(sec) + float(usec) / 1_000_000.0
+    except Exception:
+        return time.time()
+
+
 def _estimate_gemini_tokens(prompt: str, system_prompt: str = "") -> int:
-    chars = len((system_prompt or "").strip()) + len((prompt or "").strip())
-    # Conservative estimate for zh/vi prompts plus model output reserve.
-    input_tokens = max(1, math.ceil(chars / 2.2))
-    output_reserve = max(256, math.ceil(input_tokens * 0.8))
-    return input_tokens + output_reserve
+    """
+    Estimate tokens for quota gating (TPM).
+
+    Notes:
+    - Provider dashboards often report *input* tokens per minute, while some limits count input+output.
+    - Default behavior here is to gate mostly on input tokens, with an optional output reserve ratio.
+      Tune via env vars if needed.
+    """
+
+    text = f"{system_prompt}\n\n{prompt}".strip()
+    chars = len(text)
+    if chars <= 0:
+        return 1
+
+    chars_per_token_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_CHARS_PER_TOKEN", "").strip()
+    if chars_per_token_raw:
+        try:
+            chars_per_token = max(0.8, float(chars_per_token_raw))
+        except ValueError:
+            chars_per_token = 0.0
+    else:
+        han = len(_HAN_REGEX.findall(text))
+        han_ratio = han / max(1, chars)
+        # Heuristic: CJK-heavy prompts tokenize denser than Latin-heavy prompts.
+        if han_ratio >= 0.12:
+            chars_per_token = 2.0
+        elif han_ratio >= 0.03:
+            chars_per_token = 2.6
+        else:
+            chars_per_token = 4.0
+
+    input_tokens = max(1, int(math.ceil(chars / max(0.8, chars_per_token))))
+
+    output_ratio_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_RATIO", "").strip()
+    min_out_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_MIN", "").strip()
+    try:
+        output_ratio = float(output_ratio_raw) if output_ratio_raw else 0.0
+    except ValueError:
+        output_ratio = 0.0
+    try:
+        min_out = int(min_out_raw) if min_out_raw else 0
+    except ValueError:
+        min_out = 0
+
+    output_reserve = 0
+    if output_ratio > 0:
+        output_reserve = max(min_out, int(math.ceil(input_tokens * output_ratio)))
+
+    multiplier_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_SAFETY_MULTIPLIER", "").strip()
+    try:
+        multiplier = float(multiplier_raw) if multiplier_raw else 1.05
+    except ValueError:
+        multiplier = 1.05
+    multiplier = max(1.0, multiplier)
+
+    return max(1, int(math.ceil((input_tokens + output_reserve) * multiplier)))
+
+
+def _wait_seconds_until_rpm_allows(active_members_scored: list[tuple[str, float]], *, now: float, rpm: int) -> float:
+    if rpm <= 0:
+        return 0.0
+    current_requests = len(active_members_scored)
+    if current_requests < rpm:
+        return 0.0
+    # Need enough members to expire so that current_requests becomes (rpm - 1) or lower.
+    need_drop = current_requests - (rpm - 1)
+    if need_drop <= 0:
+        return 0.0
+    idx = min(len(active_members_scored) - 1, need_drop - 1)
+    _member, score = active_members_scored[idx]
+    expiry = float(score) + 60.0
+    return max(0.05, expiry - now + 0.05)
+
+
+def _wait_seconds_until_tpm_allows(
+    active_members_scored: list[tuple[str, float]],
+    token_map: dict[str, str],
+    *,
+    now: float,
+    tpm: int,
+    estimated_tokens: int,
+) -> float:
+    if tpm <= 0:
+        return 0.0
+    if estimated_tokens > tpm:
+        # This request can never fit into the TPM window.
+        raise RateLimitExceededError(
+            f"Gemini quota exceeded (reasons=TPM estimated_tokens={estimated_tokens} tpm_limit={tpm})"
+        )
+    current_tokens = 0
+    for member, _score in active_members_scored:
+        try:
+            current_tokens += int(token_map.get(member, "0"))
+        except (TypeError, ValueError):
+            continue
+    if current_tokens + estimated_tokens <= tpm:
+        return 0.0
+    need_reduce = (current_tokens + estimated_tokens) - tpm
+    reduced = 0
+    cutoff_score: float | None = None
+    for member, score in active_members_scored:
+        try:
+            reduced += int(token_map.get(member, "0"))
+        except (TypeError, ValueError):
+            continue
+        if reduced >= need_reduce:
+            cutoff_score = float(score)
+            break
+    if cutoff_score is None:
+        # Be conservative: if token map is missing, wait for the oldest to expire.
+        cutoff_score = float(active_members_scored[0][1]) if active_members_scored else now
+    expiry = cutoff_score + 60.0
+    return max(0.05, expiry - now + 0.05)
 
 
 def _acquire_gemini_rate_slot(model: str, estimated_tokens: int) -> None:
@@ -116,22 +235,20 @@ def _acquire_gemini_rate_slot(model: str, estimated_tokens: int) -> None:
         max_wait_seconds = 0.0
     started = time.time()
     while True:
-        now = time.time()
+        now = _redis_now_seconds(client)
         window_start = now - 60.0
         day_window_start = now - 86400.0
         try:
             with client.pipeline() as pipe:
                 pipe.watch(redis_key, token_key, daily_key)
                 stale_members = pipe.zrangebyscore(redis_key, 0, window_start)
-                active_members = pipe.zrangebyscore(redis_key, window_start, "+inf")
-                oldest_active = pipe.zrangebyscore(redis_key, window_start, "+inf", start=0, num=1, withscores=True)
+                active_members_scored = pipe.zrangebyscore(redis_key, window_start, "+inf", withscores=True)
                 token_map = pipe.hgetall(token_key)
                 stale_daily_members = pipe.zrangebyscore(daily_key, 0, day_window_start)
                 daily_count = pipe.zcount(daily_key, day_window_start, "+inf")
-                oldest_daily = pipe.zrangebyscore(daily_key, day_window_start, "+inf", start=0, num=1, withscores=True)
-                current_requests = len(active_members)
+                current_requests = len(active_members_scored)
                 current_tokens = 0
-                for active_member in active_members:
+                for active_member, _score in active_members_scored:
                     try:
                         current_tokens += int(token_map.get(active_member, "0"))
                     except (TypeError, ValueError):
@@ -154,17 +271,38 @@ def _acquire_gemini_rate_slot(model: str, estimated_tokens: int) -> None:
                     pipe.expire(daily_key, 172800)
                     pipe.execute()
                     return
-                oldest = pipe.zrange(redis_key, 0, 0, withscores=True)
+                oldest_daily = None
+                if rpd > 0 and daily_count >= rpd:
+                    need_drop_daily = int(daily_count) - (int(rpd) - 1)
+                    if need_drop_daily <= 0:
+                        need_drop_daily = 1
+                    oldest_daily = pipe.zrangebyscore(
+                        daily_key,
+                        day_window_start,
+                        "+inf",
+                        start=max(0, need_drop_daily - 1),
+                        num=1,
+                        withscores=True,
+                    )
                 pipe.unwatch()
             wait_rpm = 0.0
-            if rpm > 0 and current_requests >= rpm and oldest:
-                wait_rpm = max(0.05, 60.0 - (now - float(oldest[0][1])) + 0.05)
+            if rpm > 0 and current_requests >= rpm and active_members_scored:
+                wait_rpm = _wait_seconds_until_rpm_allows(active_members_scored, now=now, rpm=rpm)
             wait_tpm = 0.0
-            if tpm > 0 and (current_tokens + estimated_tokens) > tpm and oldest_active:
-                wait_tpm = max(0.05, 60.0 - (now - float(oldest_active[0][1])) + 0.05)
+            if tpm > 0 and (current_tokens + estimated_tokens) > tpm and active_members_scored:
+                wait_tpm = _wait_seconds_until_tpm_allows(
+                    active_members_scored,
+                    token_map,
+                    now=now,
+                    tpm=tpm,
+                    estimated_tokens=estimated_tokens,
+                )
             wait_rpd = 0.0
             if rpd > 0 and daily_count >= rpd and oldest_daily:
-                wait_rpd = max(1.0, 86400.0 - (now - float(oldest_daily[0][1])) + 0.05)
+                try:
+                    wait_rpd = max(1.0, (float(oldest_daily[0][1]) + 86400.0) - now + 0.05)
+                except Exception:
+                    wait_rpd = 60.0
             wait_seconds = max(wait_rpm, wait_tpm, wait_rpd, 0.25)
             reasons: list[str] = []
             if wait_rpm > 0:
@@ -235,7 +373,7 @@ def _record_gemini_api_attempt(model: str) -> None:
     if client is None:
         return
 
-    now = time.time()
+    now = _redis_now_seconds(client)
     window_start = now - 60.0
     api_key = f"{key}:api:reqs"
     member = f"{now:.6f}:{os.getpid()}:{uuid.uuid4().hex}"
@@ -268,7 +406,7 @@ def _record_gemini_429_attempt(model: str) -> None:
     if client is None:
         return
 
-    now = time.time()
+    now = _redis_now_seconds(client)
     window_start = now - 60.0
     stat_key = f"{key}:api:429"
     member = f"{now:.6f}:{os.getpid()}:{uuid.uuid4().hex}"
@@ -282,9 +420,42 @@ def _record_gemini_429_attempt(model: str) -> None:
         LOGGER.debug("Failed to record Gemini 429 attempt: %s", exc)
 
 
+def _record_gemini_api_call(model: str) -> None:
+    """
+    Record a single logical Gemini API call (one generate() invocation that proceeds to send HTTP)
+    in a 60s rolling window.
+
+    Key shape:
+      {GEMINI_RATE_LIMIT_KEY_PREFIX}:{model}:api:calls
+      OR {GEMINI_RATE_LIMIT_KEY}:api:calls
+    """
+
+    key_prefix = os.environ.get("GEMINI_RATE_LIMIT_KEY_PREFIX", "").strip()
+    key = f"{key_prefix}:{model}" if key_prefix else os.environ.get("GEMINI_RATE_LIMIT_KEY", "").strip()
+    if not key:
+        return
+
+    client = _get_rate_limit_client()
+    if client is None:
+        return
+
+    now = _redis_now_seconds(client)
+    window_start = now - 60.0
+    stat_key = f"{key}:api:calls"
+    member = f"{now:.6f}:{os.getpid()}:{uuid.uuid4().hex}"
+    try:
+        with client.pipeline() as pipe:
+            pipe.zremrangebyscore(stat_key, 0, window_start)
+            pipe.zadd(stat_key, {member: now})
+            pipe.expire(stat_key, 120)
+            pipe.execute()
+    except Exception as exc:
+        LOGGER.debug("Failed to record Gemini api call: %s", exc)
+
+
 def _record_gemini_llm_call(model: str) -> None:
     """
-    Record a single logical LLM call (one generate() invocation) in a 60s rolling window.
+    Record a single LLM attempt (one outbound HTTP attempt) in a 60s rolling window.
 
     Key shape:
       {GEMINI_RATE_LIMIT_KEY_PREFIX}:{model}:llm:reqs
@@ -300,7 +471,7 @@ def _record_gemini_llm_call(model: str) -> None:
     if client is None:
         return
 
-    now = time.time()
+    now = _redis_now_seconds(client)
     window_start = now - 60.0
     llm_key = f"{key}:llm:reqs"
     member = f"{now:.6f}:{os.getpid()}:{uuid.uuid4().hex}"
@@ -324,19 +495,28 @@ class GeminiHttpProvider(TranslationProvider):
             "contents": [{"parts": [{"text": f"{system_prompt}\n\n{prompt}".strip()}]}],
             "generationConfig": {"temperature": 0.2, "topP": 0.9},
         }
-        _record_gemini_llm_call(model)
-        _acquire_gemini_rate_slot(model, _estimate_gemini_tokens(prompt, system_prompt))
-        max_429_attempts_raw = os.environ.get("NOVEL_TTS_RATE_LIMIT_MAX_ATTEMPTS", "").strip()
-        try:
-            max_429_attempts = int(max_429_attempts_raw) if max_429_attempts_raw else 20
-        except ValueError:
-            max_429_attempts = 20
-        max_429_attempts = max(1, max_429_attempts)
+        estimated_tokens = _estimate_gemini_tokens(prompt, system_prompt)
+        _record_gemini_api_call(model)
 
-        rate_attempt = 0
+        quota_mode = os.environ.get("NOVEL_TTS_QUOTA_MODE", "wait").strip().lower()
+        max_wait_raw = os.environ.get("NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS", "").strip()
+        try:
+            max_wait_seconds = float(max_wait_raw) if max_wait_raw else 0.0
+        except ValueError:
+            max_wait_seconds = 0.0
+        is_queue_worker_mode = (quota_mode == "raise") and (max_wait_seconds <= 0.0)
+        timeout_wait_raw = os.environ.get("NOVEL_TTS_UPSTREAM_TIMEOUT_SUGGESTED_WAIT_SECONDS", "").strip()
+        try:
+            timeout_suggested_wait_seconds = float(timeout_wait_raw) if timeout_wait_raw else 15.0
+        except ValueError:
+            timeout_suggested_wait_seconds = 15.0
+
         generic_attempt = 0
         while True:
             try:
+                # Acquire a slot for each HTTP attempt (including any retries within this method).
+                _acquire_gemini_rate_slot(model, estimated_tokens)
+                _record_gemini_llm_call(model)
                 _record_gemini_api_attempt(model)
                 response = requests.post(
                     url,
@@ -347,40 +527,8 @@ class GeminiHttpProvider(TranslationProvider):
                 )
                 if response.status_code == 429:
                     _record_gemini_429_attempt(model)
-                    rate_attempt += 1
-                    # Parse Google's recommended retry delay as base
-                    import random, re
-                    base_delay = 8.0
-                    try:
-                        msg = response.json().get("error", {}).get("message", "")
-                        m = re.search(r"retry in (\d+\.?\d*)s", msg, re.IGNORECASE)
-                        if m:
-                            base_delay = max(float(m.group(1)), 3.0)
-                        else:
-                            for detail in response.json().get("error", {}).get("details", []):
-                                if detail.get("@type", "").endswith("RetryInfo"):
-                                    ds = detail.get("retryDelay", "")
-                                    if ds.endswith("s"):
-                                        base_delay = max(float(ds[:-1]), 3.0)
-                    except Exception:
-                        pass
-                    # Exponential backoff: base * 2^attempt, capped at 120s
-                    wait_seconds = min(base_delay * (2 ** (rate_attempt - 1)), 120.0)
-                    # Wide jitter (±50%) to desynchronize workers
-                    jitter = wait_seconds * 0.5
-                    wait_seconds = max(wait_seconds + random.uniform(-jitter, jitter), 3.0)
-                    if rate_attempt >= max_429_attempts:
-                        raise RateLimitExceededError(
-                            f"Gemini 429 persisted after {rate_attempt}/{max_429_attempts} attempts (model={model})"
-                        )
-                    LOGGER.warning(
-                        "Gemini API Rate Limit (429) hit. Attempt %d/%d. Sleeping for %.1fs",
-                        rate_attempt,
-                        max_429_attempts,
-                        wait_seconds,
-                    )
-                    time.sleep(wait_seconds)
-                    continue
+                    # Do not retry 429 here; let the queue worker release/requeue the job to shift keys/workers.
+                    raise RateLimitExceededError(f"Gemini HTTP 429 (model={model})")
                 response.raise_for_status()
                 payload = response.json()
                 prompt_feedback = payload.get("promptFeedback") or {}
@@ -399,6 +547,18 @@ class GeminiHttpProvider(TranslationProvider):
                 raise
             except RateLimitExceededError:
                 raise
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                # In queue worker mode, avoid spending a long time retrying within a single worker process.
+                # Release the job back to the supervisor so another key/worker (or a later time slice) can pick it up.
+                if is_queue_worker_mode:
+                    raise RateLimitExceededError(
+                        f"Gemini upstream timeout (model={model} suggested_wait={timeout_suggested_wait_seconds:.2f}s): {exc}"
+                    )
+                generic_attempt += 1
+                LOGGER.warning("Gemini API generation error (attempt %d/12): %s", generic_attempt, exc)
+                if generic_attempt >= 12:
+                    raise
+                time.sleep(5 + (generic_attempt - 1) * 5)
             except Exception as e:
                 generic_attempt += 1
                 LOGGER.warning("Gemini API generation error (attempt %d/12): %s", generic_attempt, e)

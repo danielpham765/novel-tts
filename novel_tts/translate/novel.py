@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import time
 from pathlib import Path
 
 from novel_tts.common.logging import get_logger
+from novel_tts.common.errors import RateLimitExceededError
 from novel_tts.config.models import NovelConfig
 
 from .glossary import normalize_glossary_text, sanitize_glossary_entries
@@ -23,7 +25,22 @@ GLOSSARY_STATUS_DONE = "done"
 
 
 def make_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[str, str]]:
+    masked, mapping, _replacements = make_placeholders_with_replacements(text, glossary)
+    return masked, mapping
+
+
+def make_placeholders_with_replacements(
+    text: str, glossary: dict[str, str]
+) -> tuple[str, dict[str, str], list[dict[str, str]]]:
+    """
+    Replace glossary terms in `text` with stable placeholder tokens and return:
+    - masked text
+    - token->value mapping (for restoration)
+    - ordered replacements snapshot [{src, token, value}, ...] for reproducible resume
+    """
+
     mapping: dict[str, str] = {}
+    replacements: list[dict[str, str]] = []
     for idx, key in enumerate(sorted(glossary, key=len, reverse=True)):
         token = f"ZXQ{idx:03d}QXZ"
         value = glossary.get(key, "")
@@ -33,8 +50,61 @@ def make_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[st
             continue
         if key in text:
             text = text.replace(key, token)
-            mapping[token] = value
-    return text, mapping
+            value_str = value if isinstance(value, str) else str(value)
+            mapping[token] = value_str
+            replacements.append({"src": str(key), "token": token, "value": value_str})
+    return text, mapping, replacements
+
+
+def _placeholders_snapshot_key(unit_key: str) -> str:
+    return f"placeholders__{unit_key}"
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _load_placeholders_snapshot(config: NovelConfig, unit_key: str) -> dict:
+    key = _placeholders_snapshot_key(unit_key)
+    path = progress_path(config, key)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_placeholders_snapshot(config: NovelConfig, unit_key: str, payload: dict) -> None:
+    key = _placeholders_snapshot_key(unit_key)
+    config.storage.progress_dir.mkdir(parents=True, exist_ok=True)
+    progress_path(config, key).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _clear_placeholders_snapshot(config: NovelConfig, unit_key: str) -> None:
+    clear_progress(config, _placeholders_snapshot_key(unit_key))
+
+
+def _apply_placeholders_snapshot(raw_text: str, replacements: list[dict[str, str]]) -> tuple[str, dict[str, str]]:
+    masked = raw_text
+    mapping: dict[str, str] = {}
+    for item in replacements:
+        if not isinstance(item, dict):
+            continue
+        src = item.get("src", "")
+        token = item.get("token", "")
+        value = item.get("value", "")
+        if not isinstance(src, str) or not isinstance(token, str) or not isinstance(value, str):
+            continue
+        if not src or not token:
+            continue
+        masked = masked.replace(src, token)
+        mapping[token] = value
+    return masked, mapping
 
 
 def split_chunks(text: str, max_len: int) -> list[str]:
@@ -271,6 +341,755 @@ def _extract_glossary_updates(config: NovelConfig, provider, source_text: str, t
     return _sanitize_extracted_glossary_updates(updates, translated_text)
 
 
+def _slice_center(text: str, *, max_chars: int, center_frac: float) -> str:
+    text = (text or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    frac = min(max(float(center_frac), 0.0), 1.0)
+    center = int(round(frac * len(text)))
+    half = max_chars // 2
+    start = max(0, center - half)
+    end = min(len(text), start + max_chars)
+    # If clamped at the end, shift start back.
+    start = max(0, end - max_chars)
+    return text[start:end].strip()
+
+
+def _compact_source_for_glossary(text: str, *, max_chars: int) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    keep_idx: set[int] = set()
+    for idx, line in enumerate(lines):
+        if HAN_REGEX.search(line):
+            keep_idx.add(idx)
+            if idx - 1 >= 0:
+                keep_idx.add(idx - 1)
+            if idx + 1 < len(lines):
+                keep_idx.add(idx + 1)
+    kept_lines = [lines[idx] for idx in sorted(keep_idx)] if keep_idx else lines
+    compact = "\n".join(kept_lines).strip()
+    return _slice_head_tail(compact, max_chars)
+
+
+def _glossary_progress_key(unit_key: str) -> str:
+    return f"glossary__{unit_key}"
+
+
+def _load_glossary_progress(config: NovelConfig, unit_key: str) -> dict:
+    key = _glossary_progress_key(unit_key)
+    path = progress_path(config, key)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_glossary_progress(config: NovelConfig, unit_key: str, payload: dict) -> None:
+    key = _glossary_progress_key(unit_key)
+    config.storage.progress_dir.mkdir(parents=True, exist_ok=True)
+    progress_path(config, key).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _clear_glossary_progress(config: NovelConfig, unit_key: str) -> None:
+    key = _glossary_progress_key(unit_key)
+    clear_progress(config, key)
+
+
+def _repair_progress_key(prefix: str, unit_key: str) -> str:
+    return f"{prefix}__{unit_key}"
+
+
+def _load_repair_progress(config: NovelConfig, prefix: str, unit_key: str) -> list[str]:
+    payload = load_progress(config, _repair_progress_key(prefix, unit_key))
+    return payload
+
+
+def _save_repair_progress(config: NovelConfig, prefix: str, unit_key: str, chunks: list[str]) -> None:
+    save_progress(config, _repair_progress_key(prefix, unit_key), chunks)
+
+
+def _clear_repair_progress(config: NovelConfig, prefix: str, unit_key: str) -> None:
+    clear_progress(config, _repair_progress_key(prefix, unit_key))
+
+
+def _clear_repair_progress_prefix(config: NovelConfig, prefix_base: str, unit_key: str) -> None:
+    """
+    Clear any repair progress files for a unit_key whose prefix starts with prefix_base.
+
+    Used when repair progress keys include hash suffixes (to avoid stale resume after input changes).
+    """
+
+    progress_dir = config.storage.progress_dir
+    if not progress_dir.exists():
+        return
+    pattern = f"{prefix_base}*__{unit_key}.json"
+    for path in progress_dir.glob(pattern):
+        try:
+            path.unlink()
+        except Exception:
+            continue
+
+
+def _repair_placeholder_tokens_chunked(
+    config: NovelConfig,
+    provider,
+    model: str,
+    *,
+    unit_key: str,
+    source_text: str,
+    translated_chunks: list[str],
+    mapping: dict[str, str],
+) -> str:
+    """
+    Repair hallucinated placeholder tokens (ZXQ...QXZ / QZX...QXZ) using smaller chunk windows.
+
+    This runs after the main translation phase and persists progress so quota releases can resume.
+    """
+
+    if not translated_chunks:
+        return ""
+
+    # Work on already-restored chunk text so the model sees real terms, not internal placeholders.
+    stage_prefix = f"repair_placeholders_{_hash_text(source_text)[:12]}_{len(translated_chunks)}"
+    repaired = _load_repair_progress(config, stage_prefix, unit_key)
+    if repaired and len(repaired) > len(translated_chunks):
+        repaired = repaired[: len(translated_chunks)]
+
+    total = len(translated_chunks)
+    if repaired:
+        LOGGER.info(
+            "placeholder-token repair (chunked) resuming | unit=%s repaired=%s total=%s model=%s",
+            unit_key,
+            len(repaired),
+            total,
+            model,
+        )
+    else:
+        LOGGER.info(
+            "placeholder-token repair (chunked) starting | unit=%s total=%s model=%s",
+            unit_key,
+            total,
+            model,
+        )
+    for idx in range(len(repaired), total):
+        center = (idx + 0.5) / max(1, total)
+        src_window = _slice_center(source_text, max_chars=2400, center_frac=center)
+        current = restore_placeholders(translated_chunks[idx], mapping)
+        found = sorted(set(PLACEHOLDER_TOKEN_RE.findall(current)))
+        if not found:
+            # Still emit periodic progress so long chapters don't look stalled.
+            if ((idx + 1) == total) or ((idx + 1) % 10 == 0):
+                LOGGER.info(
+                    "placeholder-token repair (chunked) progress | unit=%s chunk=%s/%s placeholders=0",
+                    unit_key,
+                    idx + 1,
+                    total,
+                )
+            repaired.append(current)
+            _save_repair_progress(config, stage_prefix, unit_key, repaired)
+            continue
+        examples = ", ".join(found[:8])
+        LOGGER.info(
+            "placeholder-token repair (chunked) fixing | unit=%s chunk=%s/%s placeholders=%s examples=%s chars=%s",
+            unit_key,
+            idx + 1,
+            total,
+            len(found),
+            examples,
+            len(current),
+        )
+        started = time.perf_counter()
+        try:
+            fixed = repair_placeholder_tokens_against_source(config, provider, model, src_window, current).strip()
+        except RateLimitExceededError:
+            LOGGER.warning(
+                "placeholder-token repair (chunked) rate-limited | unit=%s chunk=%s/%s placeholders=%s",
+                unit_key,
+                idx + 1,
+                total,
+                len(found),
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "placeholder-token repair (chunked) failed | unit=%s chunk=%s/%s placeholders=%s",
+                unit_key,
+                idx + 1,
+                total,
+                len(found),
+            )
+            raise
+        elapsed = time.perf_counter() - started
+        remaining = len(set(PLACEHOLDER_TOKEN_RE.findall(fixed)))
+        LOGGER.info(
+            "placeholder-token repair (chunked) fixed | unit=%s chunk=%s/%s in %.1fs remaining_placeholders=%s",
+            unit_key,
+            idx + 1,
+            total,
+            elapsed,
+            remaining,
+        )
+        repaired.append(fixed)
+        _save_repair_progress(config, stage_prefix, unit_key, repaired)
+
+    _clear_repair_progress(config, stage_prefix, unit_key)
+    return "".join(repaired)
+
+
+def _repair_placeholder_tokens_in_text_chunked(
+    config: NovelConfig,
+    provider,
+    model: str,
+    *,
+    unit_key: str,
+    source_text: str,
+    translated_text: str,
+    prefix: str,
+) -> str:
+    """
+    Repair hallucinated placeholder tokens in an already-merged translated text.
+
+    This is used as a bounded retry pass when placeholder tokens survive the first chunked repair.
+    Progress is persisted so queue workers can release on quota and resume later.
+    """
+
+    if not translated_text:
+        return ""
+
+    chunk_max_len_raw = os.environ.get("NOVEL_TTS_REPAIR_CHUNK_MAX_LEN", "").strip()
+    try:
+        chunk_max_len = int(chunk_max_len_raw) if chunk_max_len_raw else 0
+    except ValueError:
+        chunk_max_len = 0
+    if chunk_max_len <= 0:
+        model_chunk_raw = os.environ.get("CHUNK_MAX_LEN", "").strip()
+        try:
+            chunk_max_len = int(model_chunk_raw) if model_chunk_raw else 0
+        except ValueError:
+            chunk_max_len = 0
+    if chunk_max_len <= 0:
+        chunk_max_len = int(getattr(config.translation, "chunk_max_len", 0) or 0)
+    if chunk_max_len <= 0:
+        chunk_max_len = 1600
+    chunk_max_len = max(400, int(chunk_max_len))
+
+    input_fingerprint = _hash_text(f"{chunk_max_len}\n{source_text}\n{translated_text}")[:12]
+    stage_prefix = f"{prefix}_{input_fingerprint}"
+
+    chunks = split_chunks(translated_text, chunk_max_len)
+    repaired = _load_repair_progress(config, stage_prefix, unit_key)
+    if repaired and len(repaired) > len(chunks):
+        repaired = repaired[: len(chunks)]
+
+    total = len(chunks)
+    if repaired:
+        LOGGER.info(
+            "placeholder-token repair (retry chunked) resuming | unit=%s pass=%s repaired=%s total=%s chunk_max_len=%s model=%s",
+            unit_key,
+            prefix,
+            len(repaired),
+            total,
+            chunk_max_len,
+            model,
+        )
+    else:
+        LOGGER.info(
+            "placeholder-token repair (retry chunked) starting | unit=%s pass=%s total=%s chunk_max_len=%s model=%s",
+            unit_key,
+            prefix,
+            total,
+            chunk_max_len,
+            model,
+        )
+
+    source_window_chars = max(1200, int(chunk_max_len * 2.2))
+    for idx in range(len(repaired), total):
+        current = chunks[idx]
+        found = sorted(set(PLACEHOLDER_TOKEN_RE.findall(current)))
+        if not found:
+            if ((idx + 1) == total) or ((idx + 1) % 10 == 0):
+                LOGGER.info(
+                    "placeholder-token repair (retry chunked) progress | unit=%s pass=%s chunk=%s/%s placeholders=0",
+                    unit_key,
+                    prefix,
+                    idx + 1,
+                    total,
+                )
+            repaired.append(current)
+            _save_repair_progress(config, stage_prefix, unit_key, repaired)
+            continue
+
+        examples = ", ".join(found[:8])
+        center = (idx + 0.5) / max(1, total)
+        src_window = _slice_center(source_text, max_chars=source_window_chars, center_frac=center)
+        LOGGER.info(
+            "placeholder-token repair (retry chunked) fixing | unit=%s pass=%s chunk=%s/%s placeholders=%s examples=%s chars=%s",
+            unit_key,
+            prefix,
+            idx + 1,
+            total,
+            len(found),
+            examples,
+            len(current),
+        )
+        started = time.perf_counter()
+        try:
+            fixed = repair_placeholder_tokens_against_source(config, provider, model, src_window, current).strip()
+        except RateLimitExceededError:
+            LOGGER.warning(
+                "placeholder-token repair (retry chunked) rate-limited | unit=%s pass=%s chunk=%s/%s placeholders=%s",
+                unit_key,
+                prefix,
+                idx + 1,
+                total,
+                len(found),
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "placeholder-token repair (retry chunked) failed | unit=%s pass=%s chunk=%s/%s placeholders=%s",
+                unit_key,
+                prefix,
+                idx + 1,
+                total,
+                len(found),
+            )
+            raise
+        elapsed = time.perf_counter() - started
+        remaining = len(set(PLACEHOLDER_TOKEN_RE.findall(fixed)))
+        LOGGER.info(
+            "placeholder-token repair (retry chunked) fixed | unit=%s pass=%s chunk=%s/%s in %.1fs remaining_placeholders=%s",
+            unit_key,
+            prefix,
+            idx + 1,
+            total,
+            elapsed,
+            remaining,
+        )
+        repaired.append(fixed)
+        _save_repair_progress(config, stage_prefix, unit_key, repaired)
+        time.sleep(config.translation.chunk_sleep_seconds)
+
+    _clear_repair_progress(config, stage_prefix, unit_key)
+    return "".join(repaired)
+
+
+def final_cleanup_chunked(config: NovelConfig, provider, model: str, *, unit_key: str, text: str, mapping: dict[str, str]) -> str:
+    chunk_max_len_raw = os.environ.get("NOVEL_TTS_REPAIR_CHUNK_MAX_LEN", "").strip()
+    try:
+        chunk_max_len = int(chunk_max_len_raw) if chunk_max_len_raw else 0
+    except ValueError:
+        chunk_max_len = 0
+    if chunk_max_len <= 0:
+        model_chunk_raw = os.environ.get("CHUNK_MAX_LEN", "").strip()
+        try:
+            chunk_max_len = int(model_chunk_raw) if model_chunk_raw else 0
+        except ValueError:
+            chunk_max_len = 0
+    if chunk_max_len <= 0:
+        chunk_max_len = int(getattr(config.translation, "chunk_max_len", 0) or 0)
+    if chunk_max_len <= 0:
+        chunk_max_len = 1600
+    chunk_max_len = max(400, int(chunk_max_len))
+
+    stage_fingerprint = _hash_text(str(chunk_max_len) + "\n" + text)[:12]
+    stage_prefix = f"final_cleanup_{stage_fingerprint}"
+    chunks = split_chunks(text, chunk_max_len)
+    translated_chunks = _load_repair_progress(config, stage_prefix, unit_key)
+    glossary = build_glossary(mapping)
+    total = len(chunks)
+    if translated_chunks:
+        LOGGER.info(
+            "final_cleanup (chunked) resuming | unit=%s repaired=%s total=%s chunk_max_len=%s model=%s",
+            unit_key,
+            len(translated_chunks),
+            total,
+            chunk_max_len,
+            model,
+        )
+    else:
+        LOGGER.info(
+            "final_cleanup (chunked) starting | unit=%s total=%s chunk_max_len=%s model=%s",
+            unit_key,
+            total,
+            chunk_max_len,
+            model,
+        )
+    for idx, chunk in enumerate(chunks[len(translated_chunks):], len(translated_chunks) + 1):
+        LOGGER.info(
+            "final_cleanup (chunked) fixing | unit=%s chunk=%s/%s chars=%s",
+            unit_key,
+            idx,
+            total,
+            len(chunk),
+        )
+        started = time.perf_counter()
+        prompt = (
+            f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
+            f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary}\n\n"
+            "Dưới đây là một đoạn bản dịch tiếng Việt còn lỗi. "
+            "Hãy chỉ sửa lỗi còn sót: chữ Hán chưa dịch, câu cú gượng, xuống dòng xấu, tiêu đề chương dính hoặc lặp. "
+            "Không thêm ý mới. Chỉ trả về đúng đoạn đã sửa.\n\n"
+            f"{chunk}"
+        )
+        try:
+            fixed = _generate_once(provider, model, prompt).strip()
+        except RateLimitExceededError:
+            LOGGER.warning(
+                "final_cleanup (chunked) rate-limited | unit=%s chunk=%s/%s",
+                unit_key,
+                idx,
+                total,
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "final_cleanup (chunked) failed | unit=%s chunk=%s/%s",
+                unit_key,
+                idx,
+                total,
+            )
+            raise
+        LOGGER.info(
+            "final_cleanup (chunked) fixed | unit=%s chunk=%s/%s in %.1fs",
+            unit_key,
+            idx,
+            total,
+            time.perf_counter() - started,
+        )
+        translated_chunks.append(fixed)
+        _save_repair_progress(config, stage_prefix, unit_key, translated_chunks)
+        time.sleep(config.translation.chunk_sleep_seconds)
+    _clear_repair_progress(config, stage_prefix, unit_key)
+    return "".join(translated_chunks)
+
+
+def repair_against_source_chunked(
+    config: NovelConfig,
+    provider,
+    model: str,
+    *,
+    unit_key: str,
+    source_text: str,
+    translated_text: str,
+) -> str:
+    """
+    Repair against source in multiple smaller windows to reduce TPM bursts.
+
+    This is triggered only when we still detect Han residue after other cleanup stages.
+    Progress is persisted so queue workers can release on quota and resume later.
+    """
+
+    chunk_max_len_raw = os.environ.get("NOVEL_TTS_REPAIR_CHUNK_MAX_LEN", "").strip()
+    try:
+        chunk_max_len = int(chunk_max_len_raw) if chunk_max_len_raw else 0
+    except ValueError:
+        chunk_max_len = 0
+    if chunk_max_len <= 0:
+        model_chunk_raw = os.environ.get("CHUNK_MAX_LEN", "").strip()
+        try:
+            chunk_max_len = int(model_chunk_raw) if model_chunk_raw else 0
+        except ValueError:
+            chunk_max_len = 0
+    if chunk_max_len <= 0:
+        chunk_max_len = int(getattr(config.translation, "chunk_max_len", 0) or 0)
+    if chunk_max_len <= 0:
+        chunk_max_len = 1600
+    chunk_max_len = max(400, int(chunk_max_len))
+
+    # Keep translated windows smaller; include a bit more source context.
+    translated_windows = split_chunks(translated_text, chunk_max_len)
+    source_window_chars = max(1200, int(chunk_max_len * 2.2))
+
+    stage_fingerprint = _hash_text(str(chunk_max_len) + "\n" + source_text + "\n" + translated_text)[:12]
+    stage_prefix = f"repair_against_source_{stage_fingerprint}"
+    repaired = _load_repair_progress(config, stage_prefix, unit_key)
+    if repaired and len(repaired) > len(translated_windows):
+        repaired = repaired[: len(translated_windows)]
+
+    total = len(translated_windows)
+    if repaired:
+        LOGGER.info(
+            "repair_against_source (chunked) resuming | unit=%s repaired=%s total=%s chunk_max_len=%s model=%s",
+            unit_key,
+            len(repaired),
+            total,
+            chunk_max_len,
+            model,
+        )
+    else:
+        LOGGER.info(
+            "repair_against_source (chunked) starting | unit=%s total=%s chunk_max_len=%s model=%s",
+            unit_key,
+            total,
+            chunk_max_len,
+            model,
+        )
+    for idx in range(len(repaired), total):
+        center = (idx + 0.5) / max(1, total)
+        src_window = _slice_center(source_text, max_chars=source_window_chars, center_frac=center)
+        tr_window = translated_windows[idx]
+        LOGGER.info(
+            "repair_against_source (chunked) fixing | unit=%s chunk=%s/%s chars=%s han=%s",
+            unit_key,
+            idx + 1,
+            total,
+            len(tr_window),
+            count_han_chars(tr_window),
+        )
+        started = time.perf_counter()
+        prompt = (
+            f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
+            "Dưới đây là bản gốc tiếng Trung (TRÍCH) và bản dịch tiếng Việt hiện có (TRÍCH) của cùng một đoạn.\n"
+            "Nhiệm vụ của ngươi:\n"
+            "- Chỉ sửa đoạn BẢN DỊCH HIỆN CÓ sao cho khớp với BẢN GỐC.\n"
+            "- Giữ nguyên ý và thứ tự theo BẢN GỐC, không thêm ý, không cắt mất nội dung.\n"
+            "- Phải thay hết toàn bộ chữ Hán còn sót (kể cả chữ Hán lẻ bị trộn trong câu tiếng Việt).\n"
+            "- Không viết tiêu đề/ghi chú, không nhắc lại phần ngoài đoạn này.\n"
+            "- Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH) tương ứng.\n\n"
+            f"BẢN GỐC (TRÍCH):\n{src_window}\n\n"
+            f"BẢN DỊCH HIỆN CÓ (TRÍCH):\n{tr_window}"
+        )
+        try:
+            fixed = _generate_once(provider, model, prompt).strip()
+        except RateLimitExceededError:
+            LOGGER.warning(
+                "repair_against_source (chunked) rate-limited | unit=%s chunk=%s/%s",
+                unit_key,
+                idx + 1,
+                total,
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "repair_against_source (chunked) failed | unit=%s chunk=%s/%s",
+                unit_key,
+                idx + 1,
+                total,
+            )
+            raise
+        LOGGER.info(
+            "repair_against_source (chunked) fixed | unit=%s chunk=%s/%s in %.1fs han=%s",
+            unit_key,
+            idx + 1,
+            total,
+            time.perf_counter() - started,
+            count_han_chars(fixed),
+        )
+        repaired.append(fixed)
+        _save_repair_progress(config, stage_prefix, unit_key, repaired)
+        time.sleep(config.translation.chunk_sleep_seconds)
+
+    _clear_repair_progress(config, stage_prefix, unit_key)
+    return "".join(repaired)
+
+
+def _extract_glossary_updates_chunked(
+    config: NovelConfig,
+    provider,
+    source_text: str,
+    translated_text: str,
+    *,
+    unit_key: str,
+) -> dict[str, str]:
+    """
+    Extract glossary updates using multiple smaller windows to reduce per-call TPM.
+
+    This is similar in spirit to translation chunking: we persist partial progress to
+    `input/<novel>/.progress/glossary__<unit_key>.json` so quota releases can resume later.
+    """
+
+    if PLACEHOLDER_TOKEN_RE.search(translated_text):
+        LOGGER.warning("Skipping glossary auto-update because translation still contains placeholder tokens")
+        return {}
+
+    max_source_chars_raw = os.environ.get("NOVEL_TTS_GLOSSARY_EXTRACT_MAX_SOURCE_CHARS", "").strip()
+    max_translated_chars_raw = os.environ.get("NOVEL_TTS_GLOSSARY_EXTRACT_MAX_TRANSLATED_CHARS", "").strip()
+    try:
+        max_source_chars = int(max_source_chars_raw) if max_source_chars_raw else 2600
+    except ValueError:
+        max_source_chars = 2600
+    try:
+        max_translated_chars = int(max_translated_chars_raw) if max_translated_chars_raw else 4200
+    except ValueError:
+        max_translated_chars = 4200
+
+    # Per-window budgets (smaller than the one-shot defaults).
+    # In queue mode, align window sizes with the per-model CHUNK_MAX_LEN injected by the worker, so glossary/repair
+    # stays consistent with translation chunking for each model.
+    chunk_max_len_raw = os.environ.get("CHUNK_MAX_LEN", "").strip()
+    try:
+        model_chunk_max_len = int(chunk_max_len_raw) if chunk_max_len_raw else 0
+    except ValueError:
+        model_chunk_max_len = 0
+    if model_chunk_max_len <= 0:
+        model_chunk_max_len = int(getattr(config.translation, "chunk_max_len", 0) or 0)
+
+    win_source_raw = os.environ.get("NOVEL_TTS_GLOSSARY_EXTRACT_MAX_SOURCE_CHARS_PER_WINDOW", "").strip()
+    win_translated_raw = os.environ.get("NOVEL_TTS_GLOSSARY_EXTRACT_MAX_TRANSLATED_CHARS_PER_WINDOW", "").strip()
+    try:
+        win_source_chars = (
+            int(win_source_raw) if win_source_raw else max(400, min(max_source_chars, model_chunk_max_len))
+        )
+    except ValueError:
+        win_source_chars = max(400, min(max_source_chars, model_chunk_max_len))
+    try:
+        win_translated_chars = (
+            int(win_translated_raw)
+            if win_translated_raw
+            else max(500, min(max_translated_chars, int(model_chunk_max_len * 1.7) if model_chunk_max_len > 0 else 0))
+        )
+    except ValueError:
+        win_translated_chars = max(500, min(max_translated_chars, int(model_chunk_max_len * 1.7) if model_chunk_max_len > 0 else 0))
+
+    win_count_raw = os.environ.get("NOVEL_TTS_GLOSSARY_EXTRACT_WINDOW_COUNT", "").strip()
+    try:
+        window_count = int(win_count_raw) if win_count_raw else 3
+    except ValueError:
+        window_count = 3
+    window_count = max(1, min(7, window_count))
+
+    # If the chapter is small, fall back to one-shot behavior.
+    compact_source, compact_translated, was_compacted = _compact_glossary_context(
+        source_text,
+        translated_text,
+        max_source_chars=max_source_chars,
+        max_translated_chars=max_translated_chars,
+    )
+    total_chars = len(compact_source) + len(compact_translated)
+    if (not was_compacted) and (total_chars <= (win_source_chars + win_translated_chars)):
+        return _extract_glossary_updates(config, provider, source_text, translated_text)
+
+    model = config.translation.repair_model or config.translation.model
+    LOGGER.info(
+        "Glossary extract chunked | unit=%s windows=%s src_win=%s tr_win=%s model=%s",
+        unit_key,
+        window_count,
+        win_source_chars,
+        win_translated_chars,
+        model,
+    )
+
+    # Choose window centers: evenly spaced from head->tail, including both ends.
+    if window_count == 1:
+        centers = [0.5]
+    else:
+        centers = [i / (window_count - 1) for i in range(window_count)]
+
+    progress = _load_glossary_progress(config, unit_key) if unit_key else {}
+    start_index = int(progress.get("next_window_index", 0) or 0)
+    extracted: dict[str, str] = {}
+    raw_updates = progress.get("updates")
+    if isinstance(raw_updates, dict):
+        extracted = {str(k): str(v) for k, v in raw_updates.items() if isinstance(k, str) and isinstance(v, str)}
+
+    if start_index > 0 or extracted:
+        LOGGER.info(
+            "Glossary extract chunked resuming | unit=%s next_window=%s/%s extracted=%s model=%s",
+            unit_key,
+            start_index + 1,
+            len(centers),
+            len(extracted),
+            model,
+        )
+    else:
+        LOGGER.info(
+            "Glossary extract chunked starting | unit=%s windows=%s model=%s",
+            unit_key,
+            len(centers),
+            model,
+        )
+
+    for idx, center in enumerate(centers[start_index:], start_index + 1):
+        # Align slices by relative position in the raw texts.
+        raw_src = _slice_center(source_text, max_chars=max_source_chars * 2, center_frac=center)
+        raw_tr = _slice_center(translated_text, max_chars=win_translated_chars, center_frac=center)
+        compact_src = _compact_source_for_glossary(raw_src, max_chars=win_source_chars)
+        compact_tr = _slice_head_tail(raw_tr, win_translated_chars)
+        LOGGER.info(
+            "Glossary extract chunked extracting | unit=%s window=%s/%s center=%.2f src_chars=%s tr_chars=%s extracted=%s",
+            unit_key,
+            idx,
+            len(centers),
+            center,
+            len(compact_src),
+            len(compact_tr),
+            len(extracted),
+        )
+        started = time.perf_counter()
+        prompt = (
+            "Hãy trích xuất glossary thuật ngữ từ cặp văn bản sau.\n"
+            "Mục tiêu: dùng cho các chương sau của cùng một truyện để giữ cách dịch nhất quán.\n"
+            "Chỉ lấy mục thật sự nên tái sử dụng: tên người, tên trường, địa danh, tổ chức, chức danh riêng, biệt hiệu, thuật ngữ riêng.\n"
+            "Không lấy đại từ, động từ, tính từ, câu hoàn chỉnh, từ thông dụng.\n"
+            "Khóa phải là cụm chữ Hán xuất hiện nguyên văn trong bản gốc. Giá trị phải là đúng cách gọi tiếng Việt đã dùng trong bản dịch.\n"
+            "Giá trị bắt buộc phải xuất hiện nguyên văn trong BẢN DỊCH (copy y nguyên), không được tự bịa hoặc tự suy diễn.\n"
+            "Tuyệt đối không trả về mã placeholder dạng ZXQ123QXZ hoặc QZX123QXZ.\n"
+            "Nếu chưa chắc chắn hoặc bản dịch không thể hiện rõ, bỏ qua.\n"
+            "Ưu tiên cụm dài, tránh tạo mục con dư thừa khi đã có mục dài hơn cùng nghĩa.\n"
+            "Chỉ trả về JSON object thuần, không markdown, không giải thích.\n\n"
+            f"WINDOW {idx}/{len(centers)}:\n"
+            f"BẢN GỐC (TRÍCH):\n{compact_src}\n\n"
+            f"BẢN DỊCH (TRÍCH):\n{compact_tr}\n"
+        )
+        try:
+            updates = _parse_glossary_response(_generate_once(provider, model, prompt))
+        except RateLimitExceededError:
+            LOGGER.warning(
+                "Glossary extract chunked rate-limited | unit=%s window=%s/%s",
+                unit_key,
+                idx,
+                len(centers),
+            )
+            raise
+        except Exception:
+            LOGGER.exception(
+                "Glossary extract chunked failed | unit=%s window=%s/%s",
+                unit_key,
+                idx,
+                len(centers),
+            )
+            raise
+        updates = _sanitize_extracted_glossary_updates(updates, translated_text)
+        before_count = len(extracted)
+        added_count = 0
+        if updates:
+            for k, v in updates.items():
+                if k not in extracted:
+                    added_count += 1
+                extracted[k] = v
+        if unit_key:
+            _save_glossary_progress(
+                config,
+                unit_key,
+                {
+                    "next_window_index": idx,
+                    "updates": extracted,
+                },
+            )
+        LOGGER.info(
+            "Glossary extract chunked extracted | unit=%s window=%s/%s in %.1fs added=%s total=%s",
+            unit_key,
+            idx,
+            len(centers),
+            time.perf_counter() - started,
+            added_count,
+            max(before_count, len(extracted)),
+        )
+
+    if unit_key:
+        _clear_glossary_progress(config, unit_key)
+    return extracted
+
+
 GENERIC_GLOSSARY_TARGETS = {
     # Too generic to be useful and easy to mislearn from context.
     "tiên quân",
@@ -427,7 +1246,16 @@ def update_glossary_from_chapter(
     if marker_path is not None:
         _write_glossary_marker(marker_path, status=GLOSSARY_STATUS_PENDING, last_error="")
     try:
-        updates = _extract_glossary_updates(config, provider, source_text, translated_text)
+        if unit_key:
+            updates = _extract_glossary_updates_chunked(
+                config,
+                provider,
+                source_text,
+                translated_text,
+                unit_key=unit_key,
+            )
+        else:
+            updates = _extract_glossary_updates(config, provider, source_text, translated_text)
         if updates:
             merged, added = _merge_glossary_file(config, updates)
             LOGGER.info("Updated glossary | added=%s total=%s", added, len(merged))
@@ -808,9 +1636,46 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
     repair_model = _repair_model(config)
     refresh_glossary(config)
     provider = get_translation_provider(translation_cfg.provider)
-    masked, mapping = make_placeholders(raw_text, translation_cfg.glossary)
+    raw_sha1 = _hash_text(raw_text)
+    snapshot = _load_placeholders_snapshot(config, unit_key)
+    snapshot_sha1 = snapshot.get("raw_sha1") if isinstance(snapshot, dict) else None
+    snapshot_repls = snapshot.get("replacements") if isinstance(snapshot, dict) else None
+    if isinstance(snapshot_sha1, str) and snapshot_sha1 == raw_sha1 and isinstance(snapshot_repls, list) and snapshot_repls:
+        masked, mapping = _apply_placeholders_snapshot(raw_text, snapshot_repls)
+        LOGGER.info(
+            "Loaded placeholder snapshot | unit=%s replacements=%s",
+            unit_key,
+            len(snapshot_repls),
+        )
+    else:
+        masked, mapping, replacements = make_placeholders_with_replacements(raw_text, translation_cfg.glossary)
+        _save_placeholders_snapshot(
+            config,
+            unit_key,
+            {
+                "raw_sha1": raw_sha1,
+                "replacements": replacements,
+            },
+        )
+        LOGGER.info(
+            "Saved placeholder snapshot | unit=%s replacements=%s",
+            unit_key,
+            len(replacements),
+        )
     chunks = split_chunks(masked, translation_cfg.chunk_max_len)
-    translated_chunks = load_progress(config, unit_key)
+    translate_fingerprint = _hash_text(
+        f"{raw_sha1}\n{translation_cfg.chunk_max_len}\n{len(masked)}\n{len(mapping)}\n{config.translation.model}"
+    )[:12]
+    translate_progress_key = f"translate_{translate_fingerprint}__{unit_key}"
+    translated_chunks = load_progress(config, translate_progress_key)
+    if translated_chunks:
+        LOGGER.info(
+            "Loaded translate progress | unit=%s chunks=%s/%s chunk_max_len=%s",
+            unit_key,
+            len(translated_chunks),
+            len(chunks),
+            translation_cfg.chunk_max_len,
+        )
     LOGGER.info("QUEUE_PHASE translate | unit=%s", unit_key)
     glossary_text = "\n".join(f"- {token} = {value}" for token, value in mapping.items())
     for idx, chunk in enumerate(chunks[len(translated_chunks):], len(translated_chunks) + 1):
@@ -827,33 +1692,41 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
             len(chunk),
         )
         translated_chunks.append(result.replace(translation_cfg.line_token, "\n"))
-        save_progress(config, unit_key, translated_chunks)
+        save_progress(config, translate_progress_key, translated_chunks)
         time.sleep(translation_cfg.chunk_sleep_seconds)
     LOGGER.info("QUEUE_PHASE repair | unit=%s", unit_key)
     merged = restore_placeholders("".join(translated_chunks), mapping)
+    # If any placeholder-like tokens survive restoration, they are either hallucinated tokens or stale progress.
+    # Repair them chunk-by-chunk so TPM gating can resume instead of failing the whole job.
+    if PLACEHOLDER_TOKEN_RE.search(merged):
+        LOGGER.info("Placeholder tokens detected after merge; repairing (chunked) | unit=%s", unit_key)
+        started = time.perf_counter()
+        merged = _repair_placeholder_tokens_chunked(
+            config,
+            provider,
+            repair_model,
+            unit_key=unit_key,
+            source_text=raw_text,
+            translated_chunks=translated_chunks,
+            mapping=mapping,
+        )
+        LOGGER.info(
+            "placeholder-token repair (chunked) done in %.1fs | unit=%s",
+            time.perf_counter() - started,
+            unit_key,
+        )
+        merged = restore_placeholders(merged, mapping)
+
     merged = post_process(merged, translation_cfg.post_replacements)
     merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
-    # Placeholder tokens should never survive placeholder restoration. If they do, we repair against source.
-    if PLACEHOLDER_TOKEN_RE.search(merged):
-        LOGGER.info("Placeholder tokens detected after merge; repairing | unit=%s", unit_key)
-        try:
-            started = time.perf_counter()
-            merged = repair_placeholder_tokens_against_source(config, provider, repair_model, raw_text, merged)
-            LOGGER.info(
-                "placeholder-token repair done in %.1fs | unit=%s",
-                time.perf_counter() - started,
-                unit_key,
-            )
-            merged = restore_placeholders(merged, mapping)
-            merged = post_process(merged, translation_cfg.post_replacements)
-            merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
-        except Exception as exc:
-            LOGGER.warning("placeholder token repair failed for %s: %s", unit_key, exc)
     if has_han(merged) and count_han_chars(merged) > 12:
         LOGGER.info("Han residue detected; running final_cleanup | unit=%s count=%s", unit_key, count_han_chars(merged))
         try:
             started = time.perf_counter()
-            merged = restore_placeholders(final_cleanup(config, provider, repair_model, merged, mapping), mapping)
+            merged = restore_placeholders(
+                final_cleanup_chunked(config, provider, repair_model, unit_key=unit_key, text=merged, mapping=mapping),
+                mapping,
+            )
             LOGGER.info(
                 "final_cleanup done in %.1fs | unit=%s",
                 time.perf_counter() - started,
@@ -861,6 +1734,8 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
             )
             merged = post_process(merged, translation_cfg.post_replacements)
             merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+        except RateLimitExceededError:
+            raise
         except Exception as exc:
             LOGGER.warning("final_cleanup failed for %s: %s", unit_key, exc)
     if has_han(merged):
@@ -881,7 +1756,14 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
     if has_han(merged):
         LOGGER.info("Han residue detected; repairing against source | unit=%s count=%s", unit_key, count_han_chars(merged))
         started = time.perf_counter()
-        merged = repair_against_source(config, provider, repair_model, raw_text, merged)
+        merged = repair_against_source_chunked(
+            config,
+            provider,
+            repair_model,
+            unit_key=unit_key,
+            source_text=raw_text,
+            translated_text=merged,
+        )
         LOGGER.info(
             "repair_against_source done in %.1fs | unit=%s count=%s",
             time.perf_counter() - started,
@@ -926,9 +1808,38 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
     merged = post_process(merged, translation_cfg.post_replacements)
     merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
     if PLACEHOLDER_TOKEN_RE.search(merged):
-        LOGGER.error("Placeholder tokens survived final restoration | unit=%s", unit_key)
-        raise RuntimeError(f"Still contains placeholder tokens after restoration: {unit_key}")
-    clear_progress(config, unit_key)
+        remaining = sorted(set(PLACEHOLDER_TOKEN_RE.findall(merged)))
+        LOGGER.warning(
+            "Placeholder tokens survived final restoration; retrying repair up to 2 more passes | unit=%s count=%s examples=%s",
+            unit_key,
+            len(remaining),
+            ", ".join(remaining[:8]),
+        )
+        for retry_idx, prefix in enumerate(("repair_placeholders_retry1", "repair_placeholders_retry2"), 1):
+            if not PLACEHOLDER_TOKEN_RE.search(merged):
+                break
+            LOGGER.warning("Placeholder-token retry pass %s/2 | unit=%s", retry_idx, unit_key)
+            merged = _repair_placeholder_tokens_in_text_chunked(
+                config,
+                provider,
+                repair_model,
+                unit_key=unit_key,
+                source_text=raw_text,
+                translated_text=merged,
+                prefix=prefix,
+            )
+            merged = post_process(merged, translation_cfg.post_replacements)
+            merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+
+        if PLACEHOLDER_TOKEN_RE.search(merged):
+            remaining = sorted(set(PLACEHOLDER_TOKEN_RE.findall(merged)))
+            LOGGER.warning(
+                "Accepting translation despite residual placeholder tokens (operator will run translate repair) | unit=%s count=%s examples=%s",
+                unit_key,
+                len(remaining),
+                ", ".join(remaining[:8]),
+            )
+    clear_progress(config, translate_progress_key)
     return merged
 
 
@@ -949,6 +1860,14 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
     # leave orphan ZXQ...QXZ tokens in the merged output if we resume old chunks.
     if force:
         clear_progress(config, unit_key)
+        _clear_repair_progress_prefix(config, "translate", unit_key)
+        _clear_placeholders_snapshot(config, unit_key)
+        # Also clear repair-stage progress so we don't mix old windows with new masking.
+        _clear_repair_progress_prefix(config, "repair_placeholders", unit_key)
+        _clear_repair_progress_prefix(config, "repair_placeholders_retry1", unit_key)
+        _clear_repair_progress_prefix(config, "repair_placeholders_retry2", unit_key)
+        _clear_repair_progress_prefix(config, "final_cleanup", unit_key)
+        _clear_repair_progress_prefix(config, "repair_against_source", unit_key)
 
     needs_translate = force or (not part_path.exists()) or part_path.stat().st_mtime < source_path.stat().st_mtime
     if needs_translate:

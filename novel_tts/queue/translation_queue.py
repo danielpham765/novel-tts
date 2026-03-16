@@ -4,10 +4,12 @@ import json
 import math
 import os
 import re
+import requests
 import shlex
 import subprocess
 import sys
 import time
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -35,6 +37,206 @@ _OUT_OF_QUOTA_TOKENS = (
     "worker entering out-of-quota cooldown",
     "out_of_quota",
 )
+
+_INLINE_QUOTA_WAIT_MAX_SECONDS = 5.0
+_RATE_LIMIT_PROBE_COOLDOWN_SECONDS = 60.0
+
+
+def _rate_limit_requeue_delay_seconds(consecutive_releases: int) -> float:
+    """
+    Backoff used when releasing a job due to HTTP 429 rate limits.
+
+    The goal is to avoid immediately re-picking the same job across workers/keys, which can create a 429 storm.
+    Keep this delay short (seconds) because longer "out of quota" situations are handled separately by the
+    worker cooldown logic.
+    """
+
+    try:
+        n = int(consecutive_releases)
+    except Exception:
+        n = 1
+    n = max(1, n)
+    # Exponential backoff capped at 60s: 3, 6, 12, 24, 48, 60...
+    base = min(60.0, 3.0 * (2 ** (min(n, 6) - 1)))
+    return max(1.0, float(base))
+
+
+def _rate_limit_cooldown_key(config: NovelConfig, *, key_index: int, model: str) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"rate_limit_cooldown:k{int(key_index)}:{safe_model}")
+
+
+def _out_of_quota_cooldown_key(config: NovelConfig, *, key_index: int, model: str) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"out_of_quota_cooldown:k{int(key_index)}:{safe_model}")
+
+
+def _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key: str) -> float:
+    try:
+        raw = client.get(cooldown_key)
+        until = float(raw) if raw is not None else 0.0
+    except Exception:
+        return 0.0
+    return max(0.0, float(until) - time.time())
+
+
+def _extend_rate_limit_cooldown_capped(client, cooldown_key: str, *, seconds: float, max_seconds: float) -> float:
+    try:
+        cap = float(max_seconds)
+    except Exception:
+        cap = 0.0
+    if cap > 0:
+        try:
+            seconds = min(float(seconds), cap)
+        except Exception:
+            seconds = cap
+    return _extend_rate_limit_cooldown(client, cooldown_key, seconds=float(seconds))
+
+
+def _extend_rate_limit_cooldown(client, cooldown_key: str, *, seconds: float) -> float:
+    try:
+        wait_seconds = float(seconds)
+    except Exception:
+        wait_seconds = 0.0
+    wait_seconds = max(0.0, wait_seconds)
+    now = time.time()
+    until = now + wait_seconds
+    ttl = int(max(2.0, wait_seconds + 10.0))
+    try:
+        current_raw = client.get(cooldown_key)
+        if current_raw is not None:
+            try:
+                current_until = float(current_raw)
+            except Exception:
+                current_until = 0.0
+            if current_until >= until:
+                return current_until
+        client.set(cooldown_key, str(until), ex=ttl)
+    except Exception:
+        return until
+    return until
+
+
+def _interruptible_sleep(
+    *,
+    max_seconds: float,
+    check_remaining_seconds,
+    step_seconds: float = 1.0,
+    min_sleep_seconds: float = 0.25,
+) -> None:
+    """
+    Sleep up to max_seconds, but wake early when the wait condition clears.
+
+    Used so operator actions (e.g. `queue reset` clearing Redis keys) can unblock workers promptly,
+    instead of waiting for a long `time.sleep()` to finish.
+    """
+    deadline = time.monotonic() + max(0.0, float(max_seconds or 0.0))
+    step = max(0.05, float(step_seconds or 0.0))
+    min_sleep = max(0.01, float(min_sleep_seconds or 0.0))
+    while True:
+        remaining_gate = 0.0
+        try:
+            remaining_gate = float(check_remaining_seconds() or 0.0)
+        except Exception:
+            remaining_gate = 0.0
+        if remaining_gate <= 0.05:
+            return
+
+        remaining_budget = deadline - time.monotonic()
+        if remaining_budget <= 0:
+            return
+
+        sleep_seconds = min(remaining_budget, remaining_gate, step)
+        time.sleep(max(min_sleep, sleep_seconds))
+
+
+def _probe_gemini_429(*, api_key: str, model: str, timeout_seconds: float = 10.0) -> bool | None:
+    """
+    Lightweight "ping" request to detect whether the Gemini API is currently returning HTTP 429.
+
+    Returns:
+      - True: confirmed 429
+      - False: request completed and was not 429 (any other status)
+      - None: probe failed (network/timeout/invalid inputs)
+    """
+
+    api_key = (api_key or "").strip()
+    model = (model or "").strip()
+    if not api_key or not model:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {
+        "contents": [{"parts": [{"text": "hello"}]}],
+        "generationConfig": {"temperature": 0.0, "topP": 0.9, "maxOutputTokens": 1},
+    }
+    try:
+        response = requests.post(
+            url,
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except Exception as exc:
+        LOGGER.debug("Gemini 429 probe failed | model=%s err=%s", model, exc)
+        return None
+    return bool(response.status_code == 429)
+
+
+def _parse_quota_suggested_wait_seconds(text: str) -> float | None:
+    if not text:
+        return None
+    # CLI logs: "Gemini quota exceeded (... suggested_wait=4.58s)"
+    match = re.search(r"suggested_wait=([0-9]+(?:\.[0-9]+)?)s", text, flags=re.I)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    # Provider logs: "Gemini quota wait 5.5s | ..."
+    match = re.search(r"\bquota wait\s+([0-9]+(?:\.[0-9]+)?)s\b", text, flags=re.I)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_quota_blocked_model(text: str) -> str | None:
+    if not text:
+        return None
+    # Worker logs: "... blocked_model=<model> ..."
+    match = re.search(r"\bblocked_model\s*=\s*([A-Za-z0-9_.:-]+)", text, flags=re.I)
+    if match:
+        value = (match.group(1) or "").strip()
+        return value or None
+    # CLI quota error: "... quota exceeded (model=<model> ...)"
+    match = re.search(r"\bmodel\s*=\s*([A-Za-z0-9_.:-]+)", text, flags=re.I)
+    if match:
+        value = (match.group(1) or "").strip()
+        return value or None
+    return None
+
+
+def _parse_quota_estimated_tokens(text: str) -> int | None:
+    """
+    Parse the "+<estimated>/<limit>" token component from provider quota logs.
+
+    Example:
+      "tokens=8801+7791/15000" -> 7791
+    """
+
+    if not text:
+        return None
+    match = re.search(r"tokens=\s*\d+\s*\+\s*(\d+)\s*/\s*\d+", text, flags=re.I)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _tail_lines(path: str, max_bytes: int = 16384, max_lines: int = 80) -> list[str]:
@@ -175,14 +377,169 @@ def _extract_target_from_argv(argv: list[str]) -> str:
     return _format_target(file_arg, chapter_arg)
 
 
+def _split_csv_flags(values: list[str]) -> list[str]:
+    """
+    Parse repeatable argparse flags that also allow comma-separated values.
+
+    Example:
+      ["k1,k2", "k3"] -> ["k1", "k2", "k3"]
+    """
+    parsed: list[str] = []
+    for raw in values or []:
+        for part in str(raw).split(","):
+            part = part.strip()
+            if part:
+                parsed.append(part)
+    return parsed
+
+
+def _resolve_key_indices(selectors: list[str], keys: list[str]) -> list[int]:
+    """
+    Resolve key selectors into key indices (1-based).
+
+    Selectors can be:
+      - "k5" (key index)
+      - raw key string (exact match in keys file)
+    """
+    resolved: list[int] = []
+    for selector in selectors:
+        value = str(selector or "").strip()
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered.startswith("k") and lowered[1:].isdigit():
+            idx = int(lowered[1:])
+            if idx <= 0 or idx > len(keys):
+                raise ValueError(f"Invalid key index {value!r} (expected 1..{len(keys)})")
+            resolved.append(idx)
+            continue
+        # Raw key: must exactly match a key in the file.
+        try:
+            resolved.append(keys.index(value) + 1)
+        except ValueError as exc:
+            raise ValueError(f"Unknown raw key {value!r} (no exact match in keys file)") from exc
+
+    # Deduplicate while preserving order.
+    seen: set[int] = set()
+    unique: list[int] = []
+    for idx in resolved:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        unique.append(idx)
+    return unique
+
+
+def _reset_queue_key_state(client, config: NovelConfig, *, key_indices: list[int], models: list[str]) -> int:
+    deleted = 0
+    for key_index in key_indices:
+        # Per-key pick throttle.
+        deleted += int(client.delete(_pick_last_ms_key(config, key_index)) or 0)
+        for model in models:
+            deleted += int(client.delete(_rate_limit_cooldown_key(config, key_index=key_index, model=model)) or 0)
+            deleted += int(client.delete(_out_of_quota_cooldown_key(config, key_index=key_index, model=model)) or 0)
+            deleted += int(client.delete(_minute_quota_key(config, key_index, model)) or 0)
+            deleted += int(client.delete(_minute_token_key(config, key_index, model)) or 0)
+            deleted += int(client.delete(_daily_quota_key(config, key_index, model)) or 0)
+    return deleted
+
+
+def reset_queue_key_state(config: NovelConfig, *, key_selectors: list[str], model_selectors: list[str] | None = None) -> int:
+    """
+    Reset per-key queue state in Redis (cooldown + quota + pick throttle).
+
+    - key_selectors: list of "kN" or raw keys (exact match).
+    - model_selectors: optional list of enabled model names (supports comma-separated in CLI parsing).
+      If omitted/empty, defaults to config.queue.enabled_models.
+    """
+    keys_raw = _load_keys(config)
+    selectors = _split_csv_flags(key_selectors or [])
+    if not selectors:
+        raise ValueError("Missing --key (expected kN or raw key)")
+    key_indices = _resolve_key_indices(selectors, keys_raw)
+    if not key_indices:
+        raise ValueError("No valid keys resolved from --key")
+
+    enabled_models = list(config.queue.enabled_models or [])
+    models = _split_csv_flags(list(model_selectors or [])) if model_selectors else []
+    if not models:
+        models = enabled_models
+    if not models:
+        raise ValueError("No models configured (queue.enabled_models is empty)")
+
+    unknown_models = [m for m in models if m not in enabled_models]
+    if unknown_models:
+        raise ValueError(
+            "Unknown --model value(s): "
+            + ", ".join(sorted(set(unknown_models)))
+            + " (expected one of enabled_models: "
+            + ", ".join(enabled_models)
+            + ")"
+        )
+
+    client = _client(config)
+    deleted = _reset_queue_key_state(client, config, key_indices=key_indices, models=models)
+    keys_text = ",".join(f"k{idx}" for idx in key_indices)
+    models_text = ",".join(models)
+    print(f"Reset key state | novel={config.novel_id} keys={keys_text} models={models_text} deleted={deleted}")
+    return 0
+
+
+def _unique_target_count(rows: list[dict[str, str]]) -> int:
+    """Count unique chapter targets currently being processed.
+
+    Prefer translate-chapter subprocess targets to avoid double-counting when a worker
+    surfaces the same target as its child.
+    """
+
+    def _targets_for_role(role: str) -> set[str]:
+        targets: set[str] = set()
+        for row in rows:
+            if (row.get("role") or "") != role:
+                continue
+            value = (row.get("target") or "").strip()
+            if value:
+                targets.add(value)
+        return targets
+
+    translate_targets = _targets_for_role("translate-chapter")
+    if translate_targets:
+        return len(translate_targets)
+
+    # Fallback: count any surfaced target (e.g. when subprocess roles aren't present).
+    any_targets: set[str] = set()
+    for row in rows:
+        value = (row.get("target") or "").strip()
+        if value:
+            any_targets.add(value)
+    return len(any_targets)
+
+
 def _classify_process_state(role: str, *, is_busy: bool, log_file: str) -> tuple[str, float | None]:
     """Heuristic state classifier for ps output."""
     lines = _tail_lines(log_file)
     tail = "\n".join(lines[-40:]).lower()
 
-    # Hard errors (exceptions, crashes).
-    if "traceback" in tail or "command failed" in tail:
-        return "error", None
+    # Hard errors (exceptions, crashes) should be visible briefly, but not sticky.
+    # If an error occurred recently (within a short window), surface "error" to catch operator attention.
+    now = datetime.now()
+    error_hold_seconds = 5.0
+    recent_error_line: str | None = None
+    for raw in reversed(lines[-200:]):
+        line = (raw or "").strip()
+        lowered = line.lower()
+        if not lowered:
+            continue
+        if "traceback" in lowered or "command failed" in lowered:
+            recent_error_line = line
+            break
+    if recent_error_line:
+        ts = _parse_log_timestamp(recent_error_line)
+        if ts is None:
+            # Unknown timestamp format: be conservative and show error.
+            return "error", None
+        if (now - ts).total_seconds() <= error_hold_seconds:
+            return "error", None
 
     if role == "worker":
         # Prefer process-tree truth when available.
@@ -191,13 +548,10 @@ def _classify_process_state(role: str, *, is_busy: bool, log_file: str) -> tuple
 
         # When idle (no translate-chapter child), classify based on the most recent relevant log event.
         # We scan from the end so older 429s don't permanently label the worker.
-        now = datetime.now()
         for raw in reversed(lines[-200:]):
             line = (raw or "").lower()
             if not line:
                 continue
-            if "traceback" in line or "command failed" in line:
-                return "error", None
             if any(token in line for token in _OUT_OF_QUOTA_TOKENS):
                 remaining = _waiting_countdown_seconds(raw or "", now=now)
                 if remaining is not None and remaining > 0:
@@ -217,7 +571,6 @@ def _classify_process_state(role: str, *, is_busy: bool, log_file: str) -> tuple
 
     if role == "translate-chapter":
         # This process exists only while doing work, but it may be sleeping on rate limits/quota.
-        now = datetime.now()
         phase: str | None = None
         for raw in reversed(lines[-200:]):
             lowered = (raw or "").lower()
@@ -231,15 +584,37 @@ def _classify_process_state(role: str, *, is_busy: bool, log_file: str) -> tuple
                 remaining = _waiting_countdown_seconds(raw or "", now=now)
                 if remaining is not None and remaining > 0:
                     return "waiting-429", remaining
-            if "traceback" in lowered or "command failed" in lowered:
-                return "error", None
-            if "queue_phase glossary" in lowered:
+            if "read timed out" in lowered or ("connectionpool" in lowered and "timed out" in lowered):
+                phase = "upstream-timeout"
+                break
+            if "connectionerror" in lowered or "connection error" in lowered:
+                phase = "upstream-conn"
+                break
+            # Infer phases from high-signal translation logs so long-running units don't degrade to generic "busy".
+            if (
+                "queue_phase glossary" in lowered
+                or "glossary extract" in lowered
+                or "updated glossary" in lowered
+                or "keeping existing glossary entry" in lowered
+            ):
                 phase = "glossary"
                 break
-            if "queue_phase repair" in lowered:
+            if (
+                "queue_phase repair" in lowered
+                or "final_cleanup" in lowered
+                or "placeholder tokens detected" in lowered
+                or "han residue detected" in lowered
+                or "patch_remaining_han" in lowered
+                or "repair_against_source" in lowered
+                or "aggressive_repair" in lowered
+            ):
                 phase = "repair"
                 break
-            if "queue_phase translate" in lowered:
+            if (
+                "queue_phase translate" in lowered
+                or ("translating " in lowered and " chunk " in lowered)
+                or ("translated " in lowered and " chunk " in lowered)
+            ):
                 phase = "translate"
                 break
             # If we hit a completion marker in this log stream, treat the child as busy only if it's actually running.
@@ -326,6 +701,257 @@ def _client(config: NovelConfig):
 def _key(config: NovelConfig, suffix: str) -> str:
     return f"{config.queue.redis.prefix}:{config.novel_id}:{suffix}"
 
+
+def _pending_priority_key(config: NovelConfig) -> str:
+    return _key(config, "pending_priority")
+
+
+def _pending_delayed_key(config: NovelConfig) -> str:
+    return _key(config, "pending_delayed")
+
+
+def _pending_total_len(config: NovelConfig, client) -> int:
+    return int(client.llen(_pending_priority_key(config)) or 0) + int(client.llen(_key(config, "pending")) or 0)
+
+
+_PICK_THROTTLE_POP_LUA = r"""
+-- KEYS[1] = pending_priority list
+-- KEYS[2] = pending list
+-- KEYS[3] = last_pick_ms key
+-- ARGV[1] = min_interval_ms
+
+local min_ms = tonumber(ARGV[1]) or 0
+if min_ms <= 0 then
+  local job = redis.call('LPOP', KEYS[1])
+  if not job then
+    job = redis.call('LPOP', KEYS[2])
+  end
+  return { job or "", "0" }
+end
+
+local now = redis.call('TIME')
+local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
+
+local last = redis.call('GET', KEYS[3])
+if last then
+  last = tonumber(last) or 0
+  local elapsed = now_ms - last
+  if elapsed < min_ms then
+    return { "", tostring(min_ms - elapsed) }
+  end
+end
+
+local job = redis.call('LPOP', KEYS[1])
+if not job then
+  job = redis.call('LPOP', KEYS[2])
+end
+if not job then
+  return { "", "0" }
+end
+
+redis.call('SET', KEYS[3], tostring(now_ms))
+return { job, "0" }
+"""
+
+
+def _pick_last_ms_key(config: NovelConfig, key_index: int) -> str:
+    # Per-key throttle: all workers for the same key_index will serialize picks.
+    return _key(config, f"last_pick_ms:k{int(key_index)}")
+
+
+def _throttled_pick_job_id(
+    config: NovelConfig,
+    client,
+    *,
+    key_index: int,
+    timeout_seconds: float = 5.0,
+) -> str | None:
+    """
+    Pick a job id from pending_priority/pending with a shared Redis throttle.
+
+    Throttle is scoped to (novel_id, key_index) so multiple worker processes for the same API key
+    won't all pick at once (and then burst LLM requests).
+    """
+
+    min_interval = 0.0
+    try:
+        min_interval = float(getattr(config.queue, "min_pick_interval_seconds", 0.0) or 0.0)
+    except Exception:
+        min_interval = 0.0
+    if min_interval <= 0:
+        item = client.blpop([_pending_priority_key(config), _key(config, "pending")], timeout=int(timeout_seconds))
+        return item[1] if item else None
+
+    min_ms = max(1, int(min_interval * 1000.0))
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
+    last_key = _pick_last_ms_key(config, key_index)
+    pending_priority = _pending_priority_key(config)
+    pending = _key(config, "pending")
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+
+        try:
+            job_id, wait_ms = client.eval(
+                _PICK_THROTTLE_POP_LUA,
+                3,
+                pending_priority,
+                pending,
+                last_key,
+                str(min_ms),
+            )
+        except Exception:
+            # Fall back to legacy behavior if scripting is unavailable/misconfigured.
+            item = client.blpop([pending_priority, pending], timeout=min(5, max(1, int(remaining))))
+            return item[1] if item else None
+
+        job_id = (job_id or "").strip()
+        if job_id:
+            return job_id
+
+        try:
+            wait_seconds = max(0.0, float(wait_ms or 0) / 1000.0)
+        except Exception:
+            wait_seconds = 0.0
+
+        base_sleep = max(0.05, min(0.25, remaining))
+        sleep_seconds = min(remaining, max(base_sleep, wait_seconds) + random.uniform(0.0, 0.05))
+        time.sleep(max(0.01, sleep_seconds))
+
+
+def _requeue_job_priority(config: NovelConfig, client, job_id: str) -> bool:
+    """
+    Requeue a job at the front of the queue to bias toward finishing partially-started work.
+
+    Returns True if the job was newly queued and pushed.
+    """
+
+    if client.sadd(_key(config, "queued"), job_id):
+        client.lpush(_pending_priority_key(config), job_id)
+        return True
+    return False
+
+
+def _delay_job(config: NovelConfig, client, job_id: str, delay_seconds: float) -> None:
+    """
+    Put a released job into a delayed queue so it won't be re-picked until the delay expires.
+
+    This prevents tight requeue/pick loops when the provider recommends a long wait (e.g. TPM gate ~50s).
+    """
+
+    try:
+        delay = float(delay_seconds)
+    except Exception:
+        delay = 0.0
+    if delay <= 0:
+        _requeue_job_priority(config, client, job_id)
+        return
+    now = time.time()
+    ready_at = now + max(0.25, delay)
+    # Keep the job "queued" so the supervisor doesn't enqueue duplicates.
+    client.sadd(_key(config, "queued"), job_id)
+    client.zadd(_pending_delayed_key(config), {job_id: ready_at})
+
+
+def _drain_delayed_jobs(config: NovelConfig, client, *, max_items: int = 500) -> int:
+    """Move due delayed jobs back into the priority queue."""
+    now = time.time()
+    delayed_key = _pending_delayed_key(config)
+    try:
+        ready = client.zrangebyscore(delayed_key, "-inf", now, start=0, num=max_items)
+    except Exception:
+        return 0
+    if not ready:
+        return 0
+    # Maintain zset order (oldest ready first) while pushing into the priority list head.
+    # If ready=[a,b,c], pushing reversed via LPUSH yields [a,b,c,...].
+    with client.pipeline() as pipe:
+        pipe.zrem(delayed_key, *ready)
+        for job_id in reversed(ready):
+            pipe.lpush(_pending_priority_key(config), job_id)
+        pipe.execute()
+    return len(ready)
+
+
+def _any_idle_worker(config: NovelConfig) -> bool:
+    """
+    Best-effort check for whether *any* worker for this novel appears idle (not busy, not waiting).
+
+    Used as a heuristic when deciding whether to hold a quota-gated job vs releasing it back to the queue.
+    If we cannot determine this safely (e.g., ps permission denied), return True to avoid holding work.
+    """
+
+    try:
+        proc = subprocess.run(
+            ["ps", "ax", "-o", "pid=,ppid=,command="],
+            cwd=str(config.storage.root),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+    if proc.returncode != 0:
+        return True
+
+    lines = (proc.stdout or "").splitlines()
+    novel_token = f" {config.novel_id}"
+    workers: dict[str, dict[str, str]] = {}
+    children_by_ppid: dict[str, list[dict[str, str]]] = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_str, ppid_str, cmd = line.split(None, 2)
+        except ValueError:
+            continue
+        pid = pid_str.strip()
+        ppid = ppid_str.strip()
+        if "novel_tts" not in cmd or novel_token not in cmd:
+            continue
+
+        try:
+            argv = shlex.split(cmd)
+        except Exception:
+            argv = cmd.split()
+
+        role = ""
+        log_file = ""
+        if "queue" in argv:
+            q_idx = argv.index("queue")
+            if q_idx + 2 < len(argv) and argv[q_idx + 2] == config.novel_id:
+                subcmd = argv[q_idx + 1] if q_idx + 1 < len(argv) else ""
+                if subcmd == "worker":
+                    role = "worker"
+
+        if not role and "translate" in argv:
+            t_idx = argv.index("translate")
+            if t_idx + 2 < len(argv) and argv[t_idx + 1] == "chapter" and argv[t_idx + 2] == config.novel_id:
+                role = "translate-chapter"
+
+        if not role:
+            continue
+
+        for idx, token in enumerate(argv):
+            if token == "--log-file" and idx + 1 < len(argv):
+                log_file = argv[idx + 1]
+
+        row = {"pid": pid, "ppid": ppid, "role": role, "log_file": log_file}
+        children_by_ppid.setdefault(ppid, []).append(row)
+        if role == "worker":
+            workers[pid] = row
+
+    for pid, row in workers.items():
+        is_busy = any(child.get("role") == "translate-chapter" for child in children_by_ppid.get(pid, []))
+        state, _countdown = _classify_process_state("worker", is_busy=is_busy, log_file=row.get("log_file", "") or "")
+        if state == "idle":
+            return True
+    return False
 
 def _key_file(config: NovelConfig) -> Path:
     return config.storage.root / ".secrets" / "gemini-keys.txt"
@@ -575,8 +1201,7 @@ def _requeue_stale_inflight(config: NovelConfig, client) -> None:
         client.hdel(_key(config, "inflight"), job_id)
         if _has_exhausted_retries(config, client, job_id):
             continue
-        if client.sadd(_key(config, "queued"), job_id):
-            client.rpush(_key(config, "pending"), job_id)
+        _requeue_job_priority(config, client, job_id)
 
 
 def _count_origin_files(config: NovelConfig) -> int:
@@ -649,6 +1274,9 @@ def _write_status_line(
             model = "unknown"
         inflight_by_model[model] = inflight_by_model.get(model, 0) + 1
     status_log, state_log = _status_paths(config)
+    pending_priority = int(client.llen(_pending_priority_key(config)) or 0)
+    pending_normal = int(client.llen(_key(config, "pending")) or 0)
+    pending_delayed = int(client.zcard(_pending_delayed_key(config)) or 0)
     snapshot = {
         "ts": int(time.time()),
         "origin_files": _count_origin_files(config),
@@ -656,7 +1284,10 @@ def _write_status_line(
         "parts": _count_parts(config),
         "checkpoints": _count_checkpoints(config),
         "chapter_total": _total_chapters(config),
-        "pending": client.llen(_key(config, "pending")),
+        "pending": pending_priority + pending_normal,
+        "pending_priority": pending_priority,
+        "pending_normal": pending_normal,
+        "pending_delayed": pending_delayed,
         "queued": client.scard(_key(config, "queued")),
         "inflight": len(inflight_payloads),
         "retries": client.hlen(_key(config, "retries")),
@@ -734,9 +1365,49 @@ def _minute_token_key(config: NovelConfig, key_index: int, model: str) -> str:
 
 
 def _estimate_tokens_from_chars(char_count: int) -> int:
-    input_tokens = max(1, math.ceil(max(0, char_count) / 2.2))
-    output_reserve = max(256, math.ceil(input_tokens * 0.8))
-    return input_tokens + output_reserve
+    """
+    Rough TPM estimate for "should worker pause" checks.
+
+    This is intentionally lightweight (no tokenization call); it should broadly align with the provider-side
+    estimator in `novel_tts.translate.providers` but only has access to chunk character count here.
+    """
+
+    chars = max(0, int(char_count))
+    if chars <= 0:
+        return 1
+
+    chars_per_token_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_CHARS_PER_TOKEN", "").strip()
+    try:
+        chars_per_token = float(chars_per_token_raw) if chars_per_token_raw else 4.0
+    except ValueError:
+        chars_per_token = 4.0
+    chars_per_token = max(0.8, chars_per_token)
+
+    input_tokens = max(1, int(math.ceil(chars / chars_per_token)))
+
+    output_ratio_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_RATIO", "").strip()
+    min_out_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_MIN", "").strip()
+    try:
+        output_ratio = float(output_ratio_raw) if output_ratio_raw else 0.0
+    except ValueError:
+        output_ratio = 0.0
+    try:
+        min_out = int(min_out_raw) if min_out_raw else 0
+    except ValueError:
+        min_out = 0
+
+    output_reserve = 0
+    if output_ratio > 0:
+        output_reserve = max(min_out, int(math.ceil(input_tokens * output_ratio)))
+
+    multiplier_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_SAFETY_MULTIPLIER", "").strip()
+    try:
+        multiplier = float(multiplier_raw) if multiplier_raw else 1.10
+    except ValueError:
+        multiplier = 1.10
+    multiplier = max(1.0, multiplier)
+
+    return max(1, int(math.ceil((input_tokens + output_reserve) * multiplier)))
 
 
 def _estimated_request_tokens_for_model(config: NovelConfig, model: str) -> int:
@@ -788,13 +1459,117 @@ def _model_short_quota_wait_seconds(config: NovelConfig, client, key_index: int,
     estimated_tokens = _estimated_request_tokens_for_model(config, model)
     wait_rpm = 0.0
     if rpm_limit > 0 and current_requests >= rpm_limit and active_members:
-        oldest_score = float(active_members[0][1])
-        wait_rpm = max(0.25, 60.0 - (now - oldest_score) + 0.05)
+        need_drop = current_requests - (rpm_limit - 1)
+        idx = min(len(active_members) - 1, max(0, need_drop - 1))
+        cutoff_score = float(active_members[idx][1])
+        wait_rpm = max(0.25, (cutoff_score + 60.0) - now + 0.05)
     wait_tpm = 0.0
     if tpm_limit > 0 and (current_tokens + estimated_tokens) > tpm_limit and active_members:
-        oldest_score = float(active_members[0][1])
-        wait_tpm = max(0.25, 60.0 - (now - oldest_score) + 0.05)
+        if estimated_tokens > tpm_limit:
+            return 60.0
+        need_reduce = (current_tokens + estimated_tokens) - tpm_limit
+        reduced = 0
+        cutoff_score: float | None = None
+        for member, score in active_members:
+            try:
+                reduced += int(token_map.get(member, "0"))
+            except (TypeError, ValueError):
+                continue
+            if reduced >= need_reduce:
+                cutoff_score = float(score)
+                break
+        if cutoff_score is None:
+            cutoff_score = float(active_members[0][1])
+        wait_tpm = max(0.25, (cutoff_score + 60.0) - now + 0.05)
     return max(wait_rpm, wait_tpm, 0.0)
+
+
+def _quota_wait_seconds_for_request(config: NovelConfig, client, key_index: int, model: str, *, estimated_tokens: int) -> float:
+    """
+    Compute remaining wait time for a specific request size.
+
+    This is used by workers when they decide to hold a job and poll until the quota gate opens,
+    so they don't keep releasing/requeuing or sleeping the whole suggested_wait.
+    """
+
+    model_cfg = config.queue.model_configs.get(model)
+    if model_cfg is None:
+        return 0.0
+    rpm_limit = max(0, int(model_cfg.rpm_limit))
+    tpm_limit = max(0, int(model_cfg.tpm_limit))
+    rpd_limit = max(0, int(model_cfg.rpd_limit))
+
+    if rpm_limit <= 0 and tpm_limit <= 0 and rpd_limit <= 0:
+        return 0.0
+
+    now = time.time()
+    window_start = now - 60.0
+    req_key = _minute_quota_key(config, key_index, model)
+    token_key = _minute_token_key(config, key_index, model)
+    stale_members = client.zrangebyscore(req_key, 0, window_start)
+    if stale_members:
+        client.zrem(req_key, *stale_members)
+        client.hdel(token_key, *stale_members)
+    active_members = client.zrangebyscore(req_key, window_start, "+inf", withscores=True)
+    token_map = client.hgetall(token_key)
+
+    current_requests = len(active_members)
+    current_tokens = 0
+    for member, _score in active_members:
+        try:
+            current_tokens += int(token_map.get(member, "0"))
+        except (TypeError, ValueError):
+            continue
+
+    wait_rpm = 0.0
+    if rpm_limit > 0 and current_requests >= rpm_limit and active_members:
+        need_drop = current_requests - (rpm_limit - 1)
+        idx = min(len(active_members) - 1, max(0, need_drop - 1))
+        cutoff_score = float(active_members[idx][1])
+        wait_rpm = max(0.05, (cutoff_score + 60.0) - now + 0.05)
+
+    wait_tpm = 0.0
+    if tpm_limit > 0 and (current_tokens + estimated_tokens) > tpm_limit and active_members:
+        if estimated_tokens > tpm_limit:
+            wait_tpm = 60.0
+        else:
+            need_reduce = (current_tokens + estimated_tokens) - tpm_limit
+            reduced = 0
+            cutoff_score: float | None = None
+            for member, score in active_members:
+                try:
+                    reduced += int(token_map.get(member, "0"))
+                except (TypeError, ValueError):
+                    continue
+                if reduced >= need_reduce:
+                    cutoff_score = float(score)
+                    break
+            if cutoff_score is None:
+                cutoff_score = float(active_members[0][1])
+            wait_tpm = max(0.05, (cutoff_score + 60.0) - now + 0.05)
+
+    wait_rpd = 0.0
+    if rpd_limit > 0:
+        day_window_start = now - 86400.0
+        daily_key = _daily_quota_key(config, key_index, model)
+        client.zremrangebyscore(daily_key, 0, day_window_start)
+        daily_count = int(client.zcount(daily_key, day_window_start, "+inf") or 0)
+        if daily_count >= rpd_limit:
+            need_drop = daily_count - (rpd_limit - 1)
+            scored = client.zrangebyscore(
+                daily_key,
+                day_window_start,
+                "+inf",
+                start=max(0, need_drop - 1),
+                num=1,
+                withscores=True,
+            )
+            if scored:
+                wait_rpd = max(1.0, (float(scored[0][1]) + 86400.0) - now + 0.05)
+            else:
+                wait_rpd = 60.0
+
+    return max(wait_rpm, wait_tpm, wait_rpd, 0.0)
 
 
 def _worker_should_pause_for_quota(config: NovelConfig, client, key_index: int, model: str) -> tuple[bool, str, float]:
@@ -822,7 +1597,44 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
     client = _client(config)
     worker_id = f"{config.novel_id}:k{key_index}:{model}:{os.getpid()}"
     consecutive_rate_limit_releases = 0
+    cooldown_key = _rate_limit_cooldown_key(config, key_index=key_index, model=model)
+    out_of_quota_key = _out_of_quota_cooldown_key(config, key_index=key_index, model=model)
+    max_429_cooldown_seconds = 65.0
     while True:
+        out_remaining = _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key)
+        if out_remaining > 0.05:
+            sleep_seconds = max(1.0, out_remaining)
+            LOGGER.warning(
+                "Worker cooling down (out-of-quota) | novel=%s key_index=%s model=%s sleeping for %.2fs",
+                config.novel_id,
+                key_index,
+                model,
+                sleep_seconds,
+            )
+            _interruptible_sleep(
+                max_seconds=sleep_seconds,
+                check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key),
+                step_seconds=2.0,
+                min_sleep_seconds=0.5,
+            )
+            continue
+        remaining = _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key)
+        if remaining > 0.05:
+            sleep_seconds = max(0.25, remaining)
+            LOGGER.warning(
+                "Worker cooling down due to rate limit (429) | novel=%s key_index=%s model=%s sleeping for %.2fs",
+                config.novel_id,
+                key_index,
+                model,
+                sleep_seconds,
+            )
+            _interruptible_sleep(
+                max_seconds=sleep_seconds,
+                check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key),
+                step_seconds=1.0,
+                min_sleep_seconds=0.25,
+            )
+            continue
         should_pause, blocked_model, wait_seconds = _worker_should_pause_for_quota(config, client, key_index, model)
         if should_pause:
             LOGGER.warning(
@@ -833,12 +1645,22 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 blocked_model,
                 wait_seconds,
             )
-            time.sleep(max(1.0, wait_seconds))
+            planned = max(1.0, float(wait_seconds or 0.0))
+
+            def _quota_remaining() -> float:
+                pause, _blocked, seconds = _worker_should_pause_for_quota(config, client, key_index, model)
+                return max(0.0, float(seconds or 0.0)) if pause else 0.0
+
+            _interruptible_sleep(
+                max_seconds=planned,
+                check_remaining_seconds=_quota_remaining,
+                step_seconds=1.0,
+                min_sleep_seconds=0.5,
+            )
             continue
-        item = client.blpop(_key(config, "pending"), timeout=5)
-        if not item:
+        job_id = _throttled_pick_job_id(config, client, key_index=key_index, timeout_seconds=5.0)
+        if not job_id:
             continue
-        job_id = item[1]
         client.srem(_key(config, "queued"), job_id)
         is_captions = _is_captions_job(job_id)
         is_force = bool(client.hexists(_key(config, "force"), job_id)) if not is_captions else False
@@ -914,16 +1736,104 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 cmd_args.append("--force")
             cmd_args += ["--file", file_name, "--chapter", chapter_num]
 
-        proc = subprocess.run(
-            cmd_args,
-            cwd=str(config.storage.root),
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        client.hdel(_key(config, "inflight"), job_id)
+        # If we hit the internal quota gate (exit=76), prefer waiting in-place for short waits rather than
+        # releasing/requeueing the job, to reduce churn when workers are only slightly over TPM/RPM.
+        inline_waited_seconds = 0.0
+        inline_budget_raw = os.environ.get("NOVEL_TTS_INLINE_QUOTA_WAIT_BUDGET_SECONDS", "").strip()
+        try:
+            inline_budget_seconds = float(inline_budget_raw) if inline_budget_raw else 20.0
+        except ValueError:
+            inline_budget_seconds = 20.0
+        hold_waited_seconds = 0.0
+        hold_budget_raw = os.environ.get("NOVEL_TTS_HOLD_QUOTA_WAIT_BUDGET_SECONDS", "").strip()
+        try:
+            hold_budget_seconds = float(hold_budget_raw) if hold_budget_raw else 180.0
+        except ValueError:
+            hold_budget_seconds = 180.0
+        while True:
+            proc = subprocess.run(
+                cmd_args,
+                cwd=str(config.storage.root),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 76:
+                break
+            combined = "\n".join([proc.stdout or "", proc.stderr or ""]).strip()
+            wait_seconds = _parse_quota_suggested_wait_seconds(combined)
+            blocked_model = model
+            if wait_seconds is None:
+                should_pause, blocked_model, wait_seconds = _worker_should_pause_for_quota(config, client, key_index, model)
+                if not should_pause:
+                    wait_seconds = 0.0
+                    blocked_model = model
+            if 0 < float(wait_seconds) < _INLINE_QUOTA_WAIT_MAX_SECONDS and (
+                inline_budget_seconds <= 0 or (inline_waited_seconds + float(wait_seconds) <= inline_budget_seconds)
+            ):
+                LOGGER.warning(
+                    "Worker inline quota wait | novel=%s key_index=%s model=%s blocked_model=%s wait_seconds=%.2f budget=%.2f waited=%.2f",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    blocked_model,
+                    float(wait_seconds),
+                    float(inline_budget_seconds),
+                    float(inline_waited_seconds),
+                )
+                sleep_seconds = max(0.25, float(wait_seconds))
+                time.sleep(sleep_seconds)
+                inline_waited_seconds += sleep_seconds
+                continue
+
+            # If the recommended wait is longer, decide whether to hold the job (keep it inflight) vs releasing it.
+            # Holding can reduce churn when there are no idle workers available to pick other work anyway.
+            if float(wait_seconds) >= _INLINE_QUOTA_WAIT_MAX_SECONDS:
+                has_idle = _any_idle_worker(config)
+                if (not has_idle) and (hold_budget_seconds <= 0 or (hold_waited_seconds + float(wait_seconds) <= hold_budget_seconds)):
+                    LOGGER.warning(
+                        "Worker holding job due to quota gate (no idle workers) | job=%s novel=%s key_index=%s model=%s wait_seconds=%.2f hold_budget=%.2f hold_waited=%.2f",
+                        job_id,
+                        config.novel_id,
+                        key_index,
+                        model,
+                        float(wait_seconds),
+                        float(hold_budget_seconds),
+                        float(hold_waited_seconds),
+                    )
+                    estimated_tokens = _parse_quota_estimated_tokens(combined) or _estimated_request_tokens_for_model(config, model)
+                    started_hold = time.time()
+                    while True:
+                        waited = time.time() - started_hold
+                        if hold_budget_seconds > 0 and (hold_waited_seconds + waited) > hold_budget_seconds:
+                            break
+                        remaining = 0.0
+                        try:
+                            remaining = _quota_wait_seconds_for_request(
+                                config,
+                                client,
+                                key_index,
+                                model,
+                                estimated_tokens=estimated_tokens,
+                            )
+                        except Exception:
+                            remaining = max(0.0, float(wait_seconds) - waited)
+                        if remaining <= 0.05:
+                            break
+                        # Poll frequently so we resume as soon as quota opens, without busy looping.
+                        base_sleep = min(0.5, max(0.05, remaining))
+                        jitter = random.uniform(0.0, 0.2)
+                        time.sleep(min(0.75, base_sleep + jitter))
+                    hold_waited_seconds += max(0.0, time.time() - started_hold)
+                    # Retry the job in-process (new subprocess invocation) now that quota should be available.
+                    # If quota is still blocked, the next loop iteration will re-evaluate and either inline-wait,
+                    # hold again, or fall back to release/delay.
+                    continue
+            break
+
         # Special transient exit code from CLI when providers keep returning 429.
         if proc.returncode == 75:
+            client.hdel(_key(config, "inflight"), job_id)
             consecutive_rate_limit_releases += 1
             LOGGER.warning(
                 "Worker releasing job due to rate limit | job=%s key_index=%s model=%s",
@@ -932,22 +1842,102 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 model,
             )
             # Requeue without counting as a failure retry.
-            if client.sadd(_key(config, "queued"), job_id):
-                client.rpush(_key(config, "pending"), job_id)
-            time.sleep(0.5)
+            delay_seconds = _rate_limit_requeue_delay_seconds(consecutive_rate_limit_releases)
+            delay_seconds += random.uniform(0.0, min(1.0, delay_seconds * 0.25))
+            _extend_rate_limit_cooldown_capped(
+                client,
+                cooldown_key,
+                seconds=float(delay_seconds),
+                max_seconds=max_429_cooldown_seconds,
+            )
+            _delay_job(config, client, job_id, float(delay_seconds))
+            time.sleep(min(2.0, max(0.25, delay_seconds)))
             if consecutive_rate_limit_releases >= 2:
-                cooldown_seconds = 3600.0
-                LOGGER.warning(
-                    "Worker entering out-of-quota cooldown | out_of_quota=1 novel=%s key_index=%s model=%s wait_seconds=%.2f",
-                    config.novel_id,
-                    key_index,
-                    model,
-                    cooldown_seconds,
-                )
-                time.sleep(cooldown_seconds)
+                provider = (config.translation.provider or "").strip().lower()
+                probe_429: bool | None = None
+                if provider == "gemini_http":
+                    # Probe with a tiny request to confirm we are *still* getting HTTP 429.
+                    # If the probe fails (None), be conservative and keep the long cooldown behavior.
+                    probe_429 = _probe_gemini_429(api_key=api_key, model=model)
+
+                if probe_429 is False:
+                    cooldown_seconds = float(_RATE_LIMIT_PROBE_COOLDOWN_SECONDS)
+                    LOGGER.warning(
+                        "Worker rate limit probe: no 429; sleeping for %.2fs | novel=%s key_index=%s model=%s",
+                        cooldown_seconds,
+                        config.novel_id,
+                        key_index,
+                        model,
+                    )
+                    time.sleep(cooldown_seconds)
+                else:
+                    cooldown_seconds = 3600.0
+                    probe_text = "probe=429" if probe_429 is True else "probe=unknown"
+                    LOGGER.warning(
+                        "Worker entering out-of-quota cooldown | out_of_quota=1 novel=%s key_index=%s model=%s wait_seconds=%.2f %s",
+                        config.novel_id,
+                        key_index,
+                        model,
+                        cooldown_seconds,
+                        probe_text,
+                    )
+                    _extend_rate_limit_cooldown(client, out_of_quota_key, seconds=float(cooldown_seconds))
+                    _interruptible_sleep(
+                        max_seconds=float(cooldown_seconds),
+                        check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key),
+                        step_seconds=2.0,
+                        min_sleep_seconds=0.5,
+                    )
                 consecutive_rate_limit_releases = 0
             continue
+        # Quota gating (RPM/TPM/RPD) without necessarily any HTTP 429.
+        # Do not enter long out-of-quota cooldown; instead requeue and wait briefly.
+        if proc.returncode == 76:
+            client.hdel(_key(config, "inflight"), job_id)
+            consecutive_rate_limit_releases = 0
+            combined = "\n".join([proc.stdout or "", proc.stderr or ""]).strip()
+            lowered = combined.lower()
+            release_reason = "quota gate"
+            if "timeout" in lowered or "timed out" in lowered or "connectionerror" in lowered:
+                release_reason = "upstream timeout"
+            LOGGER.warning(
+                "Worker releasing job due to %s | job=%s key_index=%s model=%s",
+                release_reason,
+                job_id,
+                key_index,
+                model,
+            )
+            suggested_wait = _parse_quota_suggested_wait_seconds(combined)
+            parsed_blocked_model = _parse_quota_blocked_model(combined) or ""
+            should_pause, blocked_model, wait_seconds = _worker_should_pause_for_quota(config, client, key_index, model)
+            if suggested_wait is not None and suggested_wait > 0:
+                wait_seconds = max(float(wait_seconds), float(suggested_wait))
+                blocked_model = parsed_blocked_model or blocked_model or model
+            if not should_pause and (suggested_wait is None):
+                wait_seconds = 1.0
+                blocked_model = parsed_blocked_model or model
+            LOGGER.warning(
+                "Worker quota wait | novel=%s key_index=%s model=%s blocked_model=%s wait_seconds=%.2f",
+                config.novel_id,
+                key_index,
+                model,
+                blocked_model,
+                wait_seconds,
+            )
+            # If there are idle workers, avoid delaying the job: requeue immediately so other keys/workers
+            # can attempt it while this worker pauses.
+            has_idle = _any_idle_worker(config)
+            if has_idle:
+                _requeue_job_priority(config, client, job_id)
+            else:
+                # Delay the job until the quota window should have cleared.
+                _delay_job(config, client, job_id, float(wait_seconds))
+            # Sleep so this worker doesn't keep pulling jobs that will likely be quota-gated too.
+            # Cap at 60s (minute quota window); RPD exhaustion is handled by the top-of-loop pause.
+            time.sleep(max(1.0, min(float(wait_seconds), 60.0)))
+            continue
         if proc.returncode == 0:
+            client.hdel(_key(config, "inflight"), job_id)
             consecutive_rate_limit_releases = 0
             client.hdel(_key(config, "retries"), job_id)
             if is_force:
@@ -969,6 +1959,7 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             client.hincrby(_key(config, "model_done"), model, 1)
             LOGGER.info("Worker done: %s", job_id)
             continue
+        client.hdel(_key(config, "inflight"), job_id)
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
         LOGGER.error(
@@ -999,15 +1990,17 @@ def run_supervisor(config: NovelConfig) -> int:
     client = _client(config)
     while True:
         launched = _ensure_worker_processes(config)
+        drained = _drain_delayed_jobs(config, client)
         _enqueue_needed_jobs(config, client)
         _requeue_stale_inflight(config, client)
         LOGGER.info(
-            "queue pending=%s queued=%s inflight=%s done=%s launched_workers=%s",
-            client.llen(_key(config, "pending")),
+            "queue pending=%s queued=%s inflight=%s done=%s launched_workers=%s drained_delayed=%s",
+            _pending_total_len(config, client),
             client.scard(_key(config, "queued")),
             client.hlen(_key(config, "inflight")),
             client.hlen(_key(config, "done")),
             launched,
+            drained,
         )
         time.sleep(config.queue.supervisor_interval_seconds)
 
@@ -1020,7 +2013,7 @@ def run_status_monitor(config: NovelConfig) -> int:
         # Consider the queue "idle" when there's nothing pending/queued/inflight.
         # We still update the state json (for ps/monitoring), but stop appending status.log to avoid noise.
         inflight = client.hlen(_key(config, "inflight"))
-        pending = client.llen(_key(config, "pending"))
+        pending = _pending_total_len(config, client)
         queued = client.scard(_key(config, "queued"))
         is_idle = (pending == 0) and (queued == 0) and (inflight == 0)
 
@@ -1189,8 +2182,14 @@ def _ensure_worker_processes(config: NovelConfig) -> int:
     keys = _load_keys(config)
     worker_models = config.queue.enabled_models or ["gemma-3-27b-it", "gemma-3-12b-it"]
     _reap_unwanted_worker_processes(config, max_key_index=len(keys), worker_models=worker_models)
+    spawn_interval = 0.0
+    try:
+        spawn_interval = float(getattr(config.queue, "spawn_key_interval_seconds", 0.0) or 0.0)
+    except Exception:
+        spawn_interval = 0.0
     launched = 0
     for key_index in range(1, len(keys) + 1):
+        launched_before = launched
         for model in worker_models:
             model_cfg = config.queue.model_configs.get(model)
             worker_count = max(0, int(model_cfg.worker_count if model_cfg else 1))
@@ -1207,6 +2206,9 @@ def _ensure_worker_processes(config: NovelConfig) -> int:
                     worker_idx,
                     worker_log,
                 )
+        key_launched = launched - launched_before
+        if key_launched > 0 and spawn_interval > 0 and key_index < len(keys):
+            time.sleep(spawn_interval)
     return launched
 
 
@@ -1223,6 +2225,8 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False) -> int:
         for pattern in patterns:
             subprocess.run(["pkill", "-f", pattern], cwd=str(config.storage.root), check=False)
         client.delete(
+            _pending_priority_key(config),
+            _pending_delayed_key(config),
             _key(config, "pending"),
             _key(config, "queued"),
             _key(config, "inflight"),
@@ -1737,8 +2741,9 @@ def list_all_queue_processes(include_all: bool = False) -> int:
             pass
         return os.path.basename(raw)
 
-    def _render_table(rows: list[dict[str, str]]) -> None:
-        headers = ["PID", "ROLE", "KEY", "STATE", "COUNTDOWN", "TARGET", "MODEL", "LOG"]
+    def _render_table(rows: list[dict[str, str]], *, target_count: int) -> None:
+        headers = ["PID", "ROLE", "KEY", "STATE", "COUNTDOWN", "MODEL", "TARGET", "LOG"]
+        target_header = f"TARGET ({target_count})"
         display_rows = []
         def _countdown_display(raw: str) -> str:
             raw = (raw or "").strip()
@@ -1756,12 +2761,13 @@ def list_all_queue_processes(include_all: bool = False) -> int:
                     "KEY": r.get("key_index", "") or "",
                     "STATE": r.get("state", ""),
                     "COUNTDOWN": _countdown_display(r.get("countdown", "")),
-                    "TARGET": r.get("target", "") or "",
                     "MODEL": r.get("model", "") or "",
+                    "TARGET": r.get("target", "") or "",
                     "LOG": _truncate_middle(_format_log_path(r.get("log_file", "")), 110),
                 }
             )
         widths: dict[str, int] = {h: len(h) for h in headers}
+        widths["TARGET"] = max(widths["TARGET"], len(target_header))
         for r in display_rows:
             for h in headers:
                 widths[h] = max(widths[h], len(r.get(h, "")))
@@ -1780,7 +2786,7 @@ def list_all_queue_processes(include_all: bool = False) -> int:
             return "| " + " | ".join(cells) + " |"
 
         print(_hr())
-        print(_row({h: h for h in headers}))
+        print(_row({h: (target_header if h == "TARGET" else h) for h in headers}))
         print(_hr())
         for r in display_rows:
             print(_row(r))
@@ -1836,6 +2842,8 @@ def list_all_queue_processes(include_all: bool = False) -> int:
 
         pending = queued = inflight = retries = done = 0
         loaded = False
+        client = None
+        config = None
 
         # Prefer live Redis counts so the line matches what workers are doing right now.
         try:
@@ -1843,7 +2851,7 @@ def list_all_queue_processes(include_all: bool = False) -> int:
 
             config = load_novel_config(novel_id)
             client = _client(config)
-            pending = int(client.llen(_key(config, "pending")) or 0)
+            pending = int(_pending_total_len(config, client) or 0)
             queued = int(client.scard(_key(config, "queued")) or 0)
             inflight = int(client.hlen(_key(config, "inflight")) or 0)
             retries = int(client.hlen(_key(config, "retries")) or 0)
@@ -1886,6 +2894,34 @@ def list_all_queue_processes(include_all: bool = False) -> int:
                 done = int(snapshot.get("done", 0) or 0)
                 break
 
+        # If Redis is available, use the cooldown key as the source of truth for remaining time so
+        # `queue reset` immediately reflects in ps output (log-derived countdowns can be stale).
+        if loaded and client is not None and config is not None:
+            for row in rows:
+                if row.get("role") != "worker":
+                    continue
+                raw_key_index = (row.get("key_index") or "").strip()
+                raw_model = (row.get("model") or "").strip()
+                if (not raw_key_index) or (not raw_model):
+                    continue
+                try:
+                    key_index = int(raw_key_index)
+                except Exception:
+                    continue
+                out_key = _out_of_quota_cooldown_key(config, key_index=key_index, model=raw_model)
+                rl_key = _rate_limit_cooldown_key(config, key_index=key_index, model=raw_model)
+                out_remaining = _get_rate_limit_cooldown_remaining_seconds(client, out_key)
+                rl_remaining = _get_rate_limit_cooldown_remaining_seconds(client, rl_key)
+                if out_remaining > 0.05:
+                    row["state"] = "out-of-quota"
+                    row["countdown"] = str(int(math.ceil(out_remaining)))
+                elif rl_remaining > 0.05:
+                    row["state"] = "waiting-429"
+                    row["countdown"] = str(int(math.ceil(rl_remaining)))
+                elif row.get("state") in {"waiting-429", "out-of-quota"}:
+                    row["state"] = "idle"
+                    row["countdown"] = ""
+
         print(
             f"\nNovel {novel_id}:"
             f" pending={pending} queued={queued} inflight={inflight} retries={retries} done={done}"
@@ -1915,7 +2951,7 @@ def list_all_queue_processes(include_all: bool = False) -> int:
             )
         )
         render_rows = rows if include_all else [r for r in rows if r.get("role") != "translate-chapter"]
-        _render_table(render_rows)
+        _render_table(render_rows, target_count=_unique_target_count(rows))
 
     return 0
 

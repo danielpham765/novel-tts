@@ -6,8 +6,11 @@ import io
 import logging
 import os
 import re
+import select
 import sys
+import termios
 import time
+import tty
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +25,35 @@ from novel_tts.common.errors import RateLimitExceededError
 from novel_tts.config import load_novel_config, NovelConfig
 
 LOGGER = get_logger(__name__)
+
+
+@contextlib.contextmanager
+def _stdin_cbreak_if_tty() -> bool:
+    if not sys.stdin.isatty():
+        yield False
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _read_stdin_byte_nonblocking() -> bytes | None:
+    if not sys.stdin.isatty():
+        return None
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+    except (ValueError, OSError):
+        return None
+    if not r:
+        return None
+    try:
+        return os.read(sys.stdin.fileno(), 1)
+    except OSError:
+        return None
 
 
 def get_translated_ranges(config: NovelConfig, search_start: int, search_end: int) -> list[tuple[int, int, str]]:
@@ -132,7 +164,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "-f",
         "--follow",
         action="store_true",
-        help="Watch mode (refresh every 1s). Ctrl+C to stop.",
+        help="Watch mode (refresh every 1s). Ctrl+P to pause/resume, Ctrl+C to stop.",
+    )
+    queue_reset_parser = queue_sub.add_parser("reset")
+    queue_reset_parser.add_argument("novel_id")
+    queue_reset_parser.add_argument(
+        "--key",
+        action="append",
+        default=[],
+        help=(
+            "Key selector(s) to reset. Repeatable or comma-separated. "
+            "Accepts kN (key index) or raw key (exact match in .secrets/gemini-keys.txt)."
+        ),
+    )
+    queue_reset_parser.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        help=(
+            "Model(s) to reset. Repeatable or comma-separated. "
+            "Defaults to all queue.enabled_models for the selected key(s)."
+        ),
     )
     queue_stop_parser = queue_sub.add_parser("stop")
     queue_stop_parser.add_argument("novel_id")
@@ -168,6 +220,11 @@ def _build_parser() -> argparse.ArgumentParser:
     tts_parser = subparsers.add_parser("tts")
     tts_parser.add_argument("novel_id")
     tts_parser.add_argument("--range", required=True)
+    tts_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate per-chapter audio even if cached (also refreshes cache when translated text changes).",
+    )
 
     visual_parser = subparsers.add_parser("visual")
     visual_parser.add_argument("novel_id")
@@ -198,7 +255,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-f",
         "--follow",
         action="store_true",
-        help="Watch mode (refresh every 1s). Ctrl+C to stop.",
+        help="Watch mode (refresh every 1s). Ctrl+P to pause/resume, Ctrl+C to stop.",
     )
     ai_key_ps.add_argument(
         "--filter",
@@ -256,6 +313,18 @@ def _default_log_path(args) -> Path | None:
         log_name = f"{command}.log"
 
     return get_novel_log_path(config.storage.logs_dir, novel_id, log_name)
+
+
+def _rate_limit_exit_code(message: str) -> int:
+    """
+    Map provider rate limit/quota messages to special exit codes consumed by queue workers.
+
+    - 75: HTTP 429/backoff style rate limit (worker may enter long out-of-quota cooldown)
+    - 76: quota gate (RPM/TPM/RPD) without necessarily any HTTP 429 (worker should wait briefly and retry)
+    """
+    msg = message or ""
+    is_429 = "429" in msg or "too many requests" in msg.lower()
+    return 75 if is_429 else 76
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -374,6 +443,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_status_monitor,
                 run_supervisor,
                 run_worker,
+                reset_queue_key_state,
                 stop_queue_processes,
             )
 
@@ -395,33 +465,95 @@ def main(argv: list[str] | None = None) -> int:
             if args.queue_command == "ps-all":
                 include_all = bool(getattr(args, "all", False) or getattr(args, "show_translate", False))
                 if getattr(args, "follow", False):
-                    # Use alternate screen + hide cursor to reduce flicker.
-                    # We also buffer the full frame before writing once.
-                    sys.stdout.write("\033[?1049h\033[?25l")
-                    sys.stdout.flush()
-                    try:
-                        while True:
-                            buf = io.StringIO()
-                            buf.write(
-                                f"watch: queue ps-all --all={include_all} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (refresh 1s, Ctrl+C to stop)\n\n"
-                            )
-                            with contextlib.redirect_stdout(buf):
-                                rc = list_all_queue_processes(include_all=include_all)
-                            if rc != 0:
-                                return rc
-                            frame = buf.getvalue()
-                            # Move cursor home + clear-to-end, then write the full frame once.
-                            sys.stdout.write("\033[H\033[J")
-                            sys.stdout.write(frame)
-                            sys.stdout.flush()
-                            time.sleep(1.0)
-                    except KeyboardInterrupt:
-                        return 0
-                    finally:
+                    CTRL_P = b"\x10"
+
+                    def enter_alt_screen() -> None:
+                        # Alternate screen + hide cursor to reduce flicker.
+                        sys.stdout.write("\033[?1049h\033[?25l")
+                        sys.stdout.flush()
+
+                    def leave_alt_screen() -> None:
                         # Restore cursor + leave alternate screen.
                         sys.stdout.write("\033[?25h\033[?1049l")
                         sys.stdout.flush()
+
+                    def show_cursor() -> None:
+                        sys.stdout.write("\033[?25h")
+                        sys.stdout.flush()
+
+                    paused = False
+                    in_alt_screen = False
+                    last_frame = ""
+                    last_table_frame = ""
+
+                    # We buffer the full frame before writing once.
+                    with _stdin_cbreak_if_tty() as can_read_keys:
+                        enter_alt_screen()
+                        in_alt_screen = True
+                        try:
+                            while True:
+                                if can_read_keys:
+                                    key = _read_stdin_byte_nonblocking()
+                                    if key == CTRL_P:
+                                        paused = not paused
+                                        if paused and in_alt_screen:
+                                            # Leave the alt screen so output becomes scrollback.
+                                            leave_alt_screen()
+                                            in_alt_screen = False
+                                            if last_table_frame:
+                                                sys.stdout.write(last_table_frame)
+                                            sys.stdout.write(
+                                                "paused: Ctrl+P to resume, Ctrl+C to stop (no refresh while paused)\n"
+                                            )
+                                            sys.stdout.flush()
+                                        elif (not paused) and (not in_alt_screen):
+                                            enter_alt_screen()
+                                            in_alt_screen = True
+                                        continue
+
+                                if paused:
+                                    time.sleep(0.1)
+                                    continue
+
+                                buf = io.StringIO()
+                                buf.write(
+                                    "watch: queue ps-all"
+                                    f" --all={include_all} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                                    "\n\n"
+                                )
+                                with contextlib.redirect_stdout(buf):
+                                    rc = list_all_queue_processes(include_all=include_all)
+                                if rc != 0:
+                                    return rc
+                                last_table_frame = buf.getvalue().rstrip("\n") + "\n"
+                                last_frame = f"{last_table_frame}live: Ctrl+P to pause, Ctrl+C to stop (refresh 1s)\n"
+                                # Move cursor home + clear-to-end, then write the full frame once.
+                                sys.stdout.write("\033[H\033[J")
+                                sys.stdout.write(last_frame)
+                                sys.stdout.flush()
+                                time.sleep(1.0)
+                        except KeyboardInterrupt:
+                            return 0
+                        finally:
+                            if in_alt_screen:
+                                leave_alt_screen()
+                            else:
+                                show_cursor()
                 return list_all_queue_processes(include_all=include_all)
+            if args.queue_command == "reset":
+                if config is None:
+                    parser.error("queue reset requires a novel_id")
+                raw_keys = getattr(args, "key", None) or []
+                if not raw_keys:
+                    parser.error("queue reset requires --key (kN or raw key)")
+                try:
+                    return reset_queue_key_state(
+                        config,
+                        key_selectors=raw_keys,
+                        model_selectors=(getattr(args, "model", None) or []),
+                    )
+                except ValueError as exc:
+                    parser.error(str(exc))
             if args.queue_command == "stop":
                 if config is None:
                     parser.error("queue stop requires a novel_id")
@@ -474,7 +606,10 @@ def main(argv: list[str] | None = None) -> int:
             config = load_novel_config(args.novel_id)
             start, end = parse_range(args.range)
             for c_start, c_end, r_key in get_translated_ranges(config, start, end):
-                LOGGER.info("Merged audio: %s", run_tts(config, c_start, c_end, r_key))
+                LOGGER.info(
+                    "Merged audio: %s",
+                    run_tts(config, c_start, c_end, range_key=r_key, force=bool(getattr(args, "force", False))),
+                )
             return 0
 
         if args.command == "visual":
@@ -536,36 +671,86 @@ def main(argv: list[str] | None = None) -> int:
             if args.ai_key_command != "ps":
                 parser.error("ai-key: unsupported subcommand")
             if getattr(args, "follow", False):
-                sys.stdout.write("\033[?1049h\033[?25l")
-                sys.stdout.flush()
-                try:
-                    while True:
-                        buf = io.StringIO()
-                        buf.write(
-                            f"watch: ai-key ps | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (refresh 1s, Ctrl+C to stop)\n\n"
-                        )
-                        with contextlib.redirect_stdout(buf):
-                            rc = ai_key_ps(filters=args.filter or [], filters_raw=getattr(args, "filter_raw", []) or [])
-                        if rc != 0:
-                            return rc
-                        frame = buf.getvalue()
-                        sys.stdout.write("\033[H\033[J")
-                        sys.stdout.write(frame)
-                        sys.stdout.flush()
-                        time.sleep(1.0)
-                except KeyboardInterrupt:
-                    return 0
-                finally:
+                CTRL_P = b"\x10"
+
+                def enter_alt_screen() -> None:
+                    sys.stdout.write("\033[?1049h\033[?25l")
+                    sys.stdout.flush()
+
+                def leave_alt_screen() -> None:
                     sys.stdout.write("\033[?25h\033[?1049l")
                     sys.stdout.flush()
+
+                def show_cursor() -> None:
+                    sys.stdout.write("\033[?25h")
+                    sys.stdout.flush()
+
+                paused = False
+                in_alt_screen = False
+                last_frame = ""
+                last_table_frame = ""
+
+                with _stdin_cbreak_if_tty() as can_read_keys:
+                    enter_alt_screen()
+                    in_alt_screen = True
+                    try:
+                        while True:
+                            if can_read_keys:
+                                key = _read_stdin_byte_nonblocking()
+                                if key == CTRL_P:
+                                    paused = not paused
+                                    if paused and in_alt_screen:
+                                        leave_alt_screen()
+                                        in_alt_screen = False
+                                        if last_table_frame:
+                                            sys.stdout.write(last_table_frame)
+                                        sys.stdout.write(
+                                            "paused: Ctrl+P to resume, Ctrl+C to stop (no refresh while paused)\n"
+                                        )
+                                        sys.stdout.flush()
+                                    elif (not paused) and (not in_alt_screen):
+                                        enter_alt_screen()
+                                        in_alt_screen = True
+                                    continue
+
+                            if paused:
+                                time.sleep(0.1)
+                                continue
+
+                            buf = io.StringIO()
+                            buf.write(f"watch: ai-key ps | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                            with contextlib.redirect_stdout(buf):
+                                rc = ai_key_ps(
+                                    filters=args.filter or [], filters_raw=getattr(args, "filter_raw", []) or []
+                                )
+                            if rc != 0:
+                                return rc
+                            last_table_frame = buf.getvalue().rstrip("\n") + "\n"
+                            last_frame = f"{last_table_frame}live: Ctrl+P to pause, Ctrl+C to stop (refresh 1s)\n"
+                            sys.stdout.write("\033[H\033[J")
+                            sys.stdout.write(last_frame)
+                            sys.stdout.flush()
+                            time.sleep(1.0)
+                    except KeyboardInterrupt:
+                        return 0
+                    finally:
+                        if in_alt_screen:
+                            leave_alt_screen()
+                        else:
+                            show_cursor()
             return ai_key_ps(filters=args.filter or [], filters_raw=getattr(args, "filter_raw", []) or [])
 
         parser.error("Unhandled command")
         return 2
     except RateLimitExceededError as exc:
         # Used by queue workers: treat as a transient condition so the worker can release/requeue the job.
-        LOGGER.warning("Rate limited: %s", exc)
-        return 75
+        #
+        # Exit code semantics:
+        # - 75: HTTP 429/backoff style rate limit (worker may enter long out-of-quota cooldown)
+        # - 76: quota gate (RPM/TPM/RPD) without necessarily any HTTP 429 (worker should wait briefly and retry)
+        code = _rate_limit_exit_code(str(exc))
+        LOGGER.warning("Rate limited (exit=%s): %s", code, exc)
+        return code
     except Exception:
         LOGGER.exception("Command failed")
         return 1

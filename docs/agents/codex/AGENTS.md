@@ -7,9 +7,10 @@
 1. crawl source novel text
 2. translate to Vietnamese
 3. optionally queue translation via Redis
-4. synthesize audio
-5. render visual
-6. mux final video
+4. inspect per-key telemetry (Redis-backed)
+5. synthesize audio
+6. render visual
+7. mux final video
 
 Primary package: `novel_tts`
 
@@ -164,6 +165,12 @@ Important facts:
 - Redis stores queue bookkeeping only
 - disk files remain source of truth
 
+Operator UX:
+
+- `uv run novel-tts queue ps-all` prints a pm2-like table grouped by novel.
+- The column header `TARGET (N)` shows the number of **unique** chapter targets currently being processed (deduped across worker + translate-chapter subprocess rows).
+- `uv run novel-tts queue reset <novel_id> --key kN [...]` clears per-key Redis cooldown/quota/throttle state when a key gets stuck.
+
 Redis key suffixes:
 
 - `pending`
@@ -171,6 +178,20 @@ Redis key suffixes:
 - `inflight`
 - `retries`
 - `done`
+
+### AI Key Telemetry
+
+- `novel_tts/ai_key/service.py`
+
+Public entrypoint:
+
+- `ai_key_ps`
+
+Important facts:
+
+- reads `.secrets/gemini-keys.txt` but never prints raw keys
+- reads Redis cfg from `configs/app.yaml` (`queue.redis.*`)
+- scans per-key/per-model 1-minute counters emitted by queue processes
 
 ### TTS
 

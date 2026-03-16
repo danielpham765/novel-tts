@@ -8,7 +8,7 @@ It focuses on:
 - **What invariants must never be broken**
 - **Which files to touch for common changes**
 
-If you need deeper background, prefer `docs/ARCHITECTURE_DEV.md` rather than re-discovering structure from scratch.
+If you need deeper background, prefer `docs/ARCHITECTURE.md` rather than re-discovering structure from scratch.
 
 ---
 
@@ -35,9 +35,9 @@ If you are trying to understand or modify behavior, **load these files in roughl
 
 1. **High-level docs**
    - `README.md` – CLI overview and typical commands.
-   - `docs/ARCHITECTURE_DEV.md` – full developer architecture.
+   - `docs/ARCHITECTURE.md` – full developer architecture.
 2. **Agent-oriented summary**
-   - `docs/agents/codex/ARCHITECTURE.md` – concise rules and module map (still valid for Cursor).
+   - `docs/agents/codex/AGENTS.md` – concise rules and module map (still valid for Cursor).
 3. **Runtime entrypoints**
    - `novel_tts/cli/main.py` – argument parsing, dispatch, logging decisions.
    - `novel_tts/config/loader.py` & `novel_tts/config/models.py` – how config is loaded and typed.
@@ -251,4 +251,3 @@ If a change touches any of the above, you must **inspect and update all dependen
   - When describing changes, map them to “crawl / translate / queue / tts / media” so humans can follow the pipeline.
 
 This document is intentionally compact so it can be **loaded early in a Cursor session** and reused via caching to minimize tokens while still giving an accurate mental model of `novel-tts`.
-

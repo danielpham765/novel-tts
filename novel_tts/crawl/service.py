@@ -582,8 +582,11 @@ def crawl_range(config: NovelConfig, from_chapter: int, to_chapter: int, directo
     total_failed = 0
     failed_chapters: list[int] = []
     batch_size = max(1, config.crawl.chapter_batch_size)
-    for batch_start in range(from_chapter, to_chapter + 1, batch_size):
-        batch_end = min(batch_start + batch_size - 1, to_chapter)
+    aligned_start = ((from_chapter - 1) // batch_size) * batch_size + 1
+    for batch_start in range(aligned_start, to_chapter + 1, batch_size):
+        batch_end = batch_start + batch_size - 1
+        fetch_start = max(batch_start, from_chapter)
+        fetch_end = min(batch_end, to_chapter)
         blocks: list[str] = []
         fetched_numbers: list[int] = []
         batch_success = 0
@@ -596,7 +599,7 @@ def crawl_range(config: NovelConfig, from_chapter: int, to_chapter: int, directo
             batch_end,
             batch_size,
         )
-        for chapter_number in range(batch_start, batch_end + 1):
+        for chapter_number in range(fetch_start, fetch_end + 1):
             entry = chapter_map.get(chapter_number)
             if not entry:
                 LOGGER.warning("Skipping chapter %s: missing entry", chapter_number)
@@ -659,9 +662,7 @@ def crawl_range(config: NovelConfig, from_chapter: int, to_chapter: int, directo
                 )
             time.sleep(config.crawl.delay_between_chapters_seconds)
         if blocks:
-            start_num = fetched_numbers[0]
-            end_num = fetched_numbers[-1]
-            output_path = _write_batch(config.storage.origin_dir, start_num, end_num, blocks)
+            output_path = _write_batch(config.storage.origin_dir, batch_start, batch_end, blocks)
             LOGGER.info(
                 "Batch wrote file | novel=%s source=%s batch=%s-%s output=%s chapters=%s success=%s failed=%s",
                 config.novel_id,

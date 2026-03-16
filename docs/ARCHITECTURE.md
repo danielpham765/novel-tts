@@ -29,6 +29,7 @@ flowchart LR
     CFG --> TRANS["Translate Novel"]
     CFG --> CAP["Translate Captions"]
     CFG --> QUEUE["Translation Queue"]
+    CFG --> AIKEY["AI Key Telemetry"]
     CFG --> TTS["TTS"]
     CFG --> VIS["Visual"]
     CFG --> VID["Video"]
@@ -41,6 +42,7 @@ flowchart LR
     CAP --> CAPTION["input/<novel>/caption/*.srt"]
     QUEUE --> PARTS
     QUEUE --> TRANSLATED
+    AIKEY --> REDISMETRICS["Redis metrics (per key/model)"]
     TTS --> AUDIO["output/<novel>/audio/<range>/*"]
     VIS --> VISUAL["output/<novel>/visual/*"]
     VID --> VIDEO["output/<novel>/video/*"]
@@ -67,6 +69,7 @@ Important command families:
 - `crawl`
 - `translate`
 - `queue`
+- `ai-key`
 - `tts`
 - `visual`
 - `video`
@@ -108,14 +111,31 @@ Key merge behavior:
 
 Environment variables that materially affect behavior:
 
-- `NOVEL_TTS_TRANSLATION_MODEL`
-- `GEMINI_MODEL`
-- `GEMINI_API_KEY`
-- `OPENAI_API_KEY`
-- `CHUNK_MAX_LEN`
-- `CHUNK_SLEEP_SECONDS`
-- `REPAIR_MODE`
-- `NOVEL_TTS_COOKIE_HEADER`
+- Model selection:
+  - `NOVEL_TTS_TRANSLATION_MODEL` (or `NOVEL_TTS_TRANSLATE_MODEL`, or `GEMINI_MODEL`)
+  - `NOVEL_TTS_CAPTIONS_MODEL` (or `CAPTIONS_MODEL`)
+- Provider auth:
+  - `GEMINI_API_KEY`
+  - `OPENAI_API_KEY`
+- Translation chunking / repair switches:
+  - `CHUNK_MAX_LEN`
+  - `CHUNK_SLEEP_SECONDS`
+  - `REPAIR_MODE`
+  - `NOVEL_TTS_REPAIR_CHUNK_MAX_LEN`
+  - `NOVEL_TTS_GLOSSARY_STRICT`
+- Crawl/session:
+  - `NOVEL_TTS_COOKIE_HEADER`
+- Quota/rate-limit behavior (direct translate and queue workers):
+  - `NOVEL_TTS_QUOTA_MODE` (`wait` or `raise`)
+  - `NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS`
+  - `NOVEL_TTS_RATE_LIMIT_MAX_ATTEMPTS`
+  - `NOVEL_TTS_INLINE_QUOTA_WAIT_BUDGET_SECONDS`
+  - `NOVEL_TTS_HOLD_QUOTA_WAIT_BUDGET_SECONDS`
+  - `NOVEL_TTS_GEMINI_TPM_CHARS_PER_TOKEN`
+  - `NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_RATIO`
+  - `NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_MIN`
+  - `NOVEL_TTS_GEMINI_TPM_SAFETY_MULTIPLIER`
+  - `NOVEL_TTS_UPSTREAM_TIMEOUT_SUGGESTED_WAIT_SECONDS`
 
 ### Typed runtime config
 
@@ -146,7 +166,6 @@ Within `input/<novel_id>/`:
 - `caption/`: subtitle inputs and outputs
 - `.parts/`: per-chapter translated fragments, one file per chapter under each origin batch folder
 - `.progress/`: resumable work state such as chunk progress and crawl failure manifests
-- `combined/`: appears to hold downstream combined artifacts outside the main pipeline contract
 
 ### Output-side layout
 
@@ -202,7 +221,7 @@ Responsibilities:
 - keep backward compatibility for `crawl <novel> ...` by rewriting argv into `crawl run ...`
 - choose per-command log file (under `.logs/<novel_id>/<family>/*.log`)
 - import subsystem only when needed
-- convert exceptions into exit code `1`
+- convert exceptions into a process exit code (including queue-consumable rate-limit exit codes)
 
 Notable behavior:
 
@@ -211,6 +230,7 @@ Notable behavior:
 - `queue ps` / `queue ps-all` surface queue process state and progress in a pm2-like table
 - `queue stop` can stop all, or a subset of, queue processes for a novel by `--pid` or `--role`
 - `pipeline run` is an orchestration wrapper, not a distinct engine
+- `ai-key ps` surfaces per-API-key throughput and rate-limit signals derived from Redis metrics
 
 ## Crawl Subsystem
 
@@ -263,6 +283,7 @@ Current resolvers:
 - `SpudNovelResolver`
 - `Shuba69Resolver`
 - `Novel543Resolver`
+- `HjwzwResolver`
 
 This is the main extension point for adding a new source site.
 
@@ -486,6 +507,43 @@ Worker count is derived from:
 - the launch helper currently discards child stdout/stderr to `/dev/null`, while subsystem logs go through normal logger wiring when those processes run
 - process restart uses `pkill -f`, so command naming consistency matters
 - the supervisor reconciles worker processes against the current keys/models config (spawns missing workers; stops out-of-range key indices and excess workers if worker_count is reduced)
+
+## AI Key Telemetry Subsystem
+
+Files:
+
+- `novel_tts/ai_key/service.py`
+
+### Purpose
+
+`ai-key ps` is an operator tool for inspecting **per-API-key health** (Gemini keys today) while the queue is running.
+
+It is intentionally separate from queue process inspection:
+
+- queue commands focus on *processes and job progress*
+- `ai-key` focuses on *key-level throughput, rate-limit signals, and quota waits*
+
+### Data sources
+
+It reads:
+
+- `.secrets/gemini-keys.txt` (to know how many keys exist, but raw keys are never printed)
+- Redis connection settings from `configs/app.yaml` (`queue.redis.*`)
+- Redis time (`TIME`) when available, so 1-minute windows line up with Redis
+
+It scans Redis keys that workers/supervisor emit (ZSETs for 1-minute windows), such as:
+
+- `...:llm:reqs` (attempts, including retries)
+- `...:api:reqs` / `...:api:calls` (fallback for older emitters)
+- `...:api:429` (rate limit events)
+- `...:quota:reqs` (quota-wait events)
+
+### Filters
+
+`ai-key ps` supports selecting a subset of keys without ever printing the raw API keys:
+
+- `--filter`: select by `kN` / `N` (1-based key index) or by `last4` of the raw key
+- `--filter-raw`: select by exact raw key(s) (still never printed; only used for matching)
 
 ## TTS Subsystem
 

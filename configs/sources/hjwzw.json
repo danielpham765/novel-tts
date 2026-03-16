@@ -3,7 +3,7 @@
   "resolver_id": "hjwzw",
   "crawl": {
     "site_id": "hjwzw",
-    "chapter_batch_size": 20,
+    "chapter_batch_size": 10,
     "chapter_regex": "^第(\\d+)章([^\\n]*)",
     "preferred_fetch_mode": "browser-bootstrap-http",
     "request_timeout_seconds": 120,

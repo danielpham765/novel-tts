@@ -37,6 +37,8 @@ queue:
     port: 6379
     database: 1
     prefix: novel_tts
+  min_pick_interval_seconds: 0.5
+  spawn_key_interval_seconds: 0.1
   max_retries: 3
   inflight_ttl_seconds: 3600
   supervisor_interval_seconds: 15

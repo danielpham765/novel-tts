@@ -146,8 +146,13 @@ uv run novel-tts queue worker vo-cuc-thien-ton --key-index 1 --model gemma-3-27b
 uv run novel-tts queue ps vo-cuc-thien-ton
 uv run novel-tts queue ps vo-cuc-thien-ton --all           # include verbose subprocess roles
 uv run novel-tts queue ps-all
-uv run novel-tts queue ps-all --all -f                     # watch mode (refresh every 1s)
+uv run novel-tts queue ps-all --all -f                     # watch mode (refresh every 1s; Ctrl+P pause/resume)
 uv run novel-tts queue monitor vo-cuc-thien-ton            # periodic status output
+
+# Reset per-key Redis state (cooldown/quota/throttle) when a key gets stuck
+uv run novel-tts queue reset vo-cuc-thien-ton --key k5
+uv run novel-tts queue reset vo-cuc-thien-ton --key k5 --model gemini-3.1-flash-lite-preview
+uv run novel-tts queue reset vo-cuc-thien-ton --key k5,k6 --model gemma-3-27b-it,gemma-3-12b-it
 
 # Enqueue a specific chapter range for translation (by chapter number, can be inside a batch file)
 uv run novel-tts queue add vo-cuc-thien-ton --range 2001-2500
@@ -159,12 +164,32 @@ uv run novel-tts queue stop vo-cuc-thien-ton --role supervisor,worker
 uv run novel-tts queue stop vo-cuc-thien-ton --pid 1234
 ```
 
+### AI Key (Gemini key telemetry)
+
+Reads `.secrets/gemini-keys.txt` and inspects Redis metrics emitted by queue workers (rate limit / quota / request counts).
+Raw keys are never printed.
+
+```bash
+# Snapshot
+uv run novel-tts ai-key ps
+
+# Watch mode (refresh every 1s; Ctrl+P pause/resume)
+uv run novel-tts ai-key ps -f
+
+# Filter by key index (kN or N) or by last4 of the raw key
+uv run novel-tts ai-key ps --filter k1 --filter 1234
+
+# Filter by raw key (exact match). Repeatable or comma-separated.
+uv run novel-tts ai-key ps --filter-raw "$GEMINI_API_KEY"
+```
+
 ### TTS (audio synthesis)
 
 Reads `input/<novel>/translated/chuong_<start>-<end>.txt` and writes audio assets under `output/<novel>/audio/<range>/`.
 
 ```bash
 uv run novel-tts tts vo-cuc-thien-ton --range 1-10
+uv run novel-tts tts vo-cuc-thien-ton --range 1-10 --force   # re-synthesize even if cached
 ```
 
 ### Visual (overlay render)
@@ -200,3 +225,4 @@ uv run novel-tts pipeline run vo-cuc-thien-ton --range 1-10 --skip-translate
 - Python target: `3.10`
 - Install browser runtime for crawl mode when needed: `uv run playwright install chromium`
 - `queue launch` reads `.secrets/gemini-keys.txt` and spawns `1 supervisor + 1 status monitor`, then the supervisor spawns workers based on `configs/app.yaml` (`queue.enabled_models` + `queue.model_configs.<model>.worker_count`).
+- Queue pick burst guard: `queue.min_pick_interval_seconds` (default `0.5`) serializes job picks per API key (`--key-index`); set `0` to disable.

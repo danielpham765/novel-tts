@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import time
 from pathlib import Path
@@ -50,6 +51,18 @@ def _translated_text_path(config: NovelConfig, start: int, end: int, range_key: 
     raise FileNotFoundError(f"Translated range file not found: {direct}")
 
 
+def _chunk_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _chapter_audio_path(output_dir: Path, chapter_number: int) -> Path:
+    return output_dir / f"chapter_{chapter_number}.wav"
+
+
+def _chapter_hash_path(output_dir: Path, chapter_number: int) -> Path:
+    return output_dir / f"chapter_{chapter_number}.sha256"
+
+
 def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[dict[str, object]], range_key: str) -> Path:
     subtitle_dir = config.storage.subtitle_dir
     subtitle_dir.mkdir(parents=True, exist_ok=True)
@@ -72,8 +85,9 @@ def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[di
     return menu_path
 
 
-def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = None) -> Path:
-    source_path = _translated_text_path(config, start, end, range_key)
+def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = None, force: bool = False) -> Path:
+    translated_range_key = range_key
+    source_path = _translated_text_path(config, start, end, translated_range_key)
     text = source_path.read_text(encoding="utf-8")
     chunks, chapter_info = split_text_into_chunks(text)
     
@@ -87,15 +101,16 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
             
     chunks = filtered_chunks
     chapter_info = filtered_chapter_info
+    if not chunks:
+        raise ValueError(f"No chapters found for requested range: {start}-{end} (source={source_path})")
     
-    if range_key is None:
-        range_key = _range_key(start, end)
+    output_range_key = _range_key(start, end)
         
-    output_dir = config.storage.audio_dir / range_key
+    output_dir = config.storage.audio_dir / output_range_key
     output_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info(
         "TTS start | range=%s chapters=%s source=%s server=%s model=%s voice=%s",
-        range_key,
+        output_range_key,
         len(chunks),
         source_path,
         config.tts.server_name,
@@ -109,12 +124,21 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
     LOGGER.info("TTS model ready")
     audio_files: list[Path] = []
     for idx, chunk in enumerate(chunks):
-        output_path = output_dir / f"{idx}.wav"
         chapter = chapter_info[idx] if idx < len(chapter_info) else {"number": idx + 1, "title": ""}
+        chapter_number = int(chapter.get("number") or (idx + 1))
+        output_path = _chapter_audio_path(output_dir, chapter_number)
+        hash_path = _chapter_hash_path(output_dir, chapter_number)
+        expected_hash = _chunk_hash(chunk)
         chapter_label = f"chapter={chapter.get('number', idx + 1)}"
         if chapter.get("title"):
             chapter_label += f" title={chapter['title']}"
-        if output_path.exists() and output_path.stat().st_size > 0:
+        if (
+            (not force)
+            and output_path.exists()
+            and output_path.stat().st_size > 0
+            and hash_path.exists()
+            and hash_path.read_text(encoding="utf-8").strip() == expected_hash
+        ):
             LOGGER.info(
                 "TTS chapter cached | %s index=%s/%s path=%s size_bytes=%s",
                 chapter_label,
@@ -157,6 +181,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         else:
             source_audio = Path(str(result))
         shutil.copyfile(source_audio, output_path)
+        hash_path.write_text(expected_hash, encoding="utf-8")
         elapsed = time.monotonic() - chapter_started_at
         LOGGER.info(
             "TTS chapter done | %s index=%s/%s elapsed=%.1fs path=%s size_bytes=%s",
@@ -171,7 +196,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
 
     file_list_path = output_dir / "file-list.txt"
     file_list_path.write_text("\n".join(f"file '{path.resolve()}'" for path in audio_files), encoding="utf-8")
-    merged_path = output_dir / f"{range_key}.mp3"
+    merged_path = output_dir / f"{output_range_key}.mp3"
     LOGGER.info("TTS merge start | inputs=%s file_list=%s output=%s", len(audio_files), file_list_path, merged_path)
     run_ffmpeg(
         [
@@ -191,7 +216,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
             str(merged_path),
         ]
     )
-    menu_path = _generate_menu(config, audio_files, chapter_info, range_key)
+    menu_path = _generate_menu(config, audio_files, chapter_info, output_range_key)
     LOGGER.info("TTS merge done | output=%s size_bytes=%s", merged_path, merged_path.stat().st_size)
     LOGGER.info("TTS menu generated | path=%s", menu_path)
     return merged_path

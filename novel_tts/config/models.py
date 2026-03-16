@@ -132,6 +132,11 @@ class QueueModelConfig:
 @dataclass
 class QueueConfig:
     redis: RedisConfig = field(default_factory=RedisConfig)
+    # Minimum time between two successful job picks for the same (key_index, model).
+    # Helps prevent burst LLM requests when multiple workers start at the same time.
+    min_pick_interval_seconds: float = 0.5
+    # When the supervisor needs to spawn new workers, pace the spawning by key to avoid bursts.
+    spawn_key_interval_seconds: float = 0.1
     max_retries: int = 3
     inflight_ttl_seconds: int = 3600
     supervisor_interval_seconds: int = 15
