@@ -1,12 +1,23 @@
+proxy_gateway:
+  enabled: true
+  base_url: http://localhost:8888
+  mode: socket
+  auto_discovery: true
+  keys_per_proxy: 3
+  direct_run_strategy: proxy_1
+  # Proxies are proxy node "name" values from `GET /proxies`, e.g. ["cloud-node-1", "cloud-node-2"].
+  proxies: []
+
 models:
   provider: gemini_http
   enabled_models:
     - gemma-3-27b-it
     - gemini-3.1-flash-lite-preview
   repair_model: gemma-3-27b-it
+  glossary_model: 
   model_configs:
     gemma-3-27b-it:
-      worker_count: 3
+      worker_count: 2
       rpm_limit: 30
       tpm_limit: 15000
       rpd_limit: 14400
@@ -17,6 +28,7 @@ models:
       tpm_limit: 250000
       rpd_limit: 500
       repair_model: gemma-3-27b-it
+      glossary_model: 
       chunk_max_len: 5000
     gemma-3-12b-it:
       worker_count: 5
@@ -31,13 +43,26 @@ models:
       rpd_limit: 20
       chunk_max_len: 2000
 
+tts:
+  provider: gradio_vie_tts
+  voice: Ly
+  server_name: local
+  model_name: macos
+  generation_mode: Standard (Một lần)
+  use_batch: true
+  max_batch_size_run: 128
+  temperature: 1.0
+  max_chars_chunk: 512
+  tempo: 1.15
+  bitrate: 192k
+
 queue:
   redis:
     host: 127.0.0.1
     port: 6379
     database: 1
     prefix: novel_tts
-  min_pick_interval_seconds: 0.5
+  min_pick_interval_seconds: 2.0
   spawn_key_interval_seconds: 0.1
   max_retries: 3
   inflight_ttl_seconds: 3600

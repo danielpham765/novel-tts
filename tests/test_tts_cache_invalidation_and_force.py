@@ -8,8 +8,10 @@ from novel_tts.config.models import (
     BrowserDebugConfig,
     CaptionConfig,
     CrawlConfig,
+    ModelsConfig,
     NovelConfig,
     QueueConfig,
+    QueueModelConfig,
     SourceConfig,
     StorageConfig,
     TtsConfig,
@@ -35,17 +37,18 @@ def _make_config(tmp_path: Path) -> NovelConfig:
     crawl = CrawlConfig(site_id="test")
     browser_debug = BrowserDebugConfig()
     source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl, browser_debug=browser_debug)
-    translation = TranslationConfig(
+    models = ModelsConfig(
         provider="dummy",
-        model="dummy",
-        chunk_max_len=4000,
-        chunk_sleep_seconds=0.0,
+        enabled_models=["dummy"],
+        model_configs={"dummy": QueueModelConfig(chunk_max_len=4000, chunk_sleep_seconds=0.0)},
+    )
+    translation = TranslationConfig(
         chapter_regex=r"^第(\d+)章([^\n]*)",
         base_rules="",
         auto_update_glossary=True,
         glossary_file="",
     )
-    captions = CaptionConfig(provider="dummy", model="dummy")
+    captions = CaptionConfig()
     queue = QueueConfig()
     return NovelConfig(
         novel_id="novel",
@@ -58,6 +61,7 @@ def _make_config(tmp_path: Path) -> NovelConfig:
         storage=storage,
         crawl=crawl,
         browser_debug=browser_debug,
+        models=models,
         translation=translation,
         captions=captions,
         queue=queue,
@@ -108,6 +112,11 @@ def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypa
     translated_path.write_text("Chương 1: A\nXin chào\n", encoding="utf-8")
     tts_service.run_tts(config, 1, 1)
     assert provider.calls == 1
+    # Writes per-chapter assets into .parts and keeps the range folder clean.
+    audio_dir = config.storage.audio_dir / "chuong_1-1"
+    assert (audio_dir / ".parts" / "chapter_1.wav").exists()
+    assert (audio_dir / ".parts" / "file-list.txt").exists()
+    assert not (audio_dir / "file-list.txt").exists()
 
     # Cached (hash matches).
     tts_service.run_tts(config, 1, 1)

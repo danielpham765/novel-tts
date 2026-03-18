@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 from pathlib import Path
 from urllib.parse import urljoin
@@ -9,19 +8,6 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from novel_tts.config.loader import load_novel_config
-from novel_tts.config.models import (
-    BrowserDebugConfig,
-    CaptionConfig,
-    CrawlConfig,
-    NovelConfig,
-    QueueConfig,
-    SourceConfig,
-    StorageConfig,
-    TranslationConfig,
-    TtsConfig,
-    VideoConfig,
-    VisualConfig,
-)
 from novel_tts.crawl.registry import build_default_registry
 from novel_tts.crawl.service import _load_failure_manifest, _write_batch
 from novel_tts.crawl.strategies import build_strategy_chain
@@ -59,63 +45,9 @@ def _extract_neighbor_urls(html: str, current_url: str) -> tuple[str | None, str
     return prev_url, next_url
 
 
-def _root_dir() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _load_current_schema_config(novel_id: str) -> NovelConfig:
-    root = _root_dir()
-    path = root / "configs" / "novels" / f"{novel_id}.json"
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    storage = StorageConfig(
-        root=root,
-        input_dir=root / raw["storage"]["input_dir"],
-        output_dir=root / raw["storage"]["output_dir"],
-        image_dir=root / raw["storage"]["image_dir"],
-        logs_dir=root / raw["storage"].get("logs_dir", ".logs"),
-        tmp_dir=root / raw["storage"].get("tmp_dir", "tmp"),
-    )
-    crawl = CrawlConfig(**raw["crawl"])
-    browser_debug = BrowserDebugConfig(**raw.get("browser_debug", {}))
-    source_id = crawl.site_id
-    source = SourceConfig(
-        source_id=source_id,
-        resolver_id=source_id,
-        crawl=crawl,
-        browser_debug=browser_debug,
-    )
-    return NovelConfig(
-        novel_id=raw["novel_id"],
-        title=raw["title"],
-        slug=raw["slug"],
-        source_language=raw.get("source_language", "zh"),
-        target_language=raw.get("target_language", "vi"),
-        source_id=source_id,
-        source=source,
-        storage=storage,
-        crawl=crawl,
-        browser_debug=browser_debug,
-        translation=TranslationConfig(**raw["translation"]),
-        captions=CaptionConfig(**raw["captions"]),
-        queue=QueueConfig(**raw["queue"]),
-        tts=TtsConfig(**raw["tts"]),
-        visual=VisualConfig(**raw["visual"]),
-        video=VideoConfig(**raw["video"]),
-    )
-
-
-def _load_config(novel_id: str) -> NovelConfig:
-    try:
-        return load_novel_config(novel_id)
-    except KeyError as exc:
-        if exc.args != ("source_id",):
-            raise
-        return _load_current_schema_config(novel_id)
-
-
 def main() -> int:
     args = _parse_args()
-    config = _load_config(args.novel_id)
+    config = load_novel_config(args.novel_id)
     strategy_chain = build_strategy_chain(config.crawl, config.browser_debug)
     resolver = build_default_registry().get(config.crawl.site_id)
     manifest = _load_failure_manifest(config)

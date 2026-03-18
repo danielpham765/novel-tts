@@ -12,8 +12,12 @@ import logging
 import redis
 
 from novel_tts.common.errors import RateLimitExceededError
+from novel_tts.config.models import NovelConfig, ProxyGatewayConfig, RedisConfig
+from novel_tts.net import proxy_gateway as proxy_gateway_mod
+from novel_tts.quota.client import CentralQuotaClient
 
 LOGGER = logging.getLogger(__name__)
+QUOTA_LOGGER = logging.getLogger("quota.client")
 
 _HAN_REGEX = re.compile(r"[\u4e00-\u9fff]")
 
@@ -32,6 +36,7 @@ class PromptBlockedError(RuntimeError):
 
 _RATE_LIMIT_CLIENT = None
 _RATE_LIMIT_CONFIGS = None
+_RATE_LIMIT_CONFIGS_RAW = None
 
 
 def _get_rate_limit_client():
@@ -59,17 +64,23 @@ def _get_rate_limit_client():
 
 def _get_rate_limit_configs() -> dict[str, dict]:
     global _RATE_LIMIT_CONFIGS
+    global _RATE_LIMIT_CONFIGS_RAW
     if _RATE_LIMIT_CONFIGS is not None:
-        return _RATE_LIMIT_CONFIGS
+        raw = os.environ.get("GEMINI_MODEL_CONFIGS_JSON", "").strip()
+        if raw == (_RATE_LIMIT_CONFIGS_RAW or ""):
+            return _RATE_LIMIT_CONFIGS
     raw = os.environ.get("GEMINI_MODEL_CONFIGS_JSON", "").strip()
     if not raw:
         _RATE_LIMIT_CONFIGS = {}
+        _RATE_LIMIT_CONFIGS_RAW = ""
         return _RATE_LIMIT_CONFIGS
     try:
         payload = json.loads(raw)
         _RATE_LIMIT_CONFIGS = payload if isinstance(payload, dict) else {}
+        _RATE_LIMIT_CONFIGS_RAW = raw
     except Exception:
         _RATE_LIMIT_CONFIGS = {}
+        _RATE_LIMIT_CONFIGS_RAW = raw
     return _RATE_LIMIT_CONFIGS
 
 
@@ -118,11 +129,21 @@ def _estimate_gemini_tokens(prompt: str, system_prompt: str = "") -> int:
     output_ratio_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_RATIO", "").strip()
     min_out_raw = os.environ.get("NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_MIN", "").strip()
     try:
-        output_ratio = float(output_ratio_raw) if output_ratio_raw else 0.0
+        if output_ratio_raw:
+            output_ratio = float(output_ratio_raw)
+        else:
+            # Central quota mode is more sensitive to token underestimation because it gates concurrency.
+            # Default to reserving output tokens to approximate "input+output TPM" style upstream limits.
+            central = os.environ.get("NOVEL_TTS_CENTRAL_QUOTA", "").strip().lower() in {"1", "true", "yes", "on"}
+            output_ratio = 1.0 if central else 0.0
     except ValueError:
         output_ratio = 0.0
     try:
-        min_out = int(min_out_raw) if min_out_raw else 0
+        if min_out_raw:
+            min_out = int(min_out_raw)
+        else:
+            central = os.environ.get("NOVEL_TTS_CENTRAL_QUOTA", "").strip().lower() in {"1", "true", "yes", "on"}
+            min_out = 256 if central else 0
     except ValueError:
         min_out = 0
 
@@ -138,6 +159,16 @@ def _estimate_gemini_tokens(prompt: str, system_prompt: str = "") -> int:
     multiplier = max(1.0, multiplier)
 
     return max(1, int(math.ceil((input_tokens + output_reserve) * multiplier)))
+
+def _env_int(name: str) -> int | None:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    return value if value > 0 else None
 
 
 def _wait_seconds_until_rpm_allows(active_members_scored: list[tuple[str, float]], *, now: float, rpm: int) -> float:
@@ -486,17 +517,28 @@ def _record_gemini_llm_call(model: str) -> None:
 
 
 class GeminiHttpProvider(TranslationProvider):
+    def __init__(
+        self,
+        *,
+        proxy_gateway: ProxyGatewayConfig | None = None,
+        redis_cfg: RedisConfig | None = None,
+    ) -> None:
+        self.proxy_gateway = proxy_gateway or ProxyGatewayConfig()
+        self.redis_cfg = redis_cfg
+
     def generate(self, model: str, prompt: str, system_prompt: str = "") -> str:
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("Missing GEMINI_API_KEY")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        url_with_key = f"{url}?key={api_key}"
         body = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\n{prompt}".strip()}]}],
             "generationConfig": {"temperature": 0.2, "topP": 0.9},
         }
         estimated_tokens = _estimate_gemini_tokens(prompt, system_prompt)
         _record_gemini_api_call(model)
+        key_index = _env_int("NOVEL_TTS_KEY_INDEX")
 
         quota_mode = os.environ.get("NOVEL_TTS_QUOTA_MODE", "wait").strip().lower()
         max_wait_raw = os.environ.get("NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS", "").strip()
@@ -511,6 +553,157 @@ class GeminiHttpProvider(TranslationProvider):
         except ValueError:
             timeout_suggested_wait_seconds = 15.0
 
+        central_quota = CentralQuotaClient()
+        key_prefix = os.environ.get("GEMINI_RATE_LIMIT_KEY_PREFIX", "").strip()
+        use_central_quota = bool(is_queue_worker_mode and central_quota.enabled() and key_prefix)
+        model_cfg = _get_rate_limit_configs().get(model, {}) if isinstance(_get_rate_limit_configs(), dict) else {}
+        try:
+            rpm_limit_cfg = int(model_cfg.get("rpm_limit") or 0)
+        except Exception:
+            rpm_limit_cfg = 0
+        try:
+            tpm_limit_cfg = int(model_cfg.get("tpm_limit") or 0)
+        except Exception:
+            tpm_limit_cfg = 0
+        try:
+            rpd_limit_cfg = int(model_cfg.get("rpd_limit") or 0)
+        except Exception:
+            rpd_limit_cfg = 0
+
+        if is_queue_worker_mode and central_quota.enabled() and not key_prefix:
+            raise RuntimeError("Central quota is enabled but GEMINI_RATE_LIMIT_KEY_PREFIX is missing")
+
+        # Central quota path: exactly one HTTP attempt per generate() in queue worker mode.
+        if use_central_quota:
+            grant = central_quota.acquire(
+                key_prefix=key_prefix,
+                model=model,
+                tokens=estimated_tokens,
+                rpm_limit=rpm_limit_cfg,
+                tpm_limit=tpm_limit_cfg,
+                rpd_limit=rpd_limit_cfg,
+            )
+            try:
+                _record_gemini_llm_call(model)
+                _record_gemini_api_attempt(model)
+                response = proxy_gateway_mod.request(
+                    "POST",
+                    url_with_key,
+                    headers={"Content-Type": "application/json"},
+                    body=body,
+                    cfg=self.proxy_gateway,
+                    key_index=key_index,
+                    redis_cfg=self.redis_cfg,
+                    timeout_seconds=90,
+                )
+                if response.status_code == 429:
+                    _record_gemini_429_attempt(model)
+                    retry_after = (response.headers.get("Retry-After") or "").strip()
+                    message = ""
+                    status = ""
+                    try:
+                        payload = response.json() if response.content else {}
+                    except Exception:
+                        payload = {}
+                    if isinstance(payload, dict):
+                        err = payload.get("error") or {}
+                        if isinstance(err, dict):
+                            message = str(err.get("message") or "").strip()
+                            status = str(err.get("status") or "").strip()
+                    if not message:
+                        try:
+                            message = (response.text or "").strip()
+                        except Exception:
+                            message = ""
+                    if len(message) > 240:
+                        message = message[:237] + "..."
+                    try:
+                        snap = central_quota.snapshot_usage(key_prefix=key_prefix, model=model)
+                    except Exception:
+                        snap = {"rpm_used_1m": 0, "tpm_used_1m": 0, "rpd_used_1d": 0}
+                    novel_id = (os.environ.get("NOVEL_TTS_NOVEL_ID") or "").strip()
+                    key_str = (os.environ.get("NOVEL_TTS_KEY_INDEX") or "").strip()
+                    if not novel_id or not key_str:
+                        # Fallback: parse from key_prefix tail "...:<novel_id>:k{idx}"
+                        parts = [p for p in str(key_prefix).split(":") if p]
+                        if len(parts) >= 2 and parts[-1].startswith("k"):
+                            key_str = key_str or parts[-1][1:]
+                            novel_id = novel_id or parts[-2]
+
+                    QUOTA_LOGGER.warning(
+                        "Gemini 429 | novel=%s key=%s model=%s pid=%s req=%s tokens=%s rpm=%s/%s tpm=%s/%s rpd=%s/%s retry_after=%s status=%s message=%r",
+                        novel_id or "-",
+                        key_str or "-",
+                        model,
+                        os.getpid(),
+                        "1",
+                        f"{int(estimated_tokens):,}",
+                        int(snap.get("rpm_used_1m") or 0),
+                        rpm_limit_cfg if rpm_limit_cfg > 0 else "-",
+                        f"{int(snap.get('tpm_used_1m') or 0):,}",
+                        f"{int(tpm_limit_cfg):,}" if tpm_limit_cfg > 0 else "-",
+                        f"{int(snap.get('rpd_used_1d') or 0):,}",
+                        f"{int(rpd_limit_cfg):,}" if rpd_limit_cfg > 0 else "-",
+                        retry_after or "-",
+                        status or "-",
+                        message or "",
+                    )
+
+                    penalty_seconds = 10.0
+                    if retry_after:
+                        try:
+                            penalty_seconds = float(retry_after)
+                        except Exception:
+                            penalty_seconds = 10.0
+                    central_quota.penalize(key_prefix=key_prefix, model=model, seconds=penalty_seconds)
+                    meta = []
+                    if status:
+                        meta.append(f"status={status}")
+                    if retry_after:
+                        meta.append(f"retry_after={retry_after}")
+                    meta_text = (" " + " ".join(meta)) if meta else ""
+                    detail_text = f" message={message!r}" if message else ""
+                    raise RateLimitExceededError(f"Gemini HTTP 429 (model={model}){meta_text}{detail_text}")
+                response.raise_for_status()
+                payload = response.json()
+                prompt_feedback = payload.get("promptFeedback") or {}
+                block_reason = prompt_feedback.get("blockReason")
+                if block_reason:
+                    raise PromptBlockedError(block_reason, payload)
+                used_tokens = 0
+                try:
+                    usage = payload.get("usageMetadata") or {}
+                    if isinstance(usage, dict):
+                        used_tokens = int(usage.get("totalTokenCount") or 0)
+                        if used_tokens <= 0:
+                            used_tokens = int(usage.get("promptTokenCount") or 0) + int(usage.get("candidatesTokenCount") or 0)
+                except Exception:
+                    used_tokens = 0
+                candidates = payload.get("candidates") or []
+                if not candidates:
+                    raise RuntimeError(f"Empty Gemini response: {payload}")
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
+                if not text:
+                    raise RuntimeError(f"Empty Gemini parts: {payload}")
+                central_quota.commit(key_prefix=key_prefix, model=model, grant=grant, success=True, used_tokens=used_tokens)
+                return text
+            except Exception as exc:
+                try:
+                    central_quota.commit(key_prefix=key_prefix, model=model, grant=grant, success=False)
+                except Exception:
+                    pass
+                # Preserve existing queue-mode behavior: map timeouts/429 upstream to RateLimitExceededError.
+                if isinstance(exc, PromptBlockedError):
+                    raise
+                if isinstance(exc, RateLimitExceededError):
+                    raise
+                if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+                    raise RateLimitExceededError(
+                        f"Gemini upstream timeout (model={model} suggested_wait={timeout_suggested_wait_seconds:.2f}s): {exc}"
+                    )
+                raise
+
         generic_attempt = 0
         while True:
             try:
@@ -518,17 +711,47 @@ class GeminiHttpProvider(TranslationProvider):
                 _acquire_gemini_rate_slot(model, estimated_tokens)
                 _record_gemini_llm_call(model)
                 _record_gemini_api_attempt(model)
-                response = requests.post(
-                    url,
-                    params={"key": api_key},
+                response = proxy_gateway_mod.request(
+                    "POST",
+                    url_with_key,
                     headers={"Content-Type": "application/json"},
-                    json=body,
-                    timeout=90,
+                    body=body,
+                    cfg=self.proxy_gateway,
+                    key_index=key_index,
+                    redis_cfg=self.redis_cfg,
+                    timeout_seconds=90,
                 )
                 if response.status_code == 429:
                     _record_gemini_429_attempt(model)
                     # Do not retry 429 here; let the queue worker release/requeue the job to shift keys/workers.
-                    raise RateLimitExceededError(f"Gemini HTTP 429 (model={model})")
+                    retry_after = (response.headers.get("Retry-After") or "").strip()
+                    message = ""
+                    status = ""
+                    try:
+                        payload = response.json() if response.content else {}
+                    except Exception:
+                        payload = {}
+                    if isinstance(payload, dict):
+                        err = payload.get("error") or {}
+                        if isinstance(err, dict):
+                            message = str(err.get("message") or "").strip()
+                            status = str(err.get("status") or "").strip()
+                    if not message:
+                        try:
+                            message = (response.text or "").strip()
+                        except Exception:
+                            message = ""
+                    # Keep logs compact: avoid large bodies.
+                    if len(message) > 240:
+                        message = message[:237] + "..."
+                    meta = []
+                    if status:
+                        meta.append(f"status={status}")
+                    if retry_after:
+                        meta.append(f"retry_after={retry_after}")
+                    meta_text = (" " + " ".join(meta)) if meta else ""
+                    detail_text = f" message={message!r}" if message else ""
+                    raise RateLimitExceededError(f"Gemini HTTP 429 (model={model}){meta_text}{detail_text}")
                 response.raise_for_status()
                 payload = response.json()
                 prompt_feedback = payload.get("promptFeedback") or {}
@@ -568,27 +791,58 @@ class GeminiHttpProvider(TranslationProvider):
 
 
 class OpenAIChatProvider(TranslationProvider):
-    def __init__(self) -> None:
-        from openai import OpenAI
-
-        self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    def __init__(
+        self,
+        *,
+        proxy_gateway: ProxyGatewayConfig | None = None,
+        redis_cfg: RedisConfig | None = None,
+    ) -> None:
+        self.proxy_gateway = proxy_gateway or ProxyGatewayConfig()
+        self.redis_cfg = redis_cfg
 
     def generate(self, model: str, prompt: str, system_prompt: str = "") -> str:
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=[
+        api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("Missing OPENAI_API_KEY")
+        url = "https://api.openai.com/v1/chat/completions"
+        body = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt or "You are a helpful translator."},
                 {"role": "user", "content": prompt},
             ],
+        }
+        key_index = _env_int("NOVEL_TTS_KEY_INDEX")
+        response = proxy_gateway_mod.request(
+            "POST",
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            body=body,
+            cfg=self.proxy_gateway,
+            key_index=key_index,
+            redis_cfg=self.redis_cfg,
+            timeout_seconds=90,
         )
-        return (response.choices[0].message.content or "").strip()
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not choices:
+            raise RuntimeError(f"Empty OpenAI response: {payload}")
+        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+        text = (msg or {}).get("content") if isinstance(msg, dict) else ""
+        return (text or "").strip()
 
 
-def get_translation_provider(provider_name: str) -> TranslationProvider:
+def get_translation_provider(provider_name: str, *, config: NovelConfig | None = None) -> TranslationProvider:
+    proxy_cfg = config.proxy_gateway if config is not None else ProxyGatewayConfig()
+    redis_cfg = config.queue.redis if (config is not None and getattr(config, "queue", None) is not None) else None
     if provider_name == "gemini_http":
-        return GeminiHttpProvider()
+        return GeminiHttpProvider(proxy_gateway=proxy_cfg, redis_cfg=redis_cfg)
     if provider_name == "openai_chat":
-        return OpenAIChatProvider()
+        return OpenAIChatProvider(proxy_gateway=proxy_cfg, redis_cfg=redis_cfg)
     if provider_name not in {"gemini_http", "openai_chat"}:
         raise ValueError(f"Unsupported translation provider: {provider_name}")
     raise RuntimeError(f"Unhandled translation provider: {provider_name}")

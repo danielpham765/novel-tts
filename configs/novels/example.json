@@ -1,0 +1,145 @@
+{
+  "novel_id": "example",
+  "title": "Example Novel",
+  "slug": "example",
+  "source_language": "zh",
+  "target_language": "vi",
+  "storage": {
+    "input_dir": "input/example",
+    "output_dir": "output/example",
+    "image_dir": "image/example",
+    "logs_dir": ".logs",
+    "tmp_dir": "tmp"
+  },
+  "crawl": {
+    "sources": [
+      {
+        "source_id": "69shuba",
+        "directory_url": "https://www.69shuba.com/book/00000.htm",
+        "chapter_url_pattern": "https://www.69shuba.com/txt/00000/{chapter}",
+        "chapter_batch_size": 10,
+        "selectors": {
+          "content": [
+            ".txtnav",
+            "#content"
+          ]
+        },
+        "chapter_regex": "^第(\\d+)章([^\\n]*)",
+        "preferred_fetch_mode": "auto",
+        "request_timeout_seconds": 120,
+        "content_wait_timeout_seconds": 45,
+        "delay_between_chapters_seconds": 0.6,
+        "max_fetch_retries": 4,
+        "retry_backoff_seconds": 20.0,
+        "rate_limit_cooldown_seconds": 11.0
+      }
+    ]
+  },
+  "browser_debug": {
+    "mode": "auto",
+    "remote_debugging_url": "",
+    "remote_debugging_port": 9222,
+    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "user_data_dir": "",
+    "profile_directory": "",
+    "headless": false,
+    "debug_image_dir": "debug/img"
+  },
+  "translation": {
+    "glossary_file": "configs/glossaries/example.json",
+    "auto_update_glossary": true,
+    "line_token": "QZXBRQ",
+    "post_replacements": {},
+    "han_fallback_replacements": {},
+    "chapter": {
+      "chapter_regex": "^第(\\d+)章([^\\n]*)",
+      "base_rules": "Ngươi là chuyên gia dịch tiểu thuyết mạng Trung Quốc sang tiếng Việt.\nYêu cầu bắt buộc:\n- Chỉ trả về đúng phần nội dung đã dịch. Không giải thích. Không ghi chú.\n- Dịch mượt, tự nhiên, nghe như văn truyện.\n- Dịch hết toàn bộ chữ Hán. Không để sót tiếng Trung.\n- Dịch toàn bộ tên riêng sang dạng Hán Việt/Việt hóa nhất quán theo glossary.\n- Giữ nguyên thứ tự nội dung, không thêm bớt ý.\n- Phải giữ nguyên mọi token placeholder dạng ZXQ<digits>QXZ hoặc QZX<digits>QXZ (ví dụ ZXQ000QXZ) và token xuống dòng QZXBRQ; không tạo token mới; không đổi chữ số.\n",
+      "repair_mode": false
+    },
+    "captions": {
+      "chunk_size": 120,
+      "chunk_concurrency": 1,
+      "request_timeout_ms": 90000,
+      "prompt_debug_dir": "tmp/translate-captions-prompts",
+      "response_dump_dir": "tmp/translate-captions-responses",
+      "input_file": "caption_cn.srt",
+      "output_file": "caption_vn.srt"
+    }
+  },
+  "models": {
+    "provider": "gemini_http",
+    "enabled_models": [
+      "gemma-3-27b-it",
+      "gemini-3.1-flash-lite-preview"
+    ],
+    "repair_model": "gemma-3-27b-it",
+    "glossary_model": "gemma-3-27b-it",
+    "model_configs": {
+      "gemma-3-27b-it": {
+        "worker_count": 2,
+        "rpm_limit": 30,
+        "tpm_limit": 15000,
+        "rpd_limit": 14400,
+        "repair_model": "gemma-3-27b-it",
+        "glossary_model": "gemma-3-27b-it",
+        "chunk_max_len": 800,
+        "chunk_sleep_seconds": 0.1
+      },
+      "gemini-3.1-flash-lite-preview": {
+        "worker_count": 1,
+        "rpm_limit": 15,
+        "tpm_limit": 250000,
+        "rpd_limit": 500,
+        "repair_model": "gemma-3-27b-it",
+        "glossary_model": "gemma-3-27b-it",
+        "chunk_max_len": 5000,
+        "chunk_sleep_seconds": 0.0
+      }
+    }
+  },
+  "queue": {
+    "redis": {
+      "host": "127.0.0.1",
+      "port": 6379,
+      "database": 1,
+      "prefix": "novel_tts"
+    },
+    "min_pick_interval_seconds": 2.0,
+    "spawn_key_interval_seconds": 0.1,
+    "startup_ramp_seconds": 60.0,
+    "startup_ramp_rps": 1,
+    "max_retries": 3,
+    "inflight_ttl_seconds": 3600,
+    "supervisor_interval_seconds": 15,
+    "status_interval_seconds": 60
+  },
+  "tts": {
+    "provider": "gradio_vie_tts",
+    "voice": "Tuyen",
+    "server_name": "local",
+    "model_name": "macos",
+    "generation_mode": "Standard (Một lần)",
+    "use_batch": true,
+    "max_batch_size_run": 128,
+    "temperature": 1.0,
+    "max_chars_chunk": 512,
+    "tempo": 1.15,
+    "bitrate": "128k"
+  },
+  "visual": {
+    "background_video": "background.mp4",
+    "font_file": "",
+    "tag_text": "Audio Novel",
+    "line1": "Example Novel",
+    "line2": "Truyện dịch audio",
+    "line3": "Example config",
+    "render_width": 1280
+  },
+  "video": {
+    "video_codec": "libx264",
+    "audio_codec": "aac",
+    "preset": "veryfast",
+    "crf": 28,
+    "audio_bitrate": "96k"
+  }
+}

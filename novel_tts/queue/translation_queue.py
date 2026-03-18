@@ -10,12 +10,20 @@ import subprocess
 import sys
 import time
 import random
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from novel_tts.common.logging import get_logger, get_novel_log_path
 from novel_tts.config.models import NovelConfig
-from novel_tts.translate.novel import chapter_part_path, is_glossary_pending, load_source_chapters
+from novel_tts.net import proxy_gateway as proxy_gateway_mod
+from novel_tts.translate.novel import (
+    chapter_part_path,
+    chapter_source_changed,
+    is_glossary_pending,
+    load_chapter_map,
+    load_source_chapters,
+)
 
 LOGGER = get_logger(__name__)
 CAPTIONS_JOB_ID = "captions"
@@ -40,6 +48,15 @@ _OUT_OF_QUOTA_TOKENS = (
 
 _INLINE_QUOTA_WAIT_MAX_SECONDS = 5.0
 _RATE_LIMIT_PROBE_COOLDOWN_SECONDS = 60.0
+_IP_BAN_MAX_SECONDS = 180.0  # Max probe backoff interval (seconds)
+_IP_BAN_DETECT_WINDOW_SECONDS = 20.0
+_IP_BAN_DETECT_MIN_EVENTS = 6
+_IP_BAN_DETECT_MIN_KEYS = 3
+_IP_BAN_INITIAL_BACKOFF_SECONDS = 8.0
+_IP_BAN_MAX_BACKOFF_SECONDS = _IP_BAN_MAX_SECONDS
+_IP_BAN_PROBE_LOCK_SECONDS = 12
+_IP_RECOVER_SECONDS = 60.0
+_IP_RECOVER_RPS = 1
 
 
 def _rate_limit_requeue_delay_seconds(consecutive_releases: int) -> float:
@@ -69,6 +86,378 @@ def _rate_limit_cooldown_key(config: NovelConfig, *, key_index: int, model: str)
 def _out_of_quota_cooldown_key(config: NovelConfig, *, key_index: int, model: str) -> str:
     safe_model = (model or "").strip() or "unknown"
     return _key(config, f"out_of_quota_cooldown:k{int(key_index)}:{safe_model}")
+
+
+def _ip_ban_429_key(config: NovelConfig, *, model: str) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"ip_ban_429:{safe_model}")
+
+
+def _ip_ban_state_key(config: NovelConfig, *, model: str) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"ip_ban_state:{safe_model}")
+
+
+def _ip_ban_probe_lock_key(config: NovelConfig, *, model: str) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"ip_ban_probe_lock:{safe_model}")
+
+
+def _ip_recover_state_key(config: NovelConfig, *, model: str) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"ip_recover_state:{safe_model}")
+
+
+def _ip_recover_slot_key(config: NovelConfig, *, model: str, slot: int) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"ip_recover_slot:{safe_model}:{int(slot)}")
+
+
+def _startup_ramp_applied_key(config: NovelConfig, *, model: str) -> str:
+    safe_model = (model or "").strip() or "unknown"
+    return _key(config, f"startup_ramp_applied:{safe_model}")
+
+
+def _get_ip_ban_state(client, config: NovelConfig, *, model: str) -> dict:
+    try:
+        raw = client.get(_ip_ban_state_key(config, model=model))
+    except Exception:
+        raw = None
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if "next_probe_at" not in payload:
+        # Backward compatibility: older payload used "until" as the next eligible time.
+        try:
+            payload["next_probe_at"] = float(payload.get("until") or 0.0)
+        except Exception:
+            payload["next_probe_at"] = 0.0
+        _set_ip_ban_state(client, config, model=model, payload=payload)
+    return payload
+
+
+def _set_ip_ban_state(client, config: NovelConfig, *, model: str, payload: dict) -> None:
+    try:
+        next_probe_at = float(payload.get("next_probe_at") or 0.0)
+        # Keep state around across longer bans; expire a bit after next scheduled probe.
+        ttl = int(max(10 * 60.0, (next_probe_at - time.time()) + 5 * 60.0)) if next_probe_at else int(10 * 60.0)
+        client.set(_ip_ban_state_key(config, model=model), json.dumps(payload, ensure_ascii=False), ex=ttl)
+    except Exception:
+        return
+
+
+def _clear_ip_ban_state(client, config: NovelConfig, *, model: str) -> None:
+    try:
+        client.delete(_ip_ban_state_key(config, model=model))
+        client.delete(_ip_ban_429_key(config, model=model))
+        client.delete(_ip_ban_probe_lock_key(config, model=model))
+    except Exception:
+        return
+
+
+def _ip_ban_is_active(client, config: NovelConfig, *, model: str) -> bool:
+    state = _get_ip_ban_state(client, config, model=model)
+    if not state:
+        return False
+    try:
+        start = float(state.get("start") or 0.0)
+    except Exception:
+        start = 0.0
+    return start > 0.0
+
+
+def _ip_ban_next_probe_in_seconds(client, config: NovelConfig, *, model: str) -> float:
+    state = _get_ip_ban_state(client, config, model=model)
+    if not state:
+        return 0.0
+    try:
+        next_probe_at = float(state.get("next_probe_at") or 0.0)
+    except Exception:
+        next_probe_at = 0.0
+    return max(0.0, next_probe_at - time.time())
+
+
+def _get_ip_recover_state(client, config: NovelConfig, *, model: str) -> dict:
+    try:
+        raw = client.get(_ip_recover_state_key(config, model=model))
+    except Exception:
+        raw = None
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _set_ip_recover_state(client, config: NovelConfig, *, model: str, payload: dict) -> None:
+    try:
+        until = float(payload.get("until") or 0.0)
+    except Exception:
+        until = 0.0
+    ttl = int(max(5.0, (until - time.time()) + 30.0)) if until else int(_IP_RECOVER_SECONDS + 60.0)
+    try:
+        client.set(_ip_recover_state_key(config, model=model), json.dumps(payload, ensure_ascii=False), ex=ttl)
+    except Exception:
+        return
+
+
+def _clear_ip_recover_state(client, config: NovelConfig, *, model: str) -> None:
+    try:
+        client.delete(_ip_recover_state_key(config, model=model))
+    except Exception:
+        return
+
+
+def _ip_recover_is_active(client, config: NovelConfig, *, model: str) -> bool:
+    state = _get_ip_recover_state(client, config, model=model)
+    if not state:
+        return False
+    try:
+        until = float(state.get("until") or 0.0)
+    except Exception:
+        until = 0.0
+    return until > time.time()
+
+
+def _ip_recover_try_admit(client, config: NovelConfig, *, model: str) -> bool:
+    state = _get_ip_recover_state(client, config, model=model)
+    if not state:
+        return True
+    now = time.time()
+    try:
+        until = float(state.get("until") or 0.0)
+    except Exception:
+        until = 0.0
+    if until <= now:
+        _clear_ip_recover_state(client, config, model=model)
+        return True
+    try:
+        rps = int(state.get("rps") or _IP_RECOVER_RPS)
+    except Exception:
+        rps = _IP_RECOVER_RPS
+    rps = max(1, rps)
+    slot = int(now)
+    slot_key = _ip_recover_slot_key(config, model=model, slot=slot)
+    try:
+        n = int(client.incr(slot_key))
+        if n == 1:
+            client.expire(slot_key, 2)
+    except Exception:
+        return False
+    return n <= rps
+
+
+def _maybe_apply_startup_ramp(client, config: NovelConfig, *, model: str) -> None:
+    """
+    Apply a one-time "startup ramp" after queue launch/restart so that spawning many workers does not
+    immediately burst into upstream 429 storms.
+    """
+
+    try:
+        seconds = float(getattr(config.queue, "startup_ramp_seconds", 0.0) or 0.0)
+    except Exception:
+        seconds = 0.0
+    if seconds <= 0.0:
+        return
+    try:
+        rps = int(getattr(config.queue, "startup_ramp_rps", 1) or 1)
+    except Exception:
+        rps = 1
+    rps = max(1, rps)
+
+    marker = _startup_ramp_applied_key(config, model=model)
+    try:
+        if client.get(marker):
+            return
+    except Exception:
+        return
+
+    if _ip_ban_is_active(client, config, model=model):
+        return
+    if _ip_recover_is_active(client, config, model=model):
+        try:
+            client.set(marker, "1", ex=int(max(60.0, seconds + 10 * 60.0)))
+        except Exception:
+            pass
+        return
+
+    now = time.time()
+    _set_ip_recover_state(client, config, model=model, payload={"start": now, "until": now + seconds, "rps": rps})
+    try:
+        client.set(marker, "1", ex=int(max(60.0, seconds + 10 * 60.0)))
+    except Exception:
+        pass
+    LOGGER.warning(
+        "Queue startup ramp started | novel=%s model=%s rps=%s seconds=%.0f",
+        config.novel_id,
+        model,
+        rps,
+        seconds,
+    )
+
+
+def _sync_cooldown_until(client, cooldown_key: str, *, until: float) -> None:
+    now = time.time()
+    if until <= now:
+        return
+    try:
+        current_raw = client.get(cooldown_key)
+        current_until = float(current_raw) if current_raw is not None else 0.0
+    except Exception:
+        current_until = 0.0
+    if current_until >= until:
+        return
+    try:
+        ttl = int(max(2.0, (until - now) + 15.0))
+        client.set(cooldown_key, str(until), ex=ttl)
+    except Exception:
+        return
+
+
+def _maybe_trigger_ip_ban_on_429(client, config: NovelConfig, *, key_index: int, model: str) -> bool:
+    """
+    Heuristic: if we see many 429s across multiple keys in a short window, treat it as a potential IP-level ban
+    (or global throttling) and pause all workers for this novel+model.
+    """
+
+    now = time.time()
+    zkey = _ip_ban_429_key(config, model=model)
+    member = f"{now:.6f}:k{int(key_index)}:{uuid.uuid4().hex}"
+    try:
+        client.zadd(zkey, {member: now})
+        client.zremrangebyscore(zkey, 0, now - _IP_BAN_MAX_SECONDS)
+        client.expire(zkey, int(_IP_BAN_MAX_SECONDS + 120.0))
+    except Exception:
+        return False
+
+    try:
+        recent = client.zrangebyscore(zkey, now - _IP_BAN_DETECT_WINDOW_SECONDS, "+inf") or []
+    except Exception:
+        recent = []
+    if len(recent) < _IP_BAN_DETECT_MIN_EVENTS:
+        return False
+    keys = set()
+    for item in recent:
+        m = re.search(r":k(\d+):", str(item))
+        if m:
+            keys.add(int(m.group(1)))
+    if len(keys) < _IP_BAN_DETECT_MIN_KEYS:
+        return False
+
+    # If we were in recovery ramp-up and still see a 429 burst, immediately re-enter ban.
+    if _ip_recover_is_active(client, config, model=model):
+        _clear_ip_recover_state(client, config, model=model)
+        state = {}
+
+    state = _get_ip_ban_state(client, config, model=model)
+    try:
+        start = float(state.get("start") or 0.0)
+    except Exception:
+        start = 0.0
+    # If an old ban state is stale, restart the ban window.
+    if start <= 0.0 or (now - start) > (10 * 60.0):
+        start = now
+        backoff = _IP_BAN_INITIAL_BACKOFF_SECONDS
+    else:
+        try:
+            backoff = float(state.get("backoff") or _IP_BAN_INITIAL_BACKOFF_SECONDS)
+        except Exception:
+            backoff = _IP_BAN_INITIAL_BACKOFF_SECONDS
+        backoff = max(_IP_BAN_INITIAL_BACKOFF_SECONDS, min(_IP_BAN_MAX_BACKOFF_SECONDS, backoff))
+
+    next_probe_at = now + backoff
+    payload = {
+        "start": start,
+        "backoff": backoff,
+        "updated_at": now,
+        "reason": "ip_ban_suspected",
+        "recent_events": int(len(recent)),
+        "recent_keys": int(len(keys)),
+        "next_probe_at": next_probe_at,
+    }
+    _set_ip_ban_state(client, config, model=model, payload=payload)
+    return True
+
+
+def _ip_ban_probe_if_due(client, config: NovelConfig, *, key_index: int, model: str, api_key: str) -> None:
+    """
+    Probe upstream at increasing intervals while IP-ban is suspected.
+    Only one worker probes at a time (Redis lock).
+    """
+
+    state = _get_ip_ban_state(client, config, model=model)
+    if not state:
+        return
+    now = time.time()
+    try:
+        start = float(state.get("start") or 0.0)
+    except Exception:
+        start = 0.0
+    try:
+        next_probe = float(state.get("next_probe_at") or 0.0)
+    except Exception:
+        next_probe = 0.0
+    if start <= 0.0 or now < next_probe:
+        return
+
+    lock_key = _ip_ban_probe_lock_key(config, model=model)
+    try:
+        got = client.set(lock_key, str(now), nx=True, ex=int(_IP_BAN_PROBE_LOCK_SECONDS))
+    except Exception:
+        got = False
+    if not got:
+        return
+
+    probe = _probe_gemini_429(config=config, api_key=api_key, model=model, key_index=key_index)
+    if probe is False:
+        LOGGER.warning(
+            "Suspected IP ban probe: no 429; clearing | novel=%s key_index=%s model=%s",
+            config.novel_id,
+            key_index,
+            model,
+        )
+        _clear_ip_ban_state(client, config, model=model)
+        _set_ip_recover_state(
+            client,
+            config,
+            model=model,
+            payload={"start": now, "until": now + _IP_RECOVER_SECONDS, "rps": _IP_RECOVER_RPS},
+        )
+        LOGGER.warning(
+            "IP ban recovery ramp started | novel=%s model=%s rps=%s seconds=%.0f",
+            config.novel_id,
+            model,
+            _IP_RECOVER_RPS,
+            _IP_RECOVER_SECONDS,
+        )
+        return
+
+    # Still 429 (or unknown): increase backoff and schedule the next probe.
+    try:
+        backoff = float(state.get("backoff") or _IP_BAN_INITIAL_BACKOFF_SECONDS)
+    except Exception:
+        backoff = _IP_BAN_INITIAL_BACKOFF_SECONDS
+    backoff = max(_IP_BAN_INITIAL_BACKOFF_SECONDS, min(_IP_BAN_MAX_BACKOFF_SECONDS, backoff * 2.0))
+    next_probe_at = now + backoff
+    state["backoff"] = backoff
+    state["updated_at"] = now
+    state["next_probe_at"] = next_probe_at
+    state["probe_result"] = "429" if probe is True else "unknown"
+    _set_ip_ban_state(client, config, model=model, payload=state)
+    LOGGER.warning(
+        "Suspected IP ban probe: still 429; backing off | novel=%s key_index=%s model=%s backoff=%.0fs",
+        config.novel_id,
+        key_index,
+        model,
+        backoff,
+    )
 
 
 def _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key: str) -> float:
@@ -117,6 +506,24 @@ def _extend_rate_limit_cooldown(client, cooldown_key: str, *, seconds: float) ->
     return until
 
 
+def _cooldown_jitter_seconds(key_index: int, *, max_jitter_seconds: float) -> float:
+    """
+    Deterministic jitter to avoid synchronized cooldown expiry bursts across keys.
+
+    We keep this stable per key_index so operators can reason about it, while still ensuring
+    different keys don't all wake up at the exact same second.
+    """
+    try:
+        max_jitter = float(max_jitter_seconds)
+    except Exception:
+        max_jitter = 0.0
+    if max_jitter <= 0:
+        return 0.0
+    # Simple hash-like mix to spread 1..N across [0,1).
+    frac = ((int(key_index) * 9973) % 1000) / 1000.0
+    return max(0.0, min(max_jitter, frac * max_jitter))
+
+
 def _interruptible_sleep(
     *,
     max_seconds: float,
@@ -127,7 +534,7 @@ def _interruptible_sleep(
     """
     Sleep up to max_seconds, but wake early when the wait condition clears.
 
-    Used so operator actions (e.g. `queue reset` clearing Redis keys) can unblock workers promptly,
+    Used so operator actions (e.g. `queue reset-key` clearing Redis keys) can unblock workers promptly,
     instead of waiting for a long `time.sleep()` to finish.
     """
     deadline = time.monotonic() + max(0.0, float(max_seconds or 0.0))
@@ -150,7 +557,14 @@ def _interruptible_sleep(
         time.sleep(max(min_sleep, sleep_seconds))
 
 
-def _probe_gemini_429(*, api_key: str, model: str, timeout_seconds: float = 10.0) -> bool | None:
+def _probe_gemini_429(
+    *,
+    config: NovelConfig,
+    api_key: str,
+    model: str,
+    key_index: int,
+    timeout_seconds: float = 10.0,
+) -> bool | None:
     """
     Lightweight "ping" request to detect whether the Gemini API is currently returning HTTP 429.
 
@@ -164,18 +578,21 @@ def _probe_gemini_429(*, api_key: str, model: str, timeout_seconds: float = 10.0
     model = (model or "").strip()
     if not api_key or not model:
         return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     body = {
         "contents": [{"parts": [{"text": "hello"}]}],
         "generationConfig": {"temperature": 0.0, "topP": 0.9, "maxOutputTokens": 1},
     }
     try:
-        response = requests.post(
+        response = proxy_gateway_mod.request(
+            "POST",
             url,
-            params={"key": api_key},
             headers={"Content-Type": "application/json"},
-            json=body,
-            timeout=max(1.0, float(timeout_seconds)),
+            body=body,
+            cfg=config.proxy_gateway,
+            key_index=int(key_index),
+            redis_cfg=config.queue.redis,
+            timeout_seconds=max(1.0, float(timeout_seconds)),
         )
     except Exception as exc:
         LOGGER.debug("Gemini 429 probe failed | model=%s err=%s", model, exc)
@@ -237,6 +654,12 @@ def _parse_quota_estimated_tokens(text: str) -> int | None:
     except ValueError:
         return None
     return value if value > 0 else None
+
+
+def _parse_quota_should_requeue(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"\brequeue\s*=\s*1\b", text, flags=re.I))
 
 
 def _tail_lines(path: str, max_bytes: int = 16384, max_lines: int = 80) -> list[str]:
@@ -441,24 +864,49 @@ def _reset_queue_key_state(client, config: NovelConfig, *, key_indices: list[int
             deleted += int(client.delete(_minute_quota_key(config, key_index, model)) or 0)
             deleted += int(client.delete(_minute_token_key(config, key_index, model)) or 0)
             deleted += int(client.delete(_daily_quota_key(config, key_index, model)) or 0)
+            # Central quota v2 keys (freezed/locked, alloc queue).
+            key_prefix = f"{config.queue.redis.prefix}:{config.novel_id}:k{int(key_index)}"
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:alloc:queue") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:tpm:freezed") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:tpm:freezed_tokens") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:tpm:locked") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:tpm:locked_tokens") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:rpm:freezed") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:rpm:locked") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:rpd:freezed") or 0)
+            deleted += int(client.delete(f"{key_prefix}:{model}:quota:rpd:locked") or 0)
     return deleted
 
 
-def reset_queue_key_state(config: NovelConfig, *, key_selectors: list[str], model_selectors: list[str] | None = None) -> int:
+def reset_queue_key_state(
+    config: NovelConfig,
+    *,
+    key_selectors: list[str],
+    all_keys: bool = False,
+    model_selectors: list[str] | None = None,
+) -> int:
     """
     Reset per-key queue state in Redis (cooldown + quota + pick throttle).
 
     - key_selectors: list of "kN" or raw keys (exact match).
+    - all_keys: if True, reset all keys found in the keys file.
     - model_selectors: optional list of enabled model names (supports comma-separated in CLI parsing).
       If omitted/empty, defaults to config.queue.enabled_models.
     """
     keys_raw = _load_keys(config)
-    selectors = _split_csv_flags(key_selectors or [])
-    if not selectors:
-        raise ValueError("Missing --key (expected kN or raw key)")
-    key_indices = _resolve_key_indices(selectors, keys_raw)
-    if not key_indices:
-        raise ValueError("No valid keys resolved from --key")
+    if all_keys:
+        if key_selectors:
+            raise ValueError("Use either --all or --key, not both")
+        if not keys_raw:
+            raise ValueError("No keys found in .secrets/gemini-keys.txt")
+        key_indices = list(range(1, len(keys_raw) + 1))
+    else:
+        selectors = _split_csv_flags(key_selectors or [])
+        if not selectors:
+            raise ValueError("Missing --key (expected kN or raw key), or use --all")
+        key_indices = _resolve_key_indices(selectors, keys_raw)
+        if not key_indices:
+            raise ValueError("No valid keys resolved from --key")
 
     enabled_models = list(config.queue.enabled_models or [])
     models = _split_csv_flags(list(model_selectors or [])) if model_selectors else []
@@ -524,22 +972,33 @@ def _classify_process_state(role: str, *, is_busy: bool, log_file: str) -> tuple
     # If an error occurred recently (within a short window), surface "error" to catch operator attention.
     now = datetime.now()
     error_hold_seconds = 5.0
-    recent_error_line: str | None = None
-    for raw in reversed(lines[-200:]):
+    recent_error_ts: datetime | None = None
+    for idx in range(len(lines) - 1, max(-1, len(lines) - 201), -1):
+        raw = lines[idx]
         line = (raw or "").strip()
         lowered = line.lower()
         if not lowered:
             continue
-        if "traceback" in lowered or "command failed" in lowered:
-            recent_error_line = line
-            break
-    if recent_error_line:
-        ts = _parse_log_timestamp(recent_error_line)
-        if ts is None:
-            # Unknown timestamp format: be conservative and show error.
-            return "error", None
-        if (now - ts).total_seconds() <= error_hold_seconds:
-            return "error", None
+        if "traceback" not in lowered and "command failed" not in lowered:
+            continue
+
+        # Try to find a timestamp for this error event.
+        # Some traceback lines don't include timestamps; in that case, walk backwards to find
+        # the nearest preceding timestamped log line, then fall back to the file mtime.
+        for j in range(idx, max(-1, idx - 21), -1):
+            ts = _parse_log_timestamp((lines[j] or "").strip())
+            if ts is not None:
+                recent_error_ts = ts
+                break
+        if recent_error_ts is None and log_file:
+            try:
+                recent_error_ts = datetime.fromtimestamp(os.path.getmtime(log_file))
+            except Exception:
+                recent_error_ts = None
+        break
+
+    if recent_error_ts is not None and (now - recent_error_ts).total_seconds() <= error_hold_seconds:
+        return "error", None
 
     if role == "worker":
         # Prefer process-tree truth when available.
@@ -764,6 +1223,7 @@ def _throttled_pick_job_id(
     client,
     *,
     key_index: int,
+    model: str,
     timeout_seconds: float = 5.0,
 ) -> str | None:
     """
@@ -779,8 +1239,25 @@ def _throttled_pick_job_id(
     except Exception:
         min_interval = 0.0
     if min_interval <= 0:
-        item = client.blpop([_pending_priority_key(config), _key(config, "pending")], timeout=int(timeout_seconds))
-        return item[1] if item else None
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
+        while True:
+            if _ip_ban_is_active(client, config, model=model):
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            item = client.blpop(
+                [_pending_priority_key(config), _key(config, "pending")],
+                timeout=min(1, max(1, int(remaining))),
+            )
+            job_id = item[1] if item else None
+            if not job_id:
+                continue
+            # If an IP-ban is triggered while we were blocked waiting, push the job back and pause.
+            if _ip_ban_is_active(client, config, model=model):
+                client.lpush(_pending_priority_key(config), job_id)
+                return None
+            return job_id
 
     min_ms = max(1, int(min_interval * 1000.0))
     deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
@@ -789,6 +1266,8 @@ def _throttled_pick_job_id(
     pending = _key(config, "pending")
 
     while True:
+        if _ip_ban_is_active(client, config, model=model):
+            return None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
@@ -809,6 +1288,9 @@ def _throttled_pick_job_id(
 
         job_id = (job_id or "").strip()
         if job_id:
+            if _ip_ban_is_active(client, config, model=model):
+                client.lpush(_pending_priority_key(config), job_id)
+                return None
             return job_id
 
         try:
@@ -967,13 +1449,6 @@ def _load_keys(config: NovelConfig) -> list[str]:
     return keys
 
 
-def _needs_translation(config: NovelConfig, path: Path) -> bool:
-    target = config.storage.translated_dir / path.name
-    if not target.exists():
-        return True
-    return path.stat().st_mtime > target.stat().st_mtime
-
-
 def _job_id(file_name: str, chapter_num: str) -> str:
     return f"{file_name}::{int(chapter_num):04d}"
 
@@ -988,19 +1463,41 @@ def _parse_job_id(job_id: str) -> tuple[str, str]:
     return file_name, str(int(chapter_num))
 
 
-def _chapter_needs_translation(config: NovelConfig, source_path: Path, chapter_num: str) -> bool:
+def _chapter_needs_translation(
+    config: NovelConfig,
+    source_path: Path,
+    chapter_num: str,
+    chapter_text: str | None = None,
+) -> bool:
     part_path = chapter_part_path(config, source_path, chapter_num)
     if not part_path.exists():
         return True
-    if _needs_translation(config, source_path) is False:
+    if chapter_text is None:
+        try:
+            chapter_text = load_chapter_map(config, source_path).get(str(int(chapter_num)), "")
+        except Exception:
+            chapter_text = ""
+    if not (chapter_text or "").strip():
         return False
-    return part_path.stat().st_mtime < source_path.stat().st_mtime
+    # Hash-based staleness: only re-translate if the chapter source text changed.
+    return chapter_source_changed(
+        config,
+        source_path,
+        chapter_num,
+        source_text=chapter_text,
+        baseline_if_missing=True,
+    )
 
 
-def _chapter_needs_work(config: NovelConfig, source_path: Path, chapter_num: str) -> bool:
+def _chapter_needs_work(
+    config: NovelConfig,
+    source_path: Path,
+    chapter_num: str,
+    chapter_text: str | None = None,
+) -> bool:
     if is_glossary_pending(config, source_path, chapter_num):
         return True
-    return _chapter_needs_translation(config, source_path, chapter_num)
+    return _chapter_needs_translation(config, source_path, chapter_num, chapter_text=chapter_text)
 
 
 def _captions_needs_translation(config: NovelConfig) -> bool:
@@ -1015,8 +1512,8 @@ def _captions_needs_translation(config: NovelConfig) -> bool:
 
 def _chapter_jobs_for_file(config: NovelConfig, source_path: Path) -> list[str]:
     jobs: list[str] = []
-    for chapter_num, _chapter_text in load_source_chapters(config, source_path):
-        if _chapter_needs_work(config, source_path, chapter_num):
+    for chapter_num, chapter_text in load_source_chapters(config, source_path):
+        if _chapter_needs_work(config, source_path, chapter_num, chapter_text=chapter_text):
             jobs.append(_job_id(source_path.name, chapter_num))
     return jobs
 
@@ -1066,7 +1563,7 @@ def add_jobs_to_queue(config: NovelConfig, from_chapter: int, to_chapter: int, *
     skipped_exhausted = 0
 
     for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
-        for chapter_num, _chapter_text in load_source_chapters(config, source_path):
+        for chapter_num, chapter_text in load_source_chapters(config, source_path):
             try:
                 chap = int(str(chapter_num))
             except Exception:
@@ -1080,7 +1577,7 @@ def add_jobs_to_queue(config: NovelConfig, from_chapter: int, to_chapter: int, *
                 if _has_exhausted_retries(config, client, job_id):
                     skipped_exhausted += 1
                     continue
-                if not _chapter_needs_work(config, source_path, str(chap)):
+                if not _chapter_needs_work(config, source_path, str(chap), chapter_text=chapter_text):
                     skipped_done += 1
                     continue
 
@@ -1107,6 +1604,128 @@ def add_jobs_to_queue(config: NovelConfig, from_chapter: int, to_chapter: int, *
     print(
         f"Queued {added} job(s) for novel {config.novel_id} chapters {from_chapter}-{to_chapter}"
         f"{' (force)' if force else ''}. Skipped already-done={skipped_done}, exhausted-retries={skipped_exhausted}."
+    )
+    return 0
+
+
+def add_chapters_to_queue(config: NovelConfig, chapters: list[int], *, force: bool = False) -> int:
+    """Enqueue an explicit list of chapters for translation.
+
+    Useful for selective re-translation after crawl repair (replacement/placeholder rewrite).
+    """
+    wanted = sorted({int(ch) for ch in chapters if int(ch) > 0})
+    if not wanted:
+        print("No chapters provided.")
+        return 0
+    wanted_set = set(wanted)
+
+    client = _client(config)
+    added = 0
+    skipped_done = 0
+    skipped_exhausted = 0
+    found = 0
+    found_set: set[int] = set()
+
+    for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
+        for chapter_num, chapter_text in load_source_chapters(config, source_path):
+            try:
+                chap = int(str(chapter_num))
+            except Exception:
+                continue
+            if chap not in wanted_set:
+                continue
+            found += 1
+            found_set.add(chap)
+            job_id = _job_id(source_path.name, str(chap))
+            if client.hexists(_key(config, "inflight"), job_id):
+                continue
+            if not force:
+                if _has_exhausted_retries(config, client, job_id):
+                    skipped_exhausted += 1
+                    continue
+                if not _chapter_needs_work(config, source_path, str(chap), chapter_text=chapter_text):
+                    skipped_done += 1
+                    continue
+
+            if force:
+                client.hset(_key(config, "force"), job_id, str(int(time.time())))
+                client.hdel(_key(config, "retries"), job_id)
+
+            if client.sadd(_key(config, "queued"), job_id):
+                client.rpush(_key(config, "pending"), job_id)
+                added += 1
+
+    missing = len(wanted_set) - found
+    LOGGER.info(
+        "Queue add chapters | novel=%s chapters=%s force=%s added=%s found=%s missing=%s skipped_done=%s skipped_exhausted=%s",
+        config.novel_id,
+        len(wanted_set),
+        force,
+        added,
+        found,
+        missing,
+        skipped_done,
+        skipped_exhausted,
+    )
+    print(
+        f"Queued {added} job(s) for novel {config.novel_id} chapters={len(wanted_set)}"
+        f"{' (force)' if force else ''}. Found={found}, missing={missing}, skipped_done={skipped_done}, exhausted_retries={skipped_exhausted}."
+    )
+    if missing:
+        missing_chaps = [ch for ch in wanted if ch not in found_set]
+        if missing_chaps:
+            preview = ", ".join(str(ch) for ch in missing_chaps[:50])
+            suffix = " ..." if len(missing_chaps) > 50 else ""
+            print(f"Missing chapters not found in origin: {preview}{suffix}")
+    return 0
+
+
+def add_all_jobs_to_queue(config: NovelConfig, *, force: bool = False) -> int:
+    """Enqueue all chapter jobs that still need work across all origin batches."""
+    client = _client(config)
+    added = 0
+    skipped_done = 0
+    skipped_exhausted = 0
+    total_candidates = 0
+
+    for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
+        for chapter_num, chapter_text in load_source_chapters(config, source_path):
+            try:
+                chap_str = str(int(str(chapter_num)))
+            except Exception:
+                continue
+            total_candidates += 1
+            job_id = _job_id(source_path.name, chap_str)
+            if client.hexists(_key(config, "inflight"), job_id):
+                continue
+            if not force:
+                if _has_exhausted_retries(config, client, job_id):
+                    skipped_exhausted += 1
+                    continue
+                if not _chapter_needs_work(config, source_path, chap_str, chapter_text=chapter_text):
+                    skipped_done += 1
+                    continue
+
+            if force:
+                client.hset(_key(config, "force"), job_id, str(int(time.time())))
+                client.hdel(_key(config, "retries"), job_id)
+
+            if client.sadd(_key(config, "queued"), job_id):
+                client.rpush(_key(config, "pending"), job_id)
+                added += 1
+
+    LOGGER.info(
+        "Queue add --all | novel=%s force=%s candidates=%s added=%s skipped_done=%s skipped_exhausted=%s",
+        config.novel_id,
+        force,
+        total_candidates,
+        added,
+        skipped_done,
+        skipped_exhausted,
+    )
+    print(
+        f"Queued {added} job(s) for novel {config.novel_id} (all chapters){' (force)' if force else ''}. "
+        f"Skipped already-done={skipped_done}, exhausted-retries={skipped_exhausted}."
     )
     return 0
 
@@ -1414,7 +2033,8 @@ def _estimated_request_tokens_for_model(config: NovelConfig, model: str) -> int:
     model_cfg = config.queue.model_configs.get(model)
     chunk_max_len = model_cfg.chunk_max_len if model_cfg and model_cfg.chunk_max_len > 0 else 0
     if chunk_max_len <= 0:
-        chunk_max_len = config.translation.chunk_max_len
+        # Model configs are canonical; keep a conservative fallback for telemetry/estimates only.
+        chunk_max_len = 800
     return _estimate_tokens_from_chars(chunk_max_len)
 
 
@@ -1595,12 +2215,87 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
         raise ValueError(f"Invalid key index: {key_index}")
     api_key = keys[key_index - 1]
     client = _client(config)
+    if bool(getattr(config, "proxy_gateway", None) and config.proxy_gateway.enabled):
+        proxy_name = None
+        reason = ""
+        if key_index == 1:
+            LOGGER.info(
+                "Worker proxy disabled for k1; using direct | novel=%s key_index=%s model=%s",
+                config.novel_id,
+                key_index,
+                model,
+            )
+        else:
+            proxies = []
+            if bool(getattr(config.proxy_gateway, "auto_discovery", True)):
+                try:
+                    healthy, reason = proxy_gateway_mod.load_healthy_proxy_names_from_redis(
+                        cfg=config.proxy_gateway,
+                        redis_cfg=config.queue.redis,
+                        now=time.time(),
+                        cache_ttl_seconds=0.0,
+                    )
+                    proxies = list(healthy or [])
+                except Exception:
+                    proxies = []
+            else:
+                proxies = list(getattr(config.proxy_gateway, "proxies", None) or [])
+            if proxies:
+                proxy_name = proxy_gateway_mod.select_proxy_for_key_index(
+                    key_index=key_index,
+                    proxies=proxies,
+                    keys_per_proxy=int(getattr(config.proxy_gateway, "keys_per_proxy", 3) or 3),
+                )
+            if proxy_name:
+                LOGGER.info(
+                    "Worker proxy selected | novel=%s key_index=%s model=%s proxy=%s",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    proxy_name,
+                )
+            else:
+                LOGGER.info(
+                    "Worker proxy unavailable; using direct | novel=%s key_index=%s model=%s reason=%s",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    reason or "-",
+                )
     worker_id = f"{config.novel_id}:k{key_index}:{model}:{os.getpid()}"
     consecutive_rate_limit_releases = 0
     cooldown_key = _rate_limit_cooldown_key(config, key_index=key_index, model=model)
     out_of_quota_key = _out_of_quota_cooldown_key(config, key_index=key_index, model=model)
     max_429_cooldown_seconds = 65.0
     while True:
+        # Suspected IP-level throttling: pause all workers for this model (per novel), with spaced probing.
+        if _ip_ban_is_active(client, config, model=model):
+            _ip_ban_probe_if_due(client, config, key_index=key_index, model=model, api_key=api_key)
+            if _ip_ban_is_active(client, config, model=model):
+                next_in = _ip_ban_next_probe_in_seconds(client, config, model=model)
+                state = _get_ip_ban_state(client, config, model=model)
+                try:
+                    next_probe_at = float(state.get("next_probe_at") or 0.0)
+                except Exception:
+                    next_probe_at = 0.0
+                until = next_probe_at if next_probe_at > time.time() else (time.time() + max(1.0, next_in))
+                _sync_cooldown_until(client, cooldown_key, until=until)
+                sleep_seconds = max(0.5, min(max(1.0, next_in), 10.0))
+                LOGGER.warning(
+                    "Worker cooling down due to suspected IP ban (429) | novel=%s key_index=%s model=%s sleeping for %.2fs",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    sleep_seconds,
+                )
+                _interruptible_sleep(
+                    max_seconds=sleep_seconds,
+                    check_remaining_seconds=lambda: _ip_ban_next_probe_in_seconds(client, config, model=model),
+                    step_seconds=2.0,
+                    min_sleep_seconds=0.5,
+                )
+                continue
+
         out_remaining = _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key)
         if out_remaining > 0.05:
             sleep_seconds = max(1.0, out_remaining)
@@ -1658,8 +2353,20 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 min_sleep_seconds=0.5,
             )
             continue
-        job_id = _throttled_pick_job_id(config, client, key_index=key_index, timeout_seconds=5.0)
+        job_id = _throttled_pick_job_id(config, client, key_index=key_index, model=model, timeout_seconds=5.0)
         if not job_id:
+            continue
+        # If an IP-ban is suspected, do not start new translate subprocesses.
+        # Push the job back and let all workers cool down together.
+        if _ip_ban_is_active(client, config, model=model):
+            client.lpush(_pending_priority_key(config), job_id)
+            time.sleep(0.5)
+            continue
+        # After an IP-ban clears, ramp up slowly to avoid bursting into another ban.
+        if _ip_recover_is_active(client, config, model=model) and not _ip_recover_try_admit(client, config, model=model):
+            client.lpush(_pending_priority_key(config), job_id)
+            _sync_cooldown_until(client, cooldown_key, until=time.time() + 1.0)
+            time.sleep(0.25)
             continue
         client.srem(_key(config, "queued"), job_id)
         is_captions = _is_captions_job(job_id)
@@ -1692,8 +2399,13 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
         env = os.environ.copy()
         env["GEMINI_API_KEY"] = api_key
         env["GEMINI_MODEL"] = model
+        env["NOVEL_TTS_NOVEL_ID"] = config.novel_id
+        env["NOVEL_TTS_KEY_INDEX"] = str(int(key_index))
+        env["NOVEL_TTS_KEY_COUNT"] = str(int(len(keys)))
         env["NOVEL_TTS_QUOTA_MODE"] = "raise"
         env["NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS"] = "0"
+        env["NOVEL_TTS_CENTRAL_QUOTA"] = "1"
+        env["NOVEL_TTS_CENTRAL_QUOTA_NONBLOCKING"] = "1"
         if not is_captions:
             env["NOVEL_TTS_GLOSSARY_STRICT"] = "1"
         env["GEMINI_RATE_LIMIT_KEY_PREFIX"] = f"{config.queue.redis.prefix}:{config.novel_id}:k{key_index}"
@@ -1711,8 +2423,21 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 for model_name, cfg in config.queue.model_configs.items()
             }
         )
-        if model_cfg and model_cfg.repair_model:
-            env["REPAIR_MODEL"] = model_cfg.repair_model
+        def _clean_model(value) -> str:
+            if value is None:
+                return ""
+            text = str(value).strip()
+            if not text:
+                return ""
+            if text.lower() in {"none", "null"}:
+                return ""
+            return text
+
+        repair_model = _clean_model(model_cfg.repair_model) if model_cfg else ""
+        glossary_model = _clean_model(getattr(model_cfg, "glossary_model", "")) if model_cfg else ""
+        # Default to the worker's key-model when overrides are not configured.
+        env["REPAIR_MODEL"] = repair_model or model
+        env["GLOSSARY_MODEL"] = glossary_model or model
         if model_cfg and model_cfg.chunk_max_len > 0:
             env["CHUNK_MAX_LEN"] = str(model_cfg.chunk_max_len)
         if model_cfg and model_cfg.chunk_sleep_seconds > 0:
@@ -1761,6 +2486,8 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             if proc.returncode != 76:
                 break
             combined = "\n".join([proc.stdout or "", proc.stderr or ""]).strip()
+            if _parse_quota_should_requeue(combined):
+                break
             wait_seconds = _parse_quota_suggested_wait_seconds(combined)
             blocked_model = model
             if wait_seconds is None:
@@ -1841,6 +2568,7 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 key_index,
                 model,
             )
+            ip_triggered = _maybe_trigger_ip_ban_on_429(client, config, key_index=key_index, model=model)
             # Requeue without counting as a failure retry.
             delay_seconds = _rate_limit_requeue_delay_seconds(consecutive_rate_limit_releases)
             delay_seconds += random.uniform(0.0, min(1.0, delay_seconds * 0.25))
@@ -1852,16 +2580,21 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             )
             _delay_job(config, client, job_id, float(delay_seconds))
             time.sleep(min(2.0, max(0.25, delay_seconds)))
+            if ip_triggered:
+                # When IP-ban is suspected, avoid additional probes from individual workers.
+                consecutive_rate_limit_releases = 0
+                continue
             if consecutive_rate_limit_releases >= 2:
-                provider = (config.translation.provider or "").strip().lower()
+                provider = (config.models.provider or "").strip().lower()
                 probe_429: bool | None = None
                 if provider == "gemini_http":
                     # Probe with a tiny request to confirm we are *still* getting HTTP 429.
                     # If the probe fails (None), be conservative and keep the long cooldown behavior.
-                    probe_429 = _probe_gemini_429(api_key=api_key, model=model)
+                    probe_429 = _probe_gemini_429(config=config, api_key=api_key, model=model, key_index=key_index)
 
                 if probe_429 is False:
                     cooldown_seconds = float(_RATE_LIMIT_PROBE_COOLDOWN_SECONDS)
+                    cooldown_seconds += _cooldown_jitter_seconds(key_index, max_jitter_seconds=5.0)
                     LOGGER.warning(
                         "Worker rate limit probe: no 429; sleeping for %.2fs | novel=%s key_index=%s model=%s",
                         cooldown_seconds,
@@ -1869,7 +2602,20 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                         key_index,
                         model,
                     )
-                    time.sleep(cooldown_seconds)
+                    # Even if a tiny probe succeeds, the real workload may still be quota-exhausted.
+                    # Set a shared (key+model + global) cooldown so other workers don't immediately retry and re-429.
+                    _extend_rate_limit_cooldown_capped(
+                        client,
+                        cooldown_key,
+                        seconds=float(cooldown_seconds),
+                        max_seconds=max_429_cooldown_seconds,
+                    )
+                    _interruptible_sleep(
+                        max_seconds=float(cooldown_seconds),
+                        check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key),
+                        step_seconds=1.0,
+                        min_sleep_seconds=0.25,
+                    )
                 else:
                     cooldown_seconds = 3600.0
                     probe_text = "probe=429" if probe_429 is True else "probe=unknown"
@@ -1896,6 +2642,7 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             client.hdel(_key(config, "inflight"), job_id)
             consecutive_rate_limit_releases = 0
             combined = "\n".join([proc.stdout or "", proc.stderr or ""]).strip()
+            force_requeue = _parse_quota_should_requeue(combined)
             lowered = combined.lower()
             release_reason = "quota gate"
             if "timeout" in lowered or "timed out" in lowered or "connectionerror" in lowered:
@@ -1907,6 +2654,11 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 key_index,
                 model,
             )
+            if force_requeue:
+                # Central quota redirect: immediately requeue so another key can pick it up.
+                _requeue_job_priority(config, client, job_id)
+                time.sleep(0.5)
+                continue
             suggested_wait = _parse_quota_suggested_wait_seconds(combined)
             parsed_blocked_model = _parse_quota_blocked_model(combined) or ""
             should_pause, blocked_model, wait_seconds = _worker_should_pause_for_quota(config, client, key_index, model)
@@ -1991,7 +2743,6 @@ def run_supervisor(config: NovelConfig) -> int:
     while True:
         launched = _ensure_worker_processes(config)
         drained = _drain_delayed_jobs(config, client)
-        _enqueue_needed_jobs(config, client)
         _requeue_stale_inflight(config, client)
         LOGGER.info(
             "queue pending=%s queued=%s inflight=%s done=%s launched_workers=%s drained_delayed=%s",
@@ -2181,6 +2932,9 @@ def _reap_unwanted_worker_processes(config: NovelConfig, *, max_key_index: int, 
 def _ensure_worker_processes(config: NovelConfig) -> int:
     keys = _load_keys(config)
     worker_models = config.queue.enabled_models or ["gemma-3-27b-it", "gemma-3-12b-it"]
+    client = _client(config)
+    for model in worker_models:
+        _maybe_apply_startup_ramp(client, config, model=model)
     _reap_unwanted_worker_processes(config, max_key_index=len(keys), worker_models=worker_models)
     spawn_interval = 0.0
     try:
@@ -2212,7 +2966,7 @@ def _ensure_worker_processes(config: NovelConfig) -> int:
     return launched
 
 
-def launch_queue_stack(config: NovelConfig, restart: bool = False) -> int:
+def launch_queue_stack(config: NovelConfig, restart: bool = False, *, add_queue: bool = False) -> int:
     keys = _load_keys(config)
     client = _client(config)
     if restart:
@@ -2236,6 +2990,13 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False) -> int:
             _key(config, "model_done"),
             _key(config, "model_failed"),
         )
+        # Allow startup ramp to re-apply after restart.
+        for model in (config.queue.enabled_models or []):
+            _clear_ip_recover_state(client, config, model=model)
+            try:
+                client.delete(_startup_ramp_applied_key(config, model=model))
+            except Exception:
+                pass
         status_log, state_log = _status_paths(config)
         for path in (status_log, state_log):
             try:
@@ -2243,6 +3004,53 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False) -> int:
             except Exception:
                 LOGGER.warning("Failed to remove status artifact on restart: %s", path)
         time.sleep(1)
+
+    # Before launching fresh queue processes, ask the global quota-supervisor to rotate this novel's logs
+    # into .logs/archived/today so operators can follow logs from a clean slate.
+    prefix = str(config.queue.redis.prefix or "").strip() or "novel_tts"
+    requests_key = f"{prefix}:logrotate:requests"
+    request_id = uuid.uuid4().hex
+    reply_key = f"{prefix}:logrotate:reply:{request_id}"
+    payload = json.dumps(
+        {
+            "cmd": "rotate_novel_logs",
+            "novel_id": config.novel_id,
+            "request_id": request_id,
+            "reply_key": reply_key,
+            "created_at": time.time(),
+            "pid": os.getpid(),
+        },
+        ensure_ascii=False,
+    )
+    try:
+        client.rpush(requests_key, payload)
+    except Exception as exc:
+        print(f"queue launch: unable to send logrotate request to quota-supervisor: {exc}", file=sys.stderr)
+        print("queue launch: please run `uv run novel-tts quota-supervisor` first", file=sys.stderr)
+        return 1
+
+    deadline = time.time() + 5.0
+    ack_raw = ""
+    while time.time() < deadline:
+        try:
+            ack_raw = str(client.get(reply_key) or "").strip()
+        except Exception:
+            ack_raw = ""
+        if ack_raw:
+            break
+        time.sleep(0.05)
+    if not ack_raw:
+        print("queue launch: logrotate ack timeout (quota-supervisor may not be running)", file=sys.stderr)
+        print("queue launch: please run `uv run novel-tts quota-supervisor` first", file=sys.stderr)
+        return 1
+    try:
+        ack = json.loads(ack_raw)
+    except Exception:
+        ack = {}
+    ok = bool(ack.get("ok")) if isinstance(ack, dict) else False
+    if not ok:
+        print(f"queue launch: logrotate failed (ack={ack_raw!r})", file=sys.stderr)
+        return 1
 
     supervisor_log = get_novel_log_path(config.storage.logs_dir, config.novel_id, "queue/supervisor.log")
     supervisor_pid = _spawn_process(
@@ -2287,42 +3095,90 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False) -> int:
         supervisor_pid,
         status_pid,
     )
+
+    if add_queue:
+        add_all_jobs_to_queue(config)
     return 0
 
 
-def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
-    """List queue-related processes for a novel in a pm2-like summary, plus progress."""
+def _run_ps_ax(*, cwd: Path | None = None) -> tuple[int, str]:
     try:
         proc = subprocess.run(
             ["ps", "ax", "-o", "pid=,ppid=,command="],
-            cwd=str(config.storage.root),
+            cwd=str(cwd) if cwd is not None else None,
             check=False,
             capture_output=True,
             text=True,
         )
     except PermissionError as exc:
         LOGGER.error("Unable to run ps to list processes: %s", exc)
-        return 1
+        return 1, ""
     if proc.returncode != 0:
         LOGGER.error("Unable to run ps ax to list processes")
-        return 1
+        return 1, ""
+    return 0, proc.stdout or ""
 
-    lines = (proc.stdout or "").splitlines()
+
+def _queue_role_and_novel_id(argv: list[str]) -> tuple[str, str]:
+    role = ""
+    novel_id = ""
+
+    # Queue commands: novel id is after "queue <subcmd> <novel_id>"
+    if "queue" in argv:
+        q_idx = argv.index("queue")
+        if q_idx + 2 < len(argv):
+            subcmd = argv[q_idx + 1]
+            novel_id = argv[q_idx + 2]
+            if subcmd == "supervisor":
+                role = "supervisor"
+            elif subcmd == "monitor":
+                role = "monitor"
+            elif subcmd == "worker":
+                role = "worker"
+            elif subcmd == "launch":
+                role = "launcher"
+
+    # Translate chapter subprocesses: novel id is after "translate chapter <novel_id>"
+    if not role and "translate" in argv:
+        t_idx = argv.index("translate")
+        if t_idx + 2 < len(argv) and argv[t_idx + 1] == "chapter":
+            novel_id = argv[t_idx + 2]
+            role = "translate-chapter"
+
+    return role, novel_id
+
+
+def _extract_proc_meta(argv: list[str]) -> tuple[str, str, str]:
+    log_file = ""
+    key_index = ""
+    model = ""
+    for idx, token in enumerate(argv):
+        if token == "--log-file" and idx + 1 < len(argv):
+            log_file = argv[idx + 1]
+        elif token == "--key-index" and idx + 1 < len(argv):
+            key_index = argv[idx + 1]
+        elif token == "--model" and idx + 1 < len(argv):
+            model = argv[idx + 1]
+    return log_file, key_index, model
+
+
+def _collect_queue_rows_from_ps(ps_stdout: str) -> tuple[list[dict[str, str]], dict[str, str], dict[str, dict[str, str]]]:
     rows: list[dict[str, str]] = []
     ppid_by_pid: dict[str, str] = {}
     worker_meta_by_pid: dict[str, dict[str, str]] = {}
-    novel_token = f" {config.novel_id}"
 
-    for line in lines:
-        line = line.strip()
+    for raw_line in (ps_stdout or "").splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         try:
             pid_str, ppid_str, cmd = line.split(None, 2)
         except ValueError:
             continue
-        ppid_by_pid[pid_str.strip()] = ppid_str.strip()
-        if "novel_tts" not in cmd or novel_token not in cmd:
+        pid = pid_str.strip()
+        ppid = ppid_str.strip()
+        ppid_by_pid[pid] = ppid
+        if "novel_tts" not in cmd:
             continue
 
         try:
@@ -2330,106 +3186,96 @@ def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
         except Exception:
             argv = cmd.split()
 
-        role = ""
-        key_index = ""
-        model = ""
-        log_file = ""
-
-        # Queue commands for this novel.
-        if "queue" in argv:
-            q_idx = argv.index("queue")
-            if q_idx + 2 < len(argv) and argv[q_idx + 2] == config.novel_id:
-                subcmd = argv[q_idx + 1] if q_idx + 1 < len(argv) else ""
-                if subcmd == "supervisor":
-                    role = "supervisor"
-                elif subcmd == "monitor":
-                    role = "monitor"
-                elif subcmd == "worker":
-                    role = "worker"
-                else:
-                    role = subcmd or "queue"
-
-        # Translate chapter subprocesses for this novel.
-        if not role and "translate" in argv:
-            t_idx = argv.index("translate")
-            if t_idx + 2 < len(argv) and argv[t_idx + 1] == "chapter" and argv[t_idx + 2] == config.novel_id:
-                role = "translate-chapter"
-
-        if not role:
+        role, novel_id = _queue_role_and_novel_id(argv)
+        if not role or not novel_id:
             continue
 
-        for idx, token in enumerate(argv):
-            if token == "--log-file" and idx + 1 < len(argv):
-                log_file = argv[idx + 1]
-            elif token == "--key-index" and idx + 1 < len(argv):
-                key_index = argv[idx + 1]
-            elif token == "--model" and idx + 1 < len(argv):
-                model = argv[idx + 1]
+        log_file, key_index, model = _extract_proc_meta(argv)
+        target = _extract_target_from_argv(argv) if role == "translate-chapter" else ""
 
-        pid = pid_str.strip()
-        rows.append(
-            {
-                "pid": pid,
-                "ppid": ppid_str.strip(),
-                "role": role,
-                "key_index": key_index,
-                "model": model,
-                "log_file": log_file,
-                "state": "",
-                "countdown": "",
-            }
-        )
+        row = {
+            "pid": pid,
+            "ppid": ppid,
+            "novel_id": novel_id,
+            "role": role,
+            "key_index": key_index,
+            "model": model,
+            "target": target,
+            "log_file": log_file,
+            "state": "",
+            "countdown": "",
+        }
+        rows.append(row)
         if role == "worker":
             worker_meta_by_pid[pid] = {"key_index": key_index, "model": model}
 
-    def _inherit_worker_meta(pid: str) -> dict[str, str] | None:
-        cursor = pid
-        for _ in range(6):
-            if not cursor:
-                break
-            meta = worker_meta_by_pid.get(cursor)
-            if meta and meta.get("key_index") and meta.get("model"):
-                return meta
-            cursor = ppid_by_pid.get(cursor, "")
+    return rows, ppid_by_pid, worker_meta_by_pid
+
+
+def _inherit_worker_meta(*, pid: str, ppid_by_pid: dict[str, str], worker_meta_by_pid: dict[str, dict[str, str]]) -> dict[str, str] | None:
+    cursor = pid
+    for _ in range(6):
+        if not cursor:
+            break
+        meta = worker_meta_by_pid.get(cursor)
+        if meta and meta.get("key_index") and meta.get("model"):
+            return meta
+        cursor = ppid_by_pid.get(cursor, "")
+    return None
+
+
+def _infer_worker_meta_from_log_path(path: str) -> dict[str, str] | None:
+    base = os.path.basename(path or "")
+    match = re.search(r"^k(?P<key>\d+)-(?P<model>.+?)(?:-w\d+)?\.log$", base)
+    if not match:
         return None
+    return {"key_index": match.group("key"), "model": match.group("model").replace("_", "-")}
 
-    def _infer_from_log_path(path: str) -> dict[str, str] | None:
-        # Example: .../queue/workers/k1-gemma_3_27b_it-w2.log
-        base = os.path.basename(path or "")
-        match = re.search(r"^k(?P<key>\d+)-(?P<model>.+?)(?:-w\d+)?\.log$", base)
-        if not match:
-            return None
-        key = match.group("key")
-        model_guess = match.group("model").replace("_", "-")
-        return {"key_index": key, "model": model_guess}
 
+def _enrich_translate_chapter_meta(
+    rows: list[dict[str, str]],
+    *,
+    ppid_by_pid: dict[str, str],
+    worker_meta_by_pid: dict[str, dict[str, str]],
+) -> None:
     for row in rows:
-        if row["role"] != "translate-chapter":
+        if row.get("role") != "translate-chapter":
             continue
-        if (not row["key_index"]) or (not row["model"]):
-            inherited = _inherit_worker_meta(row.get("ppid", ""))
-            if inherited:
-                row["key_index"] = row["key_index"] or inherited.get("key_index", "")
-                row["model"] = row["model"] or inherited.get("model", "")
-        if (not row["key_index"]) or (not row["model"]):
-            inferred = _infer_from_log_path(row.get("log_file", ""))
-            if inferred:
-                row["key_index"] = row["key_index"] or inferred.get("key_index", "")
-                row["model"] = row["model"] or inferred.get("model", "")
+        if row.get("key_index") and row.get("model"):
+            continue
+        inherited = _inherit_worker_meta(pid=row.get("ppid", ""), ppid_by_pid=ppid_by_pid, worker_meta_by_pid=worker_meta_by_pid)
+        if inherited:
+            row["key_index"] = row.get("key_index") or inherited.get("key_index", "")
+            row["model"] = row.get("model") or inherited.get("model", "")
+        if row.get("key_index") and row.get("model"):
+            continue
+        inferred = _infer_worker_meta_from_log_path(row.get("log_file", ""))
+        if inferred:
+            row["key_index"] = row.get("key_index") or inferred.get("key_index", "")
+            row["model"] = row.get("model") or inferred.get("model", "")
 
-    children_by_ppid: dict[str, list[dict[str, str]]] = {}
+
+def _children_by_ppid(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    children: dict[str, list[dict[str, str]]] = {}
     for row in rows:
-        children_by_ppid.setdefault(row.get("ppid", ""), []).append(row)
+        children.setdefault(row.get("ppid", ""), []).append(row)
+    return children
+
+
+def _classify_queue_rows(rows: list[dict[str, str]], *, surface_worker_target: bool) -> dict[str, list[dict[str, str]]]:
+    children_by_ppid = _children_by_ppid(rows)
 
     for row in rows:
         role = row.get("role", "")
         pid = row.get("pid", "")
         is_busy = False
         if role == "worker":
-            for child in children_by_ppid.get(pid, []):
-                if child.get("role") == "translate-chapter":
-                    is_busy = True
-                    break
+            children = [c for c in children_by_ppid.get(pid, []) if c.get("role") == "translate-chapter"]
+            if children:
+                is_busy = True
+                if surface_worker_target:
+                    children.sort(key=lambda c: int(c.get("pid") or 10**12))
+                    row["target"] = (children[0].get("target") or "").strip()
         state, countdown = _classify_process_state(role, is_busy=is_busy, log_file=row.get("log_file", ""))
         row["state"] = state
         row["countdown"] = str(int(math.ceil(countdown))) if countdown is not None and countdown > 0 else ""
@@ -2449,396 +3295,297 @@ def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
                 else ""
             )
 
-    def _truncate_middle(value: str, max_len: int) -> str:
-        value = value or ""
-        if max_len <= 0 or len(value) <= max_len:
-            return value
-        head = max(1, (max_len - 3) // 2)
-        tail = max(1, max_len - 3 - head)
-        return value[:head] + "..." + value[-tail:]
+    return children_by_ppid
 
-    def _format_log_path(path: str) -> str:
-        raw = path or ""
+
+def _format_log_path_for_display(path: str, *, root: Path | None = None) -> str:
+    raw = path or ""
+    if not raw:
+        return ""
+    if root is not None:
+        try:
+            root_s = str(root)
+            if raw.startswith(root_s + os.sep):
+                return os.path.relpath(raw, root_s)
+        except Exception:
+            pass
+    marker = f"{os.sep}.logs{os.sep}"
+    idx = raw.find(marker)
+    if idx >= 0:
+        return raw[idx + 1 :]
+    try:
+        cwd = os.getcwd()
+        if raw.startswith(cwd + os.sep):
+            return os.path.relpath(raw, cwd)
+    except Exception:
+        pass
+    return os.path.basename(raw)
+
+
+def _truncate_middle(value: str, max_len: int) -> str:
+    value = value or ""
+    if max_len <= 0 or len(value) <= max_len:
+        return value
+    head = max(1, (max_len - 3) // 2)
+    tail = max(1, max_len - 3 - head)
+    return value[:head] + "..." + value[-tail:]
+
+
+def _render_queue_table(rows: list[dict[str, str]], *, target_count: int, root: Path | None = None) -> None:
+    headers = ["PID", "ROLE", "KEY", "STATE", "COUNTDOWN", "MODEL", "TARGET", "LOG"]
+    target_header = f"TARGET ({target_count})"
+
+    def _countdown_display(raw: str) -> str:
+        raw = (raw or "").strip()
         if not raw:
             return ""
         try:
-            root = str(config.storage.root)
-            if raw.startswith(root + os.sep):
-                return os.path.relpath(raw, root)
+            return _format_countdown(float(raw))
         except Exception:
-            pass
-        marker = f"{os.sep}.logs{os.sep}"
-        idx = raw.find(marker)
-        if idx >= 0:
-            return raw[idx + 1 :]
-        try:
-            cwd = os.getcwd()
-            if raw.startswith(cwd + os.sep):
-                return os.path.relpath(raw, cwd)
-        except Exception:
-            pass
-        return os.path.basename(raw)
+            return ""
 
-    def _render_table(rows: list[dict[str, str]]) -> None:
-        headers = ["PID", "ROLE", "KEY", "STATE", "COUNTDOWN", "MODEL", "LOG"]
-        # Keep the table readable by truncating the log path in the rendered view.
-        display_rows = []
-        def _countdown_display(raw: str) -> str:
-            raw = (raw or "").strip()
-            if not raw:
-                return ""
-            try:
-                return _format_countdown(float(raw))
-            except Exception:
-                return ""
-        for r in rows:
-            display_rows.append(
-                {
-                    "PID": r.get("pid", ""),
-                    "ROLE": r.get("role", ""),
-                    "KEY": r.get("key_index", "") or "",
-                    "STATE": r.get("state", ""),
-                    "COUNTDOWN": _countdown_display(r.get("countdown", "")),
-                    "MODEL": r.get("model", "") or "",
-                    "LOG": _truncate_middle(_format_log_path(r.get("log_file", "")), 110),
-                }
-            )
-
-        widths: dict[str, int] = {h: len(h) for h in headers}
-        for r in display_rows:
-            for h in headers:
-                widths[h] = max(widths[h], len(r.get(h, "")))
-
-        def _hr() -> str:
-            return "+-" + "-+-".join("-" * widths[h] for h in headers) + "-+"
-
-        def _row(values: dict[str, str]) -> str:
-            cells = []
-            for h in headers:
-                val = values.get(h, "")
-                if h in {"PID", "KEY"}:
-                    cells.append(val.rjust(widths[h]))
-                else:
-                    cells.append(val.ljust(widths[h]))
-            return "| " + " | ".join(cells) + " |"
-
-        print(_hr())
-        print(_row({h: h for h in headers}))
-        print(_hr())
-        for r in display_rows:
-            print(_row(r))
-        print(_hr())
-
-    if rows:
-        def _role_rank(role: str) -> int:
-            order = {
-                "supervisor": 0,
-                "monitor": 1,
-                "worker": 2,
-                "translate-chapter": 3,
+    display_rows: list[dict[str, str]] = []
+    for r in rows:
+        display_rows.append(
+            {
+                "PID": r.get("pid", ""),
+                "ROLE": r.get("role", ""),
+                "KEY": r.get("key_index", "") or "",
+                "STATE": r.get("state", ""),
+                "COUNTDOWN": _countdown_display(r.get("countdown", "")),
+                "MODEL": r.get("model", "") or "",
+                "TARGET": r.get("target", "") or "",
+                "LOG": _truncate_middle(_format_log_path_for_display(r.get("log_file", ""), root=root), 110),
             }
-            return order.get(role or "", 9)
-
-        def _safe_int(value: str, default: int = 10**12) -> int:
-            try:
-                return int(str(value).strip())
-            except Exception:
-                return default
-
-        rows.sort(
-            key=lambda r: (
-                _role_rank(r.get("role", "")),
-                _safe_int(r.get("key_index", ""), default=10**12),
-                r.get("model", "") or "",
-                _safe_int(r.get("pid", ""), default=10**12),
-            )
         )
-        render_rows = rows if include_all else [r for r in rows if r.get("role") != "translate-chapter"]
-        _render_table(render_rows)
-    else:
-        print(f"No queue processes found for novel {config.novel_id}")
 
-    # Try to show the latest progress snapshot, if available.
-    _status_log, state_log = _status_paths(config)
-    if state_log.exists():
+    widths: dict[str, int] = {h: len(h) for h in headers}
+    widths["TARGET"] = max(widths["TARGET"], len(target_header))
+    for r in display_rows:
+        for h in headers:
+            widths[h] = max(widths[h], len(r.get(h, "")))
+
+    def _hr() -> str:
+        return "+-" + "-+-".join("-" * widths[h] for h in headers) + "-+"
+
+    def _row(values: dict[str, str]) -> str:
+        cells: list[str] = []
+        for h in headers:
+            val = values.get(h, "")
+            if h in {"PID", "KEY"}:
+                cells.append(val.rjust(widths[h]))
+            else:
+                cells.append(val.ljust(widths[h]))
+        return "| " + " | ".join(cells) + " |"
+
+    print(_hr())
+    print(_row({h: (target_header if h == "TARGET" else h) for h in headers}))
+    print(_hr())
+    for r in display_rows:
+        print(_row(r))
+    print(_hr())
+
+
+def _sort_queue_rows(rows: list[dict[str, str]]) -> None:
+    def _role_rank(role: str) -> int:
+        order = {
+            "supervisor": 0,
+            "monitor": 1,
+            "worker": 2,
+            "translate-chapter": 3,
+            "launcher": 4,
+        }
+        return order.get(role or "", 9)
+
+    def _safe_int(value: str, default: int = 10**12) -> int:
         try:
-            snapshot = json.loads(state_log.read_text(encoding="utf-8"))
-        except Exception as exc:
-            LOGGER.warning("Unable to read queue status state for %s: %s", config.novel_id, exc)
-        else:
-            origin_files = snapshot.get("origin_files", 0)
-            translated_files = snapshot.get("translated_files", 0)
-            parts = snapshot.get("parts", 0)
-            chapter_total = snapshot.get("chapter_total", 0)
-            pending = snapshot.get("pending", 0)
-            queued = snapshot.get("queued", 0)
-            inflight = snapshot.get("inflight", 0)
-            retries = snapshot.get("retries", 0)
-            done = snapshot.get("done", 0)
-            done_pct = (translated_files / origin_files * 100.0) if origin_files else 0.0
-            part_pct = (parts / chapter_total * 100.0) if chapter_total else 0.0
-            eta_files = snapshot.get("eta_files") or ""
-            eta_parts = snapshot.get("eta_parts") or ""
+            return int(str(value).strip())
+        except Exception:
+            return default
 
-            print()
-            print(f"Progress for novel {config.novel_id}:")
-            print(
-                f"  files: {translated_files}/{origin_files} ({done_pct:.2f}%)"
-                f" | chapters: {parts}/{chapter_total} ({part_pct:.2f}%)"
-            )
-            print(
-                f"  queue: pending={pending} queued={queued} inflight={inflight}"
-                f" done={done} retries={retries}"
-            )
-            if eta_files or eta_parts:
-                print(f"  ETA: files={eta_files or 'unknown'} chapters={eta_parts or 'unknown'}")
+    rows.sort(
+        key=lambda r: (
+            _role_rank(r.get("role", "")),
+            _safe_int(r.get("key_index", ""), default=10**12),
+            r.get("model", "") or "",
+            _safe_int(r.get("pid", ""), default=10**12),
+        )
+    )
 
+
+def _queue_counts_from_redis(config: NovelConfig, client) -> tuple[int, int, int, int, int]:
+    pending = int(_pending_total_len(config, client) or 0)
+    queued = int(client.scard(_key(config, "queued")) or 0)
+    inflight = int(client.hlen(_key(config, "inflight")) or 0)
+    retries = int(client.hlen(_key(config, "retries")) or 0)
+    done = int(client.hlen(_key(config, "done")) or 0)
+    return pending, queued, inflight, retries, done
+
+
+def _queue_counts_from_state_log(config: NovelConfig) -> tuple[int, int, int, int, int]:
+    _status_log, state_log = _status_paths(config)
+    if not state_log.exists():
+        return 0, 0, 0, 0, 0
+    try:
+        snapshot = json.loads(state_log.read_text(encoding="utf-8"))
+    except Exception:
+        return 0, 0, 0, 0, 0
+    pending = int(snapshot.get("pending", 0) or 0)
+    queued = int(snapshot.get("queued", 0) or 0)
+    inflight = int(snapshot.get("inflight", 0) or 0)
+    retries = int(snapshot.get("retries", 0) or 0)
+    done = int(snapshot.get("done", 0) or 0)
+    return pending, queued, inflight, retries, done
+
+
+def _apply_live_redis_overrides(config: NovelConfig, client, rows: list[dict[str, str]], *, children_by_ppid: dict[str, list[dict[str, str]]]) -> None:
+    # If Redis is available, use cooldown keys as the source of truth for remaining time so
+    # `queue reset-key` immediately reflects in ps output (log-derived countdowns can be stale).
+    for row in rows:
+        if row.get("role") != "worker":
+            continue
+        raw_key_index = (row.get("key_index") or "").strip()
+        raw_model = (row.get("model") or "").strip()
+        if (not raw_key_index) or (not raw_model):
+            continue
+        try:
+            key_index = int(raw_key_index)
+        except Exception:
+            continue
+        out_key = _out_of_quota_cooldown_key(config, key_index=key_index, model=raw_model)
+        rl_key = _rate_limit_cooldown_key(config, key_index=key_index, model=raw_model)
+        out_remaining = _get_rate_limit_cooldown_remaining_seconds(client, out_key)
+        rl_remaining = _get_rate_limit_cooldown_remaining_seconds(client, rl_key)
+        if out_remaining > 0.05:
+            row["state"] = "out-of-quota"
+            row["countdown"] = str(int(math.ceil(out_remaining)))
+        elif float(rl_remaining or 0.0) > 0.05:
+            row["state"] = "waiting-429"
+            row["countdown"] = str(int(math.ceil(float(rl_remaining or 0.0))))
+        elif row.get("state") in {"waiting-429", "out-of-quota"}:
+            row["state"] = "idle"
+            row["countdown"] = ""
+
+    # Central quota v2: if a translate-chapter process is waiting for a grant, surface countdown from
+    # quota-supervisor ETA cache and propagate to its worker via the existing child-state combiner.
+    now_s = time.time()
+    for row in rows:
+        if row.get("role") != "translate-chapter":
+            continue
+        raw_pid = (row.get("pid") or "").strip()
+        raw_key_index = (row.get("key_index") or "").strip()
+        raw_model = (row.get("model") or "").strip()
+        if (not raw_pid) or (not raw_key_index) or (not raw_model):
+            continue
+        try:
+            pid_int = int(raw_pid)
+        except Exception:
+            continue
+        key_prefix = f"{config.queue.redis.prefix}:{config.novel_id}:k{int(raw_key_index)}"
+        inflight_key = f"{key_prefix}:{raw_model}:quota:alloc:inflight:{pid_int}"
+        try:
+            inflight_raw = client.get(inflight_key)
+        except Exception:
+            inflight_raw = None
+        if not inflight_raw:
+            continue
+        try:
+            inflight_meta = json.loads(inflight_raw)
+        except Exception:
+            inflight_meta = {}
+        request_id = str((inflight_meta or {}).get("request_id") or "").strip()
+        if not request_id:
+            continue
+        eta_key = f"{key_prefix}:{raw_model}:quota:alloc:eta"
+        try:
+            eta_raw = client.hget(eta_key, request_id)
+        except Exception:
+            eta_raw = None
+        remaining = None
+        if eta_raw:
+            try:
+                grant_at = float(eta_raw)
+                remaining = max(0.0, grant_at - now_s)
+            except Exception:
+                remaining = None
+        row["state"] = "waiting-quota"
+        row["countdown"] = str(int(math.ceil(remaining))) if remaining is not None and remaining > 0.05 else ""
+
+    # Re-combine worker state after central-quota updates so waiting-quota propagates to the worker rows.
+    for row in rows:
+        if row.get("role") != "worker":
+            continue
+        pid = row.get("pid", "")
+        children = [c for c in children_by_ppid.get(pid, []) if c.get("role") == "translate-chapter"]
+        combined_state, combined_countdown = _combine_worker_child_states_with_countdown(children)
+        if combined_state:
+            row["state"] = combined_state
+            row["countdown"] = (
+                str(int(math.ceil(combined_countdown)))
+                if combined_countdown is not None and combined_countdown > 0
+                else ""
+            )
+
+
+def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
+    """List queue-related processes for a novel in a pm2-like summary, plus progress."""
+    rc, stdout = _run_ps_ax(cwd=config.storage.root)
+    if rc != 0:
+        return 1
+
+    all_rows, ppid_by_pid, worker_meta_by_pid = _collect_queue_rows_from_ps(stdout)
+    rows = [r for r in all_rows if (r.get("novel_id") or "").strip() == config.novel_id]
+    if not rows:
+        print(f"No queue processes found for novel {config.novel_id}")
+        return 0
+
+    _enrich_translate_chapter_meta(rows, ppid_by_pid=ppid_by_pid, worker_meta_by_pid=worker_meta_by_pid)
+    children_by_ppid = _classify_queue_rows(rows, surface_worker_target=True)
+
+    pending = queued = inflight = retries = done = 0
+    client = None
+    try:
+        client = _client(config)
+        pending, queued, inflight, retries, done = _queue_counts_from_redis(config, client)
+        _apply_live_redis_overrides(config, client, rows, children_by_ppid=children_by_ppid)
+    except Exception:
+        pending, queued, inflight, retries, done = _queue_counts_from_state_log(config)
+
+    print(
+        f"\nNovel {config.novel_id}:"
+        f" pending={pending} queued={queued} inflight={inflight} retries={retries} done={done}"
+    )
+
+    _sort_queue_rows(rows)
+    render_rows = rows if include_all else [r for r in rows if r.get("role") != "translate-chapter"]
+    _render_queue_table(render_rows, target_count=_unique_target_count(rows), root=config.storage.root)
     return 0
 
 
 def list_all_queue_processes(include_all: bool = False) -> int:
     """List queue-related processes for all novels, grouped by novel."""
-    try:
-        proc = subprocess.run(
-            ["ps", "ax", "-o", "pid=,ppid=,command="],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except PermissionError as exc:
-        LOGGER.error("Unable to run ps to list processes: %s", exc)
-        return 1
-    if proc.returncode != 0:
-        LOGGER.error("Unable to run ps ax to list processes")
+    rc, stdout = _run_ps_ax()
+    if rc != 0:
         return 1
 
-    lines = (proc.stdout or "").splitlines()
+    all_rows, ppid_by_pid, worker_meta_by_pid = _collect_queue_rows_from_ps(stdout)
+    if not all_rows:
+        print("No queue processes found for any novel")
+        return 0
+
     by_novel: dict[str, list[dict[str, str]]] = {}
-    ppid_by_pid: dict[str, str] = {}
-    worker_meta_by_pid: dict[str, dict[str, str]] = {}
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            pid_str, ppid_str, cmd = line.split(None, 2)
-        except ValueError:
-            continue
-        pid = pid_str.strip()
-        ppid_by_pid[pid] = ppid_str.strip()
-        if "novel_tts" not in cmd:
-            continue
-
-        try:
-            argv = shlex.split(cmd)
-        except Exception:
-            argv = cmd.split()
-
-        role = ""
-        novel_id = ""
-
-        # Queue commands: novel id is after "queue <subcmd> <novel_id>"
-        if "queue" in argv:
-            q_idx = argv.index("queue")
-            if q_idx + 2 < len(argv):
-                subcmd = argv[q_idx + 1]
-                novel_id = argv[q_idx + 2]
-                if subcmd in {"supervisor", "monitor", "worker", "launch"}:
-                    if subcmd == "supervisor":
-                        role = "supervisor"
-                    elif subcmd == "monitor":
-                        role = "monitor"
-                    elif subcmd == "worker":
-                        role = "worker"
-                    elif subcmd == "launch":
-                        role = "launcher"
-
-        # Translate chapter subprocesses: novel id is after "translate chapter <novel_id>"
-        if not role and "translate" in argv:
-            t_idx = argv.index("translate")
-            if t_idx + 2 < len(argv) and argv[t_idx + 1] == "chapter":
-                novel_id = argv[t_idx + 2]
-                role = "translate-chapter"
-
-        if not role or not novel_id:
-            continue
-
-        key_index = ""
-        model = ""
-        log_file = ""
-        target = ""
-        for idx, token in enumerate(argv):
-            if token == "--log-file" and idx + 1 < len(argv):
-                log_file = argv[idx + 1]
-            elif token == "--key-index" and idx + 1 < len(argv):
-                key_index = argv[idx + 1]
-            elif token == "--model" and idx + 1 < len(argv):
-                model = argv[idx + 1]
-
-        if role == "translate-chapter":
-            target = _extract_target_from_argv(argv)
-
-        by_novel.setdefault(novel_id, []).append(
-            {
-                "pid": pid,
-                "ppid": ppid_str.strip(),
-                "role": role,
-                "key_index": key_index,
-                "model": model,
-                "log_file": log_file,
-                "state": "",
-                "countdown": "",
-                "target": target,
-            }
-        )
-        if role == "worker":
-            worker_meta_by_pid[pid] = {"key_index": key_index, "model": model}
+    for row in all_rows:
+        novel_id = (row.get("novel_id") or "").strip()
+        if novel_id:
+            by_novel.setdefault(novel_id, []).append(row)
 
     if not by_novel:
         print("No queue processes found for any novel")
         return 0
 
-    def _inherit_worker_meta(pid: str) -> dict[str, str] | None:
-        cursor = pid
-        for _ in range(6):
-            if not cursor:
-                break
-            meta = worker_meta_by_pid.get(cursor)
-            if meta and meta.get("key_index") and meta.get("model"):
-                return meta
-            cursor = ppid_by_pid.get(cursor, "")
-        return None
-
-    def _infer_from_log_path(path: str) -> dict[str, str] | None:
-        base = os.path.basename(path or "")
-        match = re.search(r"^k(?P<key>\d+)-(?P<model>.+?)(?:-w\d+)?\.log$", base)
-        if not match:
-            return None
-        return {"key_index": match.group("key"), "model": match.group("model").replace("_", "-")}
-
-    def _truncate_middle(value: str, max_len: int) -> str:
-        value = value or ""
-        if max_len <= 0 or len(value) <= max_len:
-            return value
-        head = max(1, (max_len - 3) // 2)
-        tail = max(1, max_len - 3 - head)
-        return value[:head] + "..." + value[-tail:]
-
-    def _format_log_path(path: str) -> str:
-        raw = path or ""
-        if not raw:
-            return ""
-        marker = f"{os.sep}.logs{os.sep}"
-        idx = raw.find(marker)
-        if idx >= 0:
-            return raw[idx + 1 :]
-        try:
-            cwd = os.getcwd()
-            if raw.startswith(cwd + os.sep):
-                return os.path.relpath(raw, cwd)
-        except Exception:
-            pass
-        return os.path.basename(raw)
-
-    def _render_table(rows: list[dict[str, str]], *, target_count: int) -> None:
-        headers = ["PID", "ROLE", "KEY", "STATE", "COUNTDOWN", "MODEL", "TARGET", "LOG"]
-        target_header = f"TARGET ({target_count})"
-        display_rows = []
-        def _countdown_display(raw: str) -> str:
-            raw = (raw or "").strip()
-            if not raw:
-                return ""
-            try:
-                return _format_countdown(float(raw))
-            except Exception:
-                return ""
-        for r in rows:
-            display_rows.append(
-                {
-                    "PID": r.get("pid", ""),
-                    "ROLE": r.get("role", ""),
-                    "KEY": r.get("key_index", "") or "",
-                    "STATE": r.get("state", ""),
-                    "COUNTDOWN": _countdown_display(r.get("countdown", "")),
-                    "MODEL": r.get("model", "") or "",
-                    "TARGET": r.get("target", "") or "",
-                    "LOG": _truncate_middle(_format_log_path(r.get("log_file", "")), 110),
-                }
-            )
-        widths: dict[str, int] = {h: len(h) for h in headers}
-        widths["TARGET"] = max(widths["TARGET"], len(target_header))
-        for r in display_rows:
-            for h in headers:
-                widths[h] = max(widths[h], len(r.get(h, "")))
-
-        def _hr() -> str:
-            return "+-" + "-+-".join("-" * widths[h] for h in headers) + "-+"
-
-        def _row(values: dict[str, str]) -> str:
-            cells = []
-            for h in headers:
-                val = values.get(h, "")
-                if h in {"PID", "KEY"}:
-                    cells.append(val.rjust(widths[h]))
-                else:
-                    cells.append(val.ljust(widths[h]))
-            return "| " + " | ".join(cells) + " |"
-
-        print(_hr())
-        print(_row({h: (target_header if h == "TARGET" else h) for h in headers}))
-        print(_hr())
-        for r in display_rows:
-            print(_row(r))
-        print(_hr())
-
     for novel_id, rows in sorted(by_novel.items(), key=lambda item: item[0]):
-        for row in rows:
-            if row["role"] != "translate-chapter":
-                continue
-            if (not row["key_index"]) or (not row["model"]):
-                inherited = _inherit_worker_meta(row.get("ppid", ""))
-                if inherited:
-                    row["key_index"] = row["key_index"] or inherited.get("key_index", "")
-                    row["model"] = row["model"] or inherited.get("model", "")
-            if (not row["key_index"]) or (not row["model"]):
-                inferred = _infer_from_log_path(row.get("log_file", ""))
-                if inferred:
-                    row["key_index"] = row["key_index"] or inferred.get("key_index", "")
-                    row["model"] = row["model"] or inferred.get("model", "")
-
-        children_by_ppid: dict[str, list[dict[str, str]]] = {}
-        for row in rows:
-            children_by_ppid.setdefault(row.get("ppid", ""), []).append(row)
-
-        for row in rows:
-            role = row.get("role", "")
-            pid = row.get("pid", "")
-            is_busy = False
-            if role == "worker":
-                children = [c for c in children_by_ppid.get(pid, []) if c.get("role") == "translate-chapter"]
-                if children:
-                    is_busy = True
-                    # Surface an active target on the worker even when children are hidden.
-                    children.sort(key=lambda c: int(c.get("pid") or 10**12))
-                    row["target"] = (children[0].get("target") or "").strip()
-            state, countdown = _classify_process_state(role, is_busy=is_busy, log_file=row.get("log_file", ""))
-            row["state"] = state
-            row["countdown"] = str(int(math.ceil(countdown))) if countdown is not None and countdown > 0 else ""
-
-        for row in rows:
-            if row.get("role") != "worker":
-                continue
-            pid = row.get("pid", "")
-            children = [c for c in children_by_ppid.get(pid, []) if c.get("role") == "translate-chapter"]
-            combined_state, combined_countdown = _combine_worker_child_states_with_countdown(children)
-            if combined_state:
-                row["state"] = combined_state
-                row["countdown"] = (
-                    str(int(math.ceil(combined_countdown)))
-                    if combined_countdown is not None and combined_countdown > 0
-                    else ""
-                )
+        _enrich_translate_chapter_meta(rows, ppid_by_pid=ppid_by_pid, worker_meta_by_pid=worker_meta_by_pid)
+        children_by_ppid = _classify_queue_rows(rows, surface_worker_target=True)
 
         pending = queued = inflight = retries = done = 0
         loaded = False
@@ -2851,11 +3598,8 @@ def list_all_queue_processes(include_all: bool = False) -> int:
 
             config = load_novel_config(novel_id)
             client = _client(config)
-            pending = int(_pending_total_len(config, client) or 0)
-            queued = int(client.scard(_key(config, "queued")) or 0)
-            inflight = int(client.hlen(_key(config, "inflight")) or 0)
-            retries = int(client.hlen(_key(config, "retries")) or 0)
-            done = int(client.hlen(_key(config, "done")) or 0)
+            pending, queued, inflight, retries, done = _queue_counts_from_redis(config, client)
+            _apply_live_redis_overrides(config, client, rows, children_by_ppid=children_by_ppid)
             loaded = True
         except Exception:
             loaded = False
@@ -2873,13 +3617,11 @@ def list_all_queue_processes(include_all: bool = False) -> int:
                         continue
                     logs_root = Path(raw[: idx + len(marker) - 1])
                     state_paths.append(logs_root / novel_id / "queue" / "status.state.json")
-            # Fallback to cwd layout (repo root).
             try:
                 state_paths.append(Path(os.getcwd()) / ".logs" / novel_id / "queue" / "status.state.json")
                 state_paths.append(Path(os.getcwd()) / "logs" / novel_id / "queue" / "status.state.json")
             except Exception:
                 pass
-
             for path in state_paths:
                 try:
                     if not path.exists():
@@ -2894,64 +3636,14 @@ def list_all_queue_processes(include_all: bool = False) -> int:
                 done = int(snapshot.get("done", 0) or 0)
                 break
 
-        # If Redis is available, use the cooldown key as the source of truth for remaining time so
-        # `queue reset` immediately reflects in ps output (log-derived countdowns can be stale).
-        if loaded and client is not None and config is not None:
-            for row in rows:
-                if row.get("role") != "worker":
-                    continue
-                raw_key_index = (row.get("key_index") or "").strip()
-                raw_model = (row.get("model") or "").strip()
-                if (not raw_key_index) or (not raw_model):
-                    continue
-                try:
-                    key_index = int(raw_key_index)
-                except Exception:
-                    continue
-                out_key = _out_of_quota_cooldown_key(config, key_index=key_index, model=raw_model)
-                rl_key = _rate_limit_cooldown_key(config, key_index=key_index, model=raw_model)
-                out_remaining = _get_rate_limit_cooldown_remaining_seconds(client, out_key)
-                rl_remaining = _get_rate_limit_cooldown_remaining_seconds(client, rl_key)
-                if out_remaining > 0.05:
-                    row["state"] = "out-of-quota"
-                    row["countdown"] = str(int(math.ceil(out_remaining)))
-                elif rl_remaining > 0.05:
-                    row["state"] = "waiting-429"
-                    row["countdown"] = str(int(math.ceil(rl_remaining)))
-                elif row.get("state") in {"waiting-429", "out-of-quota"}:
-                    row["state"] = "idle"
-                    row["countdown"] = ""
-
         print(
             f"\nNovel {novel_id}:"
             f" pending={pending} queued={queued} inflight={inflight} retries={retries} done={done}"
         )
-        def _role_rank(role: str) -> int:
-            order = {
-                "supervisor": 0,
-                "monitor": 1,
-                "worker": 2,
-                "translate-chapter": 3,
-                "launcher": 4,
-            }
-            return order.get(role or "", 9)
 
-        def _safe_int(value: str, default: int = 10**12) -> int:
-            try:
-                return int(str(value).strip())
-            except Exception:
-                return default
-
-        rows.sort(
-            key=lambda r: (
-                _role_rank(r.get("role", "")),
-                _safe_int(r.get("key_index", ""), default=10**12),
-                r.get("model", "") or "",
-                _safe_int(r.get("pid", ""), default=10**12),
-            )
-        )
+        _sort_queue_rows(rows)
         render_rows = rows if include_all else [r for r in rows if r.get("role") != "translate-chapter"]
-        _render_table(render_rows, target_count=_unique_target_count(rows))
+        _render_queue_table(render_rows, target_count=_unique_target_count(rows))
 
     return 0
 

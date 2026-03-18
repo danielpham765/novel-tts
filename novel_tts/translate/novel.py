@@ -23,6 +23,102 @@ PLACEHOLDER_LIKE_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}Q(?:XZ)?")
 GLOSSARY_STATUS_PENDING = "pending"
 GLOSSARY_STATUS_DONE = "done"
 
+def _clean_model_name(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.lower() in {"none", "null"}:
+        return ""
+    return text
+
+
+def _effective_translate_model(config: NovelConfig) -> str:
+    model = _clean_model_name(
+        os.environ.get("NOVEL_TTS_TRANSLATION_MODEL")
+        or os.environ.get("NOVEL_TTS_TRANSLATE_MODEL")
+        or os.environ.get("GEMINI_MODEL")
+        or ""
+    )
+    if model:
+        return model
+    enabled = getattr(config, "models", None) and config.models.enabled_models
+    if enabled:
+        return _clean_model_name(enabled[0])
+    enabled_queue = getattr(config, "queue", None) and config.queue.enabled_models
+    if enabled_queue:
+        return _clean_model_name(enabled_queue[0])
+    raise KeyError("Missing models.enabled_models[0]")
+
+
+def _get_model_cfg(config: NovelConfig, model: str):
+    model = _clean_model_name(model)
+    cfg = getattr(config, "models", None) and config.models.model_configs.get(model)
+    if cfg is not None:
+        return cfg
+    return getattr(config, "queue", None) and config.queue.model_configs.get(model)
+
+
+def _effective_chunk_max_len(config: NovelConfig, model: str) -> int:
+    raw = (os.environ.get("CHUNK_MAX_LEN") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return max(400, value)
+    cfg = _get_model_cfg(config, model)
+    value = int(getattr(cfg, "chunk_max_len", 0) or 0) if cfg is not None else 0
+    if value > 0:
+        return value
+    # Loader enforces chunk_max_len > 0 for enabled models, but keep a conservative fallback.
+    return 800
+
+
+def _effective_chunk_sleep_seconds(config: NovelConfig, model: str) -> float:
+    raw = (os.environ.get("CHUNK_SLEEP_SECONDS") or "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            return 0.0
+    cfg = _get_model_cfg(config, model)
+    if cfg is None:
+        return 0.1
+    value = getattr(cfg, "chunk_sleep_seconds", None)
+    if value is None:
+        return 0.1
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.1
+
+
+def _effective_repair_model(config: NovelConfig, default_model: str) -> str:
+    env = _clean_model_name(os.environ.get("REPAIR_MODEL", ""))
+    if env:
+        return env
+    cfg = _get_model_cfg(config, default_model)
+    per_model = _clean_model_name(getattr(cfg, "repair_model", "")) if cfg is not None else ""
+    if per_model:
+        return per_model
+    global_default = _clean_model_name(getattr(getattr(config, "models", None), "repair_model", ""))
+    return global_default or _clean_model_name(default_model)
+
+
+def _effective_glossary_model(config: NovelConfig, default_model: str) -> str:
+    env = _clean_model_name(os.environ.get("GLOSSARY_MODEL", ""))
+    if env:
+        return env
+    cfg = _get_model_cfg(config, default_model)
+    per_model = _clean_model_name(getattr(cfg, "glossary_model", "")) if cfg is not None else ""
+    if per_model:
+        return per_model
+    global_default = _clean_model_name(getattr(getattr(config, "models", None), "glossary_model", ""))
+    return global_default or _clean_model_name(default_model)
+
 
 def make_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[str, str]]:
     masked, mapping, _replacements = make_placeholders_with_replacements(text, glossary)
@@ -186,6 +282,51 @@ def build_glossary(mapping: dict[str, str]) -> str:
     return "\n".join(f"- {token} = {value}" for token, value in mapping.items())
 
 
+def _glossary_text_for_text(mapping: dict[str, str], text: str, *, max_chars: int) -> str:
+    """
+    Build a compact glossary string for a given `text`.
+
+    `mapping` can contain placeholder tokens for an entire unit/chapter. If we include all entries in every
+    per-chunk prompt, requests can become much larger than the configured `chunk_max_len`. To keep request
+    sizes aligned with the configured chunking, only include glossary entries whose placeholder tokens
+    actually appear in `text`.
+    """
+
+    if not mapping or not text:
+        return ""
+    budget = int(max_chars or 0)
+    if budget <= 0:
+        return ""
+    budget = max(64, budget)
+
+    tokens_raw = PLACEHOLDER_TOKEN_RE.findall(text)
+    if not tokens_raw:
+        return ""
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for tok in tokens_raw:
+        if tok in seen:
+            continue
+        seen.add(tok)
+        tokens.append(tok)
+
+    lines: list[str] = []
+    total = 0
+    for tok in tokens:
+        val = mapping.get(tok)
+        if not isinstance(val, str) or not val:
+            continue
+        line = f"- {tok} = {val}"
+        extra = len(line) + (1 if lines else 0)
+        if lines and (total + extra) > budget:
+            break
+        lines.append(line)
+        total += extra
+        if total >= budget:
+            break
+    return "\n".join(lines)
+
+
 def glossary_path(config: NovelConfig) -> Path | None:
     if not config.translation.glossary_file:
         return None
@@ -325,9 +466,8 @@ def _extract_glossary_updates(config: NovelConfig, provider, source_text: str, t
         f"BẢN GỐC{' (TRÍCH)' if was_compacted else ''}:\n{compact_source}\n\n"
         f"BẢN DỊCH{' (TRÍCH)' if was_compacted else ''}:\n{compact_translated}\n"
     )
-    # Prefer using the repair model for glossary extraction (more like a cleanup stage),
-    # and to avoid competing with the primary translation model quota.
-    model = config.translation.repair_model or config.translation.model
+    default_model = _effective_translate_model(config)
+    model = _effective_glossary_model(config, default_model)
     if was_compacted:
         LOGGER.info(
             "Glossary extract using compacted context | source_chars=%s/%s translated_chars=%s/%s model=%s",
@@ -676,7 +816,7 @@ def _repair_placeholder_tokens_in_text_chunked(
         )
         repaired.append(fixed)
         _save_repair_progress(config, stage_prefix, unit_key, repaired)
-        time.sleep(config.translation.chunk_sleep_seconds)
+        time.sleep(_effective_chunk_sleep_seconds(config, model))
 
     _clear_repair_progress(config, stage_prefix, unit_key)
     return "".join(repaired)
@@ -695,7 +835,7 @@ def final_cleanup_chunked(config: NovelConfig, provider, model: str, *, unit_key
         except ValueError:
             chunk_max_len = 0
     if chunk_max_len <= 0:
-        chunk_max_len = int(getattr(config.translation, "chunk_max_len", 0) or 0)
+        chunk_max_len = _effective_chunk_max_len(config, model)
     if chunk_max_len <= 0:
         chunk_max_len = 1600
     chunk_max_len = max(400, int(chunk_max_len))
@@ -704,7 +844,6 @@ def final_cleanup_chunked(config: NovelConfig, provider, model: str, *, unit_key
     stage_prefix = f"final_cleanup_{stage_fingerprint}"
     chunks = split_chunks(text, chunk_max_len)
     translated_chunks = _load_repair_progress(config, stage_prefix, unit_key)
-    glossary = build_glossary(mapping)
     total = len(chunks)
     if translated_chunks:
         LOGGER.info(
@@ -732,9 +871,10 @@ def final_cleanup_chunked(config: NovelConfig, provider, model: str, *, unit_key
             len(chunk),
         )
         started = time.perf_counter()
+        glossary_text = _glossary_text_for_text(mapping, chunk, max_chars=chunk_max_len)
         prompt = (
             f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
-            f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary}\n\n"
+            f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
             "Dưới đây là một đoạn bản dịch tiếng Việt còn lỗi. "
             "Hãy chỉ sửa lỗi còn sót: chữ Hán chưa dịch, câu cú gượng, xuống dòng xấu, tiêu đề chương dính hoặc lặp. "
             "Không thêm ý mới. Chỉ trả về đúng đoạn đã sửa.\n\n"
@@ -767,7 +907,7 @@ def final_cleanup_chunked(config: NovelConfig, provider, model: str, *, unit_key
         )
         translated_chunks.append(fixed)
         _save_repair_progress(config, stage_prefix, unit_key, translated_chunks)
-        time.sleep(config.translation.chunk_sleep_seconds)
+        time.sleep(_effective_chunk_sleep_seconds(config, model))
     _clear_repair_progress(config, stage_prefix, unit_key)
     return "".join(translated_chunks)
 
@@ -845,6 +985,12 @@ def repair_against_source_chunked(
             len(tr_window),
             count_han_chars(tr_window),
         )
+        # This stage exists to eliminate remaining Han residue. If a window has no Han at all,
+        # avoid sending the (possibly sensitive) source excerpt to the provider unnecessarily.
+        if not has_han(tr_window):
+            repaired.append(tr_window)
+            _save_repair_progress(config, stage_prefix, unit_key, repaired)
+            continue
         started = time.perf_counter()
         prompt = (
             f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
@@ -860,6 +1006,43 @@ def repair_against_source_chunked(
         )
         try:
             fixed = _generate_once(provider, model, prompt).strip()
+        except PromptBlockedError as exc:
+            prompt_feedback = {}
+            try:
+                prompt_feedback = (exc.payload or {}).get("promptFeedback") or {}
+            except Exception:
+                prompt_feedback = {}
+            LOGGER.warning(
+                "repair_against_source (chunked) prompt blocked | unit=%s chunk=%s/%s reason=%s feedback=%s",
+                unit_key,
+                idx + 1,
+                total,
+                getattr(exc, "reason", "UNKNOWN"),
+                prompt_feedback,
+            )
+            # Fallback: do a best-effort "Han-only" cleanup without including the Chinese source excerpt.
+            # This is less faithful than repairing against source, but is better than failing the entire unit.
+            fallback_prompt = (
+                f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
+                "Dưới đây là một đoạn tiếng Việt (TRÍCH) còn lẫn chữ Hán.\n"
+                "Nhiệm vụ của ngươi:\n"
+                "- Dịch hết toàn bộ chữ Hán còn sót sang tiếng Việt.\n"
+                "- Giữ nguyên ý và thứ tự theo đoạn hiện có, không thêm ý, không cắt mất nội dung.\n"
+                "- Không viết tiêu đề/ghi chú.\n"
+                "- Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH).\n\n"
+                f"ĐOẠN CẦN SỬA (TRÍCH):\n{tr_window}"
+            )
+            try:
+                fixed = _generate_once(provider, model, fallback_prompt).strip()
+            except Exception as exc2:
+                LOGGER.warning(
+                    "repair_against_source (chunked) fallback failed; scrubbing Han locally | unit=%s chunk=%s/%s err=%r",
+                    unit_key,
+                    idx + 1,
+                    total,
+                    exc2,
+                )
+                fixed = HAN_REGEX.sub("", tr_window)
         except RateLimitExceededError:
             LOGGER.warning(
                 "repair_against_source (chunked) rate-limited | unit=%s chunk=%s/%s",
@@ -886,7 +1069,7 @@ def repair_against_source_chunked(
         )
         repaired.append(fixed)
         _save_repair_progress(config, stage_prefix, unit_key, repaired)
-        time.sleep(config.translation.chunk_sleep_seconds)
+        time.sleep(_effective_chunk_sleep_seconds(config, model))
 
     _clear_repair_progress(config, stage_prefix, unit_key)
     return "".join(repaired)
@@ -968,7 +1151,8 @@ def _extract_glossary_updates_chunked(
     if (not was_compacted) and (total_chars <= (win_source_chars + win_translated_chars)):
         return _extract_glossary_updates(config, provider, source_text, translated_text)
 
-    model = config.translation.repair_model or config.translation.model
+    default_model = _effective_translate_model(config)
+    model = _effective_glossary_model(config, default_model)
     LOGGER.info(
         "Glossary extract chunked | unit=%s windows=%s src_win=%s tr_win=%s model=%s",
         unit_key,
@@ -1240,9 +1424,11 @@ def update_glossary_from_chapter(
 ) -> None:
     if not config.translation.auto_update_glossary:
         return
-    provider = get_translation_provider(config.translation.provider)
+    provider = get_translation_provider(config.models.provider, config=config)
     if unit_key:
-        LOGGER.info("QUEUE_PHASE glossary | unit=%s", unit_key)
+        default_model = _effective_translate_model(config)
+        glossary_model = _effective_glossary_model(config, default_model)
+        LOGGER.info("QUEUE_PHASE glossary | unit=%s model=%s", unit_key, glossary_model or "unknown")
     if marker_path is not None:
         _write_glossary_marker(marker_path, status=GLOSSARY_STATUS_PENDING, last_error="")
     try:
@@ -1357,6 +1543,77 @@ def chapter_part_path(config: NovelConfig, source_path: Path, chapter_num: str) 
     return config.storage.parts_dir / source_path.stem / f"{int(chapter_num):04d}.txt"
 
 
+def chapter_source_hash_path(config: NovelConfig, source_path: Path, chapter_num: str) -> Path:
+    """
+    Per-chapter source hash used to detect whether a chapter's origin text changed since it was translated.
+
+    Stored alongside the chapter part in .parts/<origin_stem>/<NNNN>.source.sha256.
+    """
+    return chapter_part_path(config, source_path, chapter_num).with_suffix(".source.sha256")
+
+
+def _normalize_source_text_for_hash(text: str) -> str:
+    # Normalize newlines + trailing whitespace so "touch"/rewrites that don't change content
+    # don't force pointless re-translation.
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    return normalized.strip()
+
+
+def chapter_source_sha256(source_text: str) -> str:
+    normalized = _normalize_source_text_for_hash(source_text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def read_chapter_source_hash(config: NovelConfig, source_path: Path, chapter_num: str) -> str | None:
+    path = chapter_source_hash_path(config, source_path, chapter_num)
+    if not path.exists():
+        return None
+    try:
+        value = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return None
+    return value or None
+
+
+def write_chapter_source_hash(config: NovelConfig, source_path: Path, chapter_num: str, sha256: str) -> None:
+    path = chapter_source_hash_path(config, source_path, chapter_num)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sha256 = (sha256 or "").strip()
+    if not sha256:
+        return
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            existing = ""
+        if existing == sha256:
+            return
+    path.write_text(sha256 + "\n", encoding="utf-8")
+
+
+def chapter_source_changed(
+    config: NovelConfig,
+    source_path: Path,
+    chapter_num: str,
+    *,
+    source_text: str,
+    baseline_if_missing: bool = True,
+) -> bool:
+    """
+    Returns True when we can prove the chapter's source text changed since last translation.
+
+    If the stored hash is missing and baseline_if_missing is True, this writes the current hash and returns False.
+    """
+    current = chapter_source_sha256(source_text)
+    stored = read_chapter_source_hash(config, source_path, chapter_num)
+    if stored is None:
+        if baseline_if_missing:
+            write_chapter_source_hash(config, source_path, chapter_num, current)
+        return False
+    return stored != current
+
+
 def split_source_chapters(raw: str, chapter_regex: str) -> list[tuple[str, str]]:
     matches = list(re.finditer(chapter_regex, raw, flags=re.M))
     if not matches:
@@ -1423,10 +1680,6 @@ def _generate_once(provider, model: str, prompt: str) -> str:
     return strip_model_wrappers(provider.generate(model, prompt))
 
 
-def _repair_model(config: NovelConfig) -> str:
-    return config.translation.repair_model or config.translation.model
-
-
 def _strip_placeholder_rules(base_rules: str) -> str:
     """
     The chapter translation prompt must preserve placeholder tokens (ZXQ...QXZ) while translating masked text.
@@ -1455,7 +1708,15 @@ def _safe_literary_prompt(base_rules: str, glossary_text: str, line_token: str, 
     )
 
 
-def _generate_translation_chunk(provider, translation_cfg, glossary_text: str, chunk: str) -> str:
+def _generate_translation_chunk(
+    provider,
+    translation_cfg,
+    model: str,
+    glossary_text: str,
+    chunk: str,
+    *,
+    chunk_max_len: int,
+) -> str:
     primary_prompt = (
         f"{translation_cfg.base_rules}\n"
         f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
@@ -1463,7 +1724,7 @@ def _generate_translation_chunk(provider, translation_cfg, glossary_text: str, c
         f"Dịch đoạn sau sang tiếng Việt:\n{chunk.replace(chr(10), f' {translation_cfg.line_token} ')}"
     )
     try:
-        return _generate_once(provider, translation_cfg.model, primary_prompt)
+        return _generate_once(provider, model, primary_prompt)
     except PromptBlockedError as exc:
         LOGGER.warning("Provider blocked chunk, retrying with safe literary prompt | reason=%s", exc.reason)
 
@@ -1474,11 +1735,11 @@ def _generate_translation_chunk(provider, translation_cfg, glossary_text: str, c
         chunk,
     )
     try:
-        return _generate_once(provider, translation_cfg.model, safe_prompt)
+        return _generate_once(provider, model, safe_prompt)
     except PromptBlockedError as exc:
         LOGGER.warning("Provider still blocked chunk, retrying with smaller segments | reason=%s", exc.reason)
 
-    segment_limit = max(180, min(translation_cfg.chunk_max_len // 3, 320))
+    segment_limit = max(180, min(int(chunk_max_len) // 3, 320))
     segment_texts = split_chunks(chunk, segment_limit)
     outputs: list[str] = []
     for idx, segment in enumerate(segment_texts, 1):
@@ -1489,7 +1750,7 @@ def _generate_translation_chunk(provider, translation_cfg, glossary_text: str, c
             segment,
         )
         try:
-            outputs.append(_generate_once(provider, translation_cfg.model, segment_prompt))
+            outputs.append(_generate_once(provider, model, segment_prompt))
         except PromptBlockedError as exc:
             LOGGER.warning(
                 "Provider blocked small segment, stripping sensitive wording in prompt | segment=%s/%s reason=%s",
@@ -1505,14 +1766,16 @@ def _generate_translation_chunk(provider, translation_cfg, glossary_text: str, c
                 "Chỉ trả về bản dịch.\n\n"
                 f"{segment.replace(chr(10), f' {translation_cfg.line_token} ')}"
             )
-            outputs.append(_generate_once(provider, translation_cfg.model, softened_prompt))
+            outputs.append(_generate_once(provider, model, softened_prompt))
     return "".join(outputs)
 
 
 def final_cleanup(config: NovelConfig, provider, model: str, text: str, mapping: dict[str, str]) -> str:
+    chunk_max_len = _effective_chunk_max_len(config, model)
+    glossary_text = _glossary_text_for_text(mapping, text, max_chars=chunk_max_len)
     prompt = (
         f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
-        f"Glossary dùng bắt buộc nếu xuất hiện:\n{build_glossary(mapping)}\n\n"
+        f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
         "Dưới đây là bản dịch tiếng Việt còn lỗi. "
         "Hãy chỉ sửa lỗi còn sót: chữ Hán chưa dịch, câu cú gượng, xuống dòng xấu, tiêu đề chương dính hoặc lặp. "
         "Không thêm ý mới. Chỉ trả về bản sửa cuối cùng.\n\n"
@@ -1526,7 +1789,6 @@ def patch_remaining_han(config: NovelConfig, provider, model: str, text: str, ma
     text = apply_rule_based_han_fixes(text, translation_cfg.han_fallback_replacements)
     if not has_han(text):
         return text
-    glossary = build_glossary(mapping)
     lines = text.splitlines()
     for idx, line in enumerate(lines):
         line = apply_rule_based_han_fixes(line, translation_cfg.han_fallback_replacements)
@@ -1534,9 +1796,10 @@ def patch_remaining_han(config: NovelConfig, provider, model: str, text: str, ma
         if not has_han(line):
             lines[idx] = line
             continue
+        glossary_text = _glossary_text_for_text(mapping, line, max_chars=_effective_chunk_max_len(config, model))
         prompt = (
             f"{_strip_placeholder_rules(translation_cfg.base_rules)}\n"
-            f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary}\n\n"
+            f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
             "Chỉ dịch đúng dòng sau sang tiếng Việt tự nhiên. "
             "Nếu dòng chỉ là từ tượng thanh thì dịch thành từ tượng thanh tiếng Việt phù hợp. "
             "Chỉ trả về đúng một dòng đã dịch.\n\n"
@@ -1550,7 +1813,6 @@ def patch_remaining_han(config: NovelConfig, provider, model: str, text: str, ma
 
 def aggressive_repair_han(config: NovelConfig, provider, model: str, text: str, mapping: dict[str, str]) -> str:
     translation_cfg = config.translation
-    glossary = build_glossary(mapping)
     repaired_lines: list[str] = []
     for line in text.splitlines():
         line = apply_rule_based_han_fixes(line, translation_cfg.han_fallback_replacements)
@@ -1564,9 +1826,14 @@ def aggressive_repair_han(config: NovelConfig, provider, model: str, text: str, 
             if not has_han(segment):
                 fixed_segments.append(segment)
                 continue
+            glossary_text = _glossary_text_for_text(
+                mapping,
+                segment,
+                max_chars=int(getattr(translation_cfg, "chunk_max_len", 0) or 0),
+            )
             prompt = (
                 f"{_strip_placeholder_rules(translation_cfg.base_rules)}\n"
-                f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary}\n\n"
+                f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
                 "Chỉ sửa đoạn văn sau: thay toàn bộ chữ Hán còn sót thành tiếng Việt tự nhiên. "
                 "Giữ nguyên ý, không thêm bớt. Tuyệt đối không để sót chữ Hán. "
                 "Chỉ trả về đúng đoạn đã sửa.\n\n"
@@ -1633,9 +1900,10 @@ def strip_all_remaining_han(text: str) -> str:
 
 def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
     translation_cfg = config.translation
-    repair_model = _repair_model(config)
+    translate_model = _effective_translate_model(config)
+    repair_model = _effective_repair_model(config, translate_model)
     refresh_glossary(config)
-    provider = get_translation_provider(translation_cfg.provider)
+    provider = get_translation_provider(config.models.provider, config=config)
     raw_sha1 = _hash_text(raw_text)
     snapshot = _load_placeholders_snapshot(config, unit_key)
     snapshot_sha1 = snapshot.get("raw_sha1") if isinstance(snapshot, dict) else None
@@ -1662,9 +1930,10 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
             unit_key,
             len(replacements),
         )
-    chunks = split_chunks(masked, translation_cfg.chunk_max_len)
+    effective_chunk_max_len = _effective_chunk_max_len(config, translate_model)
+    chunks = split_chunks(masked, effective_chunk_max_len)
     translate_fingerprint = _hash_text(
-        f"{raw_sha1}\n{translation_cfg.chunk_max_len}\n{len(masked)}\n{len(mapping)}\n{config.translation.model}"
+        f"{raw_sha1}\n{effective_chunk_max_len}\n{len(masked)}\n{len(mapping)}\n{translate_model}"
     )[:12]
     translate_progress_key = f"translate_{translate_fingerprint}__{unit_key}"
     translated_chunks = load_progress(config, translate_progress_key)
@@ -1674,14 +1943,21 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
             unit_key,
             len(translated_chunks),
             len(chunks),
-            translation_cfg.chunk_max_len,
+            effective_chunk_max_len,
         )
-    LOGGER.info("QUEUE_PHASE translate | unit=%s", unit_key)
-    glossary_text = "\n".join(f"- {token} = {value}" for token, value in mapping.items())
+    LOGGER.info("QUEUE_PHASE translate | unit=%s model=%s", unit_key, translate_model or "unknown")
     for idx, chunk in enumerate(chunks[len(translated_chunks):], len(translated_chunks) + 1):
         LOGGER.info("Translating %s chunk %s/%s", unit_key, idx, len(chunks))
         started = time.perf_counter()
-        result = _generate_translation_chunk(provider, translation_cfg, glossary_text, chunk)
+        glossary_text = _glossary_text_for_text(mapping, chunk, max_chars=effective_chunk_max_len)
+        result = _generate_translation_chunk(
+            provider,
+            translation_cfg,
+            translate_model,
+            glossary_text,
+            chunk,
+            chunk_max_len=effective_chunk_max_len,
+        )
         elapsed = time.perf_counter() - started
         LOGGER.info(
             "Translated %s chunk %s/%s in %.1fs (chars=%s)",
@@ -1693,8 +1969,8 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
         )
         translated_chunks.append(result.replace(translation_cfg.line_token, "\n"))
         save_progress(config, translate_progress_key, translated_chunks)
-        time.sleep(translation_cfg.chunk_sleep_seconds)
-    LOGGER.info("QUEUE_PHASE repair | unit=%s", unit_key)
+        time.sleep(_effective_chunk_sleep_seconds(config, translate_model))
+    LOGGER.info("QUEUE_PHASE repair | unit=%s model=%s", unit_key, (repair_model or "unknown"))
     merged = restore_placeholders("".join(translated_chunks), mapping)
     # If any placeholder-like tokens survive restoration, they are either hallucinated tokens or stale progress.
     # Repair them chunk-by-chunk so TPM gating can resume instead of failing the whole job.
@@ -1834,7 +2110,7 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
         if PLACEHOLDER_TOKEN_RE.search(merged):
             remaining = sorted(set(PLACEHOLDER_TOKEN_RE.findall(merged)))
             LOGGER.warning(
-                "Accepting translation despite residual placeholder tokens (operator will run translate repair) | unit=%s count=%s examples=%s",
+                "Accepting translation despite residual placeholder tokens (operator will run queue repair) | unit=%s count=%s examples=%s",
                 unit_key,
                 len(remaining),
                 ", ".join(remaining[:8]),
@@ -1850,11 +2126,20 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
     part_path = chapter_part_path(config, source_path, chapter_num)
     marker_path = glossary_marker_path(config, source_path, chapter_num)
     pending_glossary = is_glossary_pending(config, source_path, chapter_num)
-    if part_path.exists() and not force and part_path.stat().st_mtime >= source_path.stat().st_mtime and not pending_glossary:
-        return part_path
     part_path.parent.mkdir(parents=True, exist_ok=True)
     source_text = chapter_map[chapter_num]
     unit_key = f"{source_path.name}__{chapter_num}"
+    current_hash = chapter_source_sha256(source_text)
+
+    if part_path.exists() and not force and not pending_glossary:
+        stored_hash = read_chapter_source_hash(config, source_path, chapter_num)
+        if stored_hash is not None and stored_hash == current_hash:
+            return part_path
+        # Migration fallback: if we don't have a stored hash yet, use mtime once to avoid
+        # potentially skipping real edits that happened before this tracking was introduced.
+        if stored_hash is None and part_path.stat().st_mtime >= source_path.stat().st_mtime:
+            write_chapter_source_hash(config, source_path, chapter_num, current_hash)
+            return part_path
 
     # Force runs should not resume stale progress snapshots. Glossary changes can shift placeholder tokens and
     # leave orphan ZXQ...QXZ tokens in the merged output if we resume old chunks.
@@ -1869,7 +2154,14 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
         _clear_repair_progress_prefix(config, "final_cleanup", unit_key)
         _clear_repair_progress_prefix(config, "repair_against_source", unit_key)
 
-    needs_translate = force or (not part_path.exists()) or part_path.stat().st_mtime < source_path.stat().st_mtime
+    stored_hash = read_chapter_source_hash(config, source_path, chapter_num)
+    needs_translate = force or (not part_path.exists())
+    if not needs_translate:
+        if stored_hash is not None:
+            needs_translate = stored_hash != current_hash
+        else:
+            # No hash yet: fall back to mtime (migration behavior).
+            needs_translate = part_path.stat().st_mtime < source_path.stat().st_mtime
     if needs_translate:
         text = translate_unit(config, unit_key, source_text)
         part_path.write_text(text, encoding="utf-8")
@@ -1884,6 +2176,7 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
             marker_path=marker_path,
             unit_key=unit_key,
         )
+    write_chapter_source_hash(config, source_path, chapter_num, current_hash)
     return part_path
 
 

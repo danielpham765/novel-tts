@@ -48,12 +48,11 @@ def _tmp_storage(tmp_path: Path) -> StorageConfig:
 def test_translate_unit_final_placeholder_restore(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     cfg = load_novel_config("vo-cuc-thien-ton")
     cfg.storage = _tmp_storage(tmp_path)
+    monkeypatch.setenv("CHUNK_SLEEP_SECONDS", "0")
 
     # Avoid filesystem refresh, keep glossary tiny and deterministic.
     cfg.translation.glossary_file = ""
     cfg.translation.glossary = {"陳天極": "Trần Thiên Kiệt"}
-    cfg.translation.chunk_max_len = 0
-    cfg.translation.chunk_sleep_seconds = 0.0
     cfg.translation.han_fallback_replacements = {}
     cfg.translation.post_replacements = {}
     cfg.translation.base_rules = (
@@ -62,7 +61,7 @@ def test_translate_unit_final_placeholder_restore(monkeypatch: pytest.MonkeyPatc
     )
 
     dummy = _DummyProvider()
-    monkeypatch.setattr(novel_mod, "get_translation_provider", lambda _provider: dummy)
+    monkeypatch.setattr(novel_mod, "get_translation_provider", lambda _provider, *, config=None: dummy)
 
     out = translate_unit(cfg, unit_key="unit", raw_text="陳天極")
 

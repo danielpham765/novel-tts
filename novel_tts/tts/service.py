@@ -55,12 +55,77 @@ def _chunk_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _chapter_audio_path(output_dir: Path, chapter_number: int) -> Path:
+def _chapter_parts_dir(output_dir: Path) -> Path:
+    return output_dir / ".parts"
+
+
+def _legacy_chapter_audio_path(output_dir: Path, chapter_number: int) -> Path:
     return output_dir / f"chapter_{chapter_number}.wav"
 
 
-def _chapter_hash_path(output_dir: Path, chapter_number: int) -> Path:
+def _chapter_audio_path(parts_dir: Path, chapter_number: int) -> Path:
+    return parts_dir / f"chapter_{chapter_number}.wav"
+
+
+def _chapter_hash_cache_dir(parts_dir: Path) -> Path:
+    # Keep cache metadata out of the main audio folder to reduce clutter.
+    return parts_dir / ".cache"
+
+
+def _chapter_hash_path(parts_dir: Path, chapter_number: int) -> Path:
+    return _chapter_hash_cache_dir(parts_dir) / f"chapter_{chapter_number}.sha256"
+
+
+def _legacy_chapter_hash_path(output_dir: Path, chapter_number: int) -> Path:
+    # Oldest layout: hashes lived next to chapter wavs.
     return output_dir / f"chapter_{chapter_number}.sha256"
+
+
+def _legacy_chapter_hash_cache_path(output_dir: Path, chapter_number: int) -> Path:
+    # Previous layout (after refactor): hashes lived under output_dir/.cache
+    return (output_dir / ".cache") / f"chapter_{chapter_number}.sha256"
+
+
+def _read_cached_hash(parts_dir: Path, *, output_dir: Path, chapter_number: int) -> str | None:
+    """
+    Read cached sha256 for a chapter.
+
+    Supports legacy locations by migrating into `output_dir/.parts/.cache/`.
+    """
+    hash_path = _chapter_hash_path(parts_dir, chapter_number)
+    if hash_path.exists():
+        try:
+            return hash_path.read_text(encoding="utf-8").strip() or None
+        except Exception:
+            return None
+
+    legacy_paths = [
+        _legacy_chapter_hash_cache_path(output_dir, chapter_number),
+        _legacy_chapter_hash_path(output_dir, chapter_number),
+    ]
+    for legacy_path in legacy_paths:
+        if not legacy_path.exists():
+            continue
+        try:
+            value = legacy_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            value = ""
+        try:
+            hash_path.parent.mkdir(parents=True, exist_ok=True)
+            if value:
+                hash_path.write_text(value, encoding="utf-8")
+            legacy_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return value or None
+
+    return None
+
+
+def _write_cached_hash(parts_dir: Path, chapter_number: int, value: str) -> None:
+    path = _chapter_hash_path(parts_dir, chapter_number)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
 
 
 def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[dict[str, object]], range_key: str) -> Path:
@@ -108,6 +173,16 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         
     output_dir = config.storage.audio_dir / output_range_key
     output_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir = _chapter_parts_dir(output_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    legacy_file_list_path = output_dir / "file-list.txt"
+    file_list_path = parts_dir / "file-list.txt"
+    if legacy_file_list_path.exists() and (not file_list_path.exists()):
+        # Best-effort migration; we'll overwrite with a fresh list at the end anyway.
+        try:
+            legacy_file_list_path.replace(file_list_path)
+        except Exception:
+            pass
     LOGGER.info(
         "TTS start | range=%s chapters=%s source=%s server=%s model=%s voice=%s",
         output_range_key,
@@ -126,18 +201,24 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
     for idx, chunk in enumerate(chunks):
         chapter = chapter_info[idx] if idx < len(chapter_info) else {"number": idx + 1, "title": ""}
         chapter_number = int(chapter.get("number") or (idx + 1))
-        output_path = _chapter_audio_path(output_dir, chapter_number)
-        hash_path = _chapter_hash_path(output_dir, chapter_number)
+        output_path = _chapter_audio_path(parts_dir, chapter_number)
+        legacy_output_path = _legacy_chapter_audio_path(output_dir, chapter_number)
+        if (not output_path.exists()) and legacy_output_path.exists():
+            try:
+                legacy_output_path.replace(output_path)
+            except Exception:
+                pass
         expected_hash = _chunk_hash(chunk)
         chapter_label = f"chapter={chapter.get('number', idx + 1)}"
         if chapter.get("title"):
             chapter_label += f" title={chapter['title']}"
+        cached_hash = _read_cached_hash(parts_dir, output_dir=output_dir, chapter_number=chapter_number)
         if (
             (not force)
             and output_path.exists()
             and output_path.stat().st_size > 0
-            and hash_path.exists()
-            and hash_path.read_text(encoding="utf-8").strip() == expected_hash
+            and cached_hash is not None
+            and cached_hash == expected_hash
         ):
             LOGGER.info(
                 "TTS chapter cached | %s index=%s/%s path=%s size_bytes=%s",
@@ -149,6 +230,19 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
             )
             audio_files.append(output_path)
             continue
+        if not force:
+            reason = "hash-mismatch"
+            if not output_path.exists() or output_path.stat().st_size <= 0:
+                reason = "missing-audio"
+            elif cached_hash is None:
+                reason = "missing-hash"
+            LOGGER.info(
+                "TTS chapter cache miss | %s index=%s/%s reason=%s",
+                chapter_label,
+                idx + 1,
+                len(chunks),
+                reason,
+            )
         LOGGER.info(
             "TTS chapter start | %s index=%s/%s chars=%s output=%s",
             chapter_label,
@@ -181,7 +275,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         else:
             source_audio = Path(str(result))
         shutil.copyfile(source_audio, output_path)
-        hash_path.write_text(expected_hash, encoding="utf-8")
+        _write_cached_hash(parts_dir, chapter_number, expected_hash)
         elapsed = time.monotonic() - chapter_started_at
         LOGGER.info(
             "TTS chapter done | %s index=%s/%s elapsed=%.1fs path=%s size_bytes=%s",
@@ -194,8 +288,12 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         )
         audio_files.append(output_path)
 
-    file_list_path = output_dir / "file-list.txt"
     file_list_path.write_text("\n".join(f"file '{path.resolve()}'" for path in audio_files), encoding="utf-8")
+    # Keep the range folder clean: remove any legacy file-list in the old location.
+    try:
+        legacy_file_list_path.unlink(missing_ok=True)
+    except Exception:
+        pass
     merged_path = output_dir / f"{output_range_key}.mp3"
     LOGGER.info("TTS merge start | inputs=%s file_list=%s output=%s", len(audio_files), file_list_path, merged_path)
     run_ffmpeg(

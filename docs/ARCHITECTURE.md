@@ -18,7 +18,7 @@ The codebase is intentionally simple in shape:
 - one CLI entrypoint: `novel_tts.cli.main`
 - per-stage service modules instead of a large framework
 - filesystem as the primary state store
-- Redis only for distributed translation queueing
+- Redis only for queue + quota bookkeeping (translation truth still lives on disk)
 
 ## System Overview
 
@@ -29,6 +29,8 @@ flowchart LR
     CFG --> TRANS["Translate Novel"]
     CFG --> CAP["Translate Captions"]
     CFG --> QUEUE["Translation Queue"]
+    CFG --> QUOTA["Central Quota (Redis gate)"]
+    CFG --> QUOTASUP["Quota Supervisor (global)"]
     CFG --> AIKEY["AI Key Telemetry"]
     CFG --> TTS["TTS"]
     CFG --> VIS["Visual"]
@@ -42,6 +44,8 @@ flowchart LR
     CAP --> CAPTION["input/<novel>/caption/*.srt"]
     QUEUE --> PARTS
     QUEUE --> TRANSLATED
+    QUOTA --> REDISQUOTA["Redis quota keys (per key/model)"]
+    QUOTASUP --> REDISQUOTA
     AIKEY --> REDISMETRICS["Redis metrics (per key/model)"]
     TTS --> AUDIO["output/<novel>/audio/<range>/*"]
     VIS --> VISUAL["output/<novel>/visual/*"]
@@ -70,6 +74,7 @@ Important command families:
 - `translate`
 - `queue`
 - `ai-key`
+- `quota-supervisor`
 - `tts`
 - `visual`
 - `video`
@@ -89,6 +94,24 @@ Configuration is assembled by `novel_tts.config.loader.load_novel_config()` from
 - `configs/glossaries/<novel_id>.json` or explicit glossary file
 - selected environment variables
 
+### Config schema notes (current)
+
+The translation config schema is:
+
+- `translation`: common translation settings (provider, glossary_file, replacements, etc.)
+- `translation.chapter`: chapter translation settings (chapter_regex, base_rules, etc.)
+- `translation.captions`: caption translation settings (input/output file naming, etc.)
+
+Legacy configs that embed chapter fields under `chapter` or older `translation` shapes are still supported,
+but `load_novel_config()` will warn and normalize them into the new shape.
+
+Model pool config can live in `configs/app.yaml` under `models` and is shared by direct translation and queue mode:
+
+- `models.provider`
+- `models.enabled_models` (also used as a default for `queue.enabled_models`)
+- `models.model_configs.<model>` (also used as a default for `queue.model_configs.<model>`)
+- `models.repair_model` (optional)
+
 ### Merge model
 
 ```mermaid
@@ -106,6 +129,7 @@ Key merge behavior:
 - `crawl`: source defaults overridden by novel-specific crawl settings
 - `browser_debug`: source defaults overridden by novel-specific browser settings
 - `queue`: app defaults overridden by novel-specific queue settings
+- `tts`: app defaults overridden by novel-specific tts settings
 - glossary file content is sanitized before entering runtime config
 - translation model can be overridden by env
 
@@ -117,6 +141,11 @@ Environment variables that materially affect behavior:
 - Provider auth:
   - `GEMINI_API_KEY`
   - `OPENAI_API_KEY`
+- Central quota (v2):
+  - `NOVEL_TTS_CENTRAL_QUOTA` (enable flag)
+  - `NOVEL_TTS_CENTRAL_QUOTA_WAIT_SECONDS` (blocking wait when acquiring a grant)
+  - `NOVEL_TTS_CENTRAL_QUOTA_REQUEST_TTL_SECONDS` (expiry for queued requests)
+  - `GEMINI_REDIS_HOST` / `GEMINI_REDIS_PORT` / `GEMINI_REDIS_DB` (Redis wiring for the quota client)
 - Translation chunking / repair switches:
   - `CHUNK_MAX_LEN`
   - `CHUNK_SLEEP_SECONDS`
@@ -231,6 +260,8 @@ Notable behavior:
 - `queue stop` can stop all, or a subset of, queue processes for a novel by `--pid` or `--role`
 - `pipeline run` is an orchestration wrapper, not a distinct engine
 - `ai-key ps` surfaces per-API-key throughput and rate-limit signals derived from Redis metrics
+- `quota-supervisor` runs a global Redis-backed quota gate and can be launched as a daemon via `-d`
+- `translate repair` scans a chapter range and enqueues only broken chapters back into Redis for queue workers to re-translate
 
 ## Crawl Subsystem
 
@@ -331,6 +362,7 @@ Files:
 - `novel_tts/translate/glossary.py`
 - `novel_tts/translate/polish.py`
 - `novel_tts/translate/captions.py`
+- `novel_tts/translate/repair.py`
 
 ### Responsibilities
 
@@ -342,6 +374,7 @@ Files:
 - rebuild merged translated files
 - post-polish style and formatting
 - translate caption SRT files separately
+- scan outputs and enqueue repair jobs (queue-backed)
 
 ### Translation data model
 
@@ -440,6 +473,17 @@ It does not share the full chapter translation repair stack.
 
 This is especially relevant for novels with persistent naming inconsistencies.
 
+### Repair (scan + requeue)
+
+`translate repair` is a queue-oriented operator command implemented in `novel_tts/translate/repair.py`.
+
+It:
+
+- scans a chapter range and identifies broken chapters (missing/empty parts, residual Han, placeholder tokens, stale parts)
+- enqueues only those chapters back into Redis for re-translation (force mode)
+
+Important: `translate repair` does **not** translate anything by itself. It only enqueues work; you need a running queue stack for jobs to be processed.
+
 ## Queue Subsystem
 
 File:
@@ -481,6 +525,11 @@ A single queue job maps to one chapter in one origin file:
 
 - job id format: `<file_name>::<chapter_num>`
 
+Additionally, the queue may enqueue a special captions job:
+
+- job id: `captions`
+- worker executes: `python -m novel_tts translate captions <novel_id>`
+
 Workers do not call translation logic directly in-process.
 Instead, they spawn:
 
@@ -507,6 +556,56 @@ Worker count is derived from:
 - the launch helper currently discards child stdout/stderr to `/dev/null`, while subsystem logs go through normal logger wiring when those processes run
 - process restart uses `pkill -f`, so command naming consistency matters
 - the supervisor reconciles worker processes against the current keys/models config (spawns missing workers; stops out-of-range key indices and excess workers if worker_count is reduced)
+- queue workers enable the central quota gate by setting env (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`) for their translate subprocesses
+- `queue ps-all` can surface `waiting-quota` countdowns when `quota-supervisor` is running (it publishes ETA hints in Redis)
+
+## Central Quota Subsystem (v2)
+
+Files:
+
+- `novel_tts/quota/client.py`
+- `novel_tts/quota/supervisor.py`
+- `novel_tts/quota/eta.py`
+- `novel_tts/quota/keys.py`
+- `novel_tts/quota/lua_scripts.py`
+
+### Purpose
+
+The central quota subsystem provides a **global**, Redis-backed gate for RPM/TPM/RPD enforcement across
+multiple worker processes (and potentially multiple novels), with better coordination than per-process sleeps.
+
+This is the system behind:
+
+- queue workers pausing as `waiting-quota` without spamming the upstream provider
+- stable, operator-visible countdowns in `queue ps-all` (ETA cache)
+
+### How it works
+
+1. A translation subprocess (typically spawned by a queue worker) requests a quota grant via `CentralQuotaClient.acquire()`.
+2. The request is appended to a Redis list: `{prefix}:{novel_id}:k{idx}:{model}:quota:alloc:queue`.
+3. A long-running `quota-supervisor` process scans alloc queues, runs the Lua grant script, and replies to each request via a per-request Redis key.
+4. After the provider call completes, the subprocess commits the outcome via `CentralQuotaClient.commit()` so the quota window state stays accurate.
+
+### Enablement and wiring
+
+- Enable flag: `NOVEL_TTS_CENTRAL_QUOTA=1`
+- Redis wiring for the quota client comes from env:
+  - `GEMINI_REDIS_HOST`
+  - `GEMINI_REDIS_PORT`
+  - `GEMINI_REDIS_DB`
+- Queue workers set these env vars automatically for their translation subprocesses based on `configs/app.yaml` (`queue.redis.*`).
+
+The `quota-supervisor` CLI command reads Redis settings from `configs/app.yaml` (`queue.redis.*`) and should be run once globally.
+
+### Operator UX (ETA cache)
+
+`quota-supervisor` periodically computes estimated grant times for requests currently waiting in alloc queues and writes
+short-lived ETA hashes:
+
+- `{prefix}:{novel_id}:k{idx}:{model}:quota:alloc:eta` (hash: request_id -> unix timestamp)
+
+`queue ps-all` uses these ETA hints to show `waiting-quota` countdowns for translate-chapter subprocesses (and to propagate
+that state up to their parent worker row).
 
 ## AI Key Telemetry Subsystem
 
@@ -639,6 +738,7 @@ These assumptions show up across the codebase:
 - `translated/<batch>.txt` is a rebuild artifact, not the primary translation state
 - TTS expects translated text headings to start with `Chương <n>`
 - media generation expects a translated file for the exact requested range
+- queue-mode translation expects a running `quota-supervisor` when central quota is enabled (default for workers)
 
 Breaking any of these tends to create downstream failures that look unrelated.
 

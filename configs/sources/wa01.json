@@ -1,0 +1,27 @@
+{
+  "source_id": "wa01",
+  "resolver_id": "wa01",
+  "crawl": {
+    "site_id": "wa01",
+    "chapter_batch_size": 10,
+    "chapter_regex": "^第(\\d+)章([^\\n]*)",
+    "preferred_fetch_mode": "auto",
+    "request_timeout_seconds": 120,
+    "content_wait_timeout_seconds": 45,
+    "delay_between_chapters_seconds": 0.2,
+    "max_fetch_retries": 3,
+    "retry_backoff_seconds": 10.0,
+    "rate_limit_cooldown_seconds": 30.0
+  },
+  "browser_debug": {
+    "mode": "auto",
+    "remote_debugging_url": "",
+    "remote_debugging_port": 9222,
+    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "user_data_dir": "",
+    "profile_directory": "",
+    "headless": false,
+    "debug_image_dir": "debug/img"
+  }
+}
+

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 
 from novel_tts.queue.translation_queue import _classify_process_state
@@ -38,6 +39,21 @@ def test_worker_error_is_held_briefly() -> None:
         fh.flush()
         state, countdown = _classify_process_state("worker", is_busy=False, log_file=fh.name)
         assert state == "error"
+        assert countdown is None
+
+
+def test_worker_traceback_without_timestamp_is_not_sticky() -> None:
+    # Traceback lines often have no timestamp; classifier should not show "error" forever.
+    import datetime as _dt
+
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=True) as fh:
+        fh.write("Traceback (most recent call last):\n")
+        fh.write("  File \"x.py\", line 1, in <module>\n")
+        fh.flush()
+        past = (_dt.datetime.now() - _dt.timedelta(seconds=30)).timestamp()
+        os.utime(fh.name, (past, past))
+        state, countdown = _classify_process_state("worker", is_busy=False, log_file=fh.name)
+        assert state == "idle"
         assert countdown is None
 
 

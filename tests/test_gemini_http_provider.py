@@ -18,19 +18,22 @@ def test_gemini_generate_raises_on_429_and_does_not_retry(monkeypatch) -> None:
         del model, estimated_tokens
         acquire_calls.append(1)
 
-    post_calls: list[int] = []
+    request_calls: list[int] = []
 
-    def fake_post(*args, **kwargs):
+    def fake_request(*args, **kwargs):
         del args, kwargs
-        post_calls.append(1)
+        request_calls.append(1)
         return SimpleNamespace(
             status_code=429,
-            json=lambda: {"error": {"message": "Too Many Requests"}},
+            headers={"Retry-After": "7"},
+            content=b"1",
+            json=lambda: {"error": {"message": "Too Many Requests", "status": "RESOURCE_EXHAUSTED"}},
+            text="",
             raise_for_status=lambda: None,
         )
 
     monkeypatch.setattr(providers, "_acquire_gemini_rate_slot", fake_acquire)
-    monkeypatch.setattr(providers.requests, "post", fake_post)
+    monkeypatch.setattr(providers.proxy_gateway_mod, "request", fake_request)
     monkeypatch.setattr(providers.time, "sleep", lambda *_args, **_kwargs: None)
 
     p = providers.GeminiHttpProvider()
@@ -38,7 +41,8 @@ def test_gemini_generate_raises_on_429_and_does_not_retry(monkeypatch) -> None:
         p.generate("gemma-3-27b-it", "hi", "sys")
 
     assert "429" in str(exc.value)
-    assert len(post_calls) == 1
+    assert "retry_after=7" in str(exc.value)
+    assert len(request_calls) == 1
     assert len(acquire_calls) == 1
 
 
@@ -53,7 +57,7 @@ def test_gemini_generate_acquires_per_attempt_for_generic_retries(monkeypatch) -
 
     calls = {"n": 0}
 
-    def fake_post(*args, **kwargs):
+    def fake_request(*args, **kwargs):
         del args, kwargs
         calls["n"] += 1
         if calls["n"] < 3:
@@ -65,7 +69,7 @@ def test_gemini_generate_acquires_per_attempt_for_generic_retries(monkeypatch) -
         )
 
     monkeypatch.setattr(providers, "_acquire_gemini_rate_slot", fake_acquire)
-    monkeypatch.setattr(providers.requests, "post", fake_post)
+    monkeypatch.setattr(providers.proxy_gateway_mod, "request", fake_request)
     monkeypatch.setattr(providers.time, "sleep", lambda *_args, **_kwargs: None)
 
     p = providers.GeminiHttpProvider()
@@ -85,15 +89,15 @@ def test_gemini_generate_in_queue_worker_mode_releases_on_timeout(monkeypatch) -
         del model, estimated_tokens
         acquire_calls.append(1)
 
-    post_calls: list[int] = []
+    request_calls: list[int] = []
 
-    def fake_post(*args, **kwargs):
+    def fake_request(*args, **kwargs):
         del args, kwargs
-        post_calls.append(1)
+        request_calls.append(1)
         raise providers.requests.exceptions.ReadTimeout("read timeout")
 
     monkeypatch.setattr(providers, "_acquire_gemini_rate_slot", fake_acquire)
-    monkeypatch.setattr(providers.requests, "post", fake_post)
+    monkeypatch.setattr(providers.proxy_gateway_mod, "request", fake_request)
     monkeypatch.setattr(providers.time, "sleep", lambda *_args, **_kwargs: None)
 
     p = providers.GeminiHttpProvider()
@@ -101,5 +105,5 @@ def test_gemini_generate_in_queue_worker_mode_releases_on_timeout(monkeypatch) -
         p.generate("gemma-3-27b-it", "hi", "sys")
 
     assert "timeout" in str(exc.value).lower()
-    assert len(post_calls) == 1
+    assert len(request_calls) == 1
     assert len(acquire_calls) == 1

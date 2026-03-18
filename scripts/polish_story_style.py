@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from novel_tts.config import load_novel_config
 from novel_tts.translate.novel import build_glossary, load_source_chapters, rebuild_translated_file
 from novel_tts.translate.providers import get_translation_provider
+
+
+def _effective_translate_model(config) -> str:
+    model = (
+        os.environ.get("NOVEL_TTS_TRANSLATION_MODEL")
+        or os.environ.get("NOVEL_TTS_TRANSLATE_MODEL")
+        or os.environ.get("GEMINI_MODEL")
+        or ""
+    ).strip()
+    if model:
+        return model
+    if getattr(config, "models", None) and config.models.enabled_models:
+        return str(config.models.enabled_models[0]).strip()
+    raise KeyError("Missing models.enabled_models[0]")
 
 
 def _relevant_glossary(glossary: dict[str, str], source_text: str) -> dict[str, str]:
@@ -28,7 +43,7 @@ def _clean_response(text: str) -> str:
     return text.strip() + "\n"
 
 
-def _polish_chapter(config, provider, chapter_num: str, source_text: str, translated_text: str) -> str:
+def _polish_chapter(config, provider, model: str, chapter_num: str, source_text: str, translated_text: str) -> str:
     glossary = _relevant_glossary(config.translation.glossary, source_text)
     glossary_text = build_glossary(glossary) if glossary else "- không có mục bắt buộc"
     prompt = (
@@ -49,7 +64,7 @@ def _polish_chapter(config, provider, chapter_num: str, source_text: str, transl
         f"BẢN DỊCH HIỆN TẠI:\n{translated_text}\n\n"
         f"Chương cần biên tập: {int(chapter_num)}"
     )
-    return _clean_response(provider.generate(config.translation.model, prompt))
+    return _clean_response(provider.generate(model, prompt))
 
 
 def main() -> int:
@@ -59,7 +74,8 @@ def main() -> int:
     args = parser.parse_args()
 
     config = load_novel_config(args.novel_id)
-    provider = get_translation_provider(config.translation.provider)
+    provider = get_translation_provider(config.models.provider)
+    model = _effective_translate_model(config)
     files = sorted(config.storage.origin_dir.glob("*.txt"))
     if args.file:
         wanted = set(args.file)
@@ -77,7 +93,7 @@ def main() -> int:
                 continue
             any_part = True
             translated_text = part_path.read_text(encoding="utf-8")
-            polished = _polish_chapter(config, provider, chapter_num, source_text, translated_text)
+            polished = _polish_chapter(config, provider, model, chapter_num, source_text, translated_text)
             if polished != translated_text:
                 part_path.write_text(polished, encoding="utf-8")
                 changed_parts += 1

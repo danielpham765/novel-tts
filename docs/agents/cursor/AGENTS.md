@@ -19,9 +19,10 @@ If you need deeper background, prefer `docs/ARCHITECTURE.md` rather than re-disc
   - **crawl** → writes `input/<novel>/origin/*.txt`
   - **translate** → writes `input/<novel>/.parts/...` and rebuilds `translated/*.txt`
   - **queue** → distributes chapter translation via Redis, but truth still lives on disk
+  - **quota-supervisor** → global Redis-backed quota gate (RPM/TPM/RPD) used by queue translation
   - **tts** → reads `translated/*.txt`, writes `output/<novel>/audio/...`
   - **media** (`visual`, `video`) → reads audio + config, writes `output/<novel>/visual` and `video`
-- **State**: filesystem is primary storage; Redis is **only** for queue bookkeeping.
+- **State**: filesystem is primary storage; Redis is for queue + quota bookkeeping only.
 
 Think of the system as:
 
@@ -38,16 +39,23 @@ If you are trying to understand or modify behavior, **load these files in roughl
    - `docs/ARCHITECTURE.md` – full developer architecture.
 2. **Agent-oriented summary**
    - `docs/agents/codex/AGENTS.md` – concise rules and module map (still valid for Cursor).
-3. **Runtime entrypoints**
+3. **Repo hygiene**
+   - Avoid loading large/generated artifacts into context.
+   - Do **not** read these folders (or files under them) unless the task explicitly requires it: `./input`, `./output`, `./image`, `./tmp`.
+   - When you must inspect artifacts, prefer targeted, minimal reads (one file, small excerpts).
+4. **Refactor/architecture rule**
+   - When doing refactor/architecture/strategy changes, avoid keeping aliases/backward-compatible code paths by default.
+   - Prefer a complete migration (update call sites/configs/docs) so the codebase has one consistent design.
+5. **Runtime entrypoints**
    - `novel_tts/cli/main.py` – argument parsing, dispatch, logging decisions.
    - `novel_tts/config/loader.py` & `novel_tts/config/models.py` – how config is loaded and typed.
-4. **Subsystem roots**
+6. **Subsystem roots**
    - Crawl: `novel_tts/crawl/service.py`, `novel_tts/crawl/registry.py`, `novel_tts/crawl/resolvers/*.py`
    - Translate: `novel_tts/translate/novel.py`, `novel_tts/translate/providers.py`
    - Queue: `novel_tts/queue/translation_queue.py`
    - TTS: `novel_tts/tts/service.py`, `novel_tts/tts/providers.py`
    - Media: `novel_tts/media/service.py`
-5. **Common utilities**
+7. **Common utilities**
    - `novel_tts/common/logging.py`, `novel_tts/common/text.py`, `novel_tts/common/ffmpeg.py`, `novel_tts/common/subprocesses.py`
 
 When answering questions or making edits, **anchor your reasoning** to these files instead of re-traversing the entire tree.
@@ -92,7 +100,7 @@ When modifying behavior, **preserve these directory and filename contracts** or 
 
 - File: `novel_tts/cli/main.py`
 - Role: thin dispatcher:
-  - Parses commands: `crawl`, `translate`, `queue`, `tts`, `visual`, `video`, `pipeline`.
+  - Parses commands: `crawl`, `translate`, `queue`, `ai-key`, `quota-supervisor`, `tts`, `visual`, `video`, `pipeline`.
   - Computes default log file (`_default_log_path`).
   - Loads `NovelConfig` and calls the right service function.
   - Keeps backward compatibility for old `crawl <novel>` syntax.
@@ -112,13 +120,14 @@ When modifying behavior, **preserve these directory and filename contracts** or 
 
 ### Translation
 
-- Files: `novel_tts/translate/novel.py`, `providers.py`, `glossary.py`, `captions.py`, `polish.py`
+- Files: `novel_tts/translate/novel.py`, `providers.py`, `glossary.py`, `captions.py`, `polish.py`, `repair.py`
 - Responsibilities:
   - Split `origin/*.txt` into chapters (`translation.chapter_regex`).
   - Translate chapter-by-chapter, checkpointing at chunk level.
   - Heavy multi-pass cleanup for residual Han characters.
   - Glossary placeholder flow and optional auto-update.
   - Rebuild `translated/*.txt` from `.parts`.
+  - Scan translated outputs and enqueue repair jobs back into Redis (`translate repair`).
 - Provider abstraction:
   - `gemini_http`, `openai_chat` via `get_translation_provider`.
 - **Key functions to know**:
@@ -132,9 +141,11 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Discover un-translated chapters by inspecting `.parts` vs `origin`.
   - Enqueue jobs in Redis (`pending/queued/inflight/retries/done`).
   - Spawn workers that run `python -m novel_tts translate chapter ...`.
+  - Optionally enqueue a special captions job id: `captions` (runs `translate captions`).
+  - Enable the central quota gate for translate subprocesses (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`).
   - Launch/monitor processes for a novel (`queue launch`).
 - Design:
-  - Redis stores **job bookkeeping only**; translation truth is still on disk.
+  - Redis stores **job + quota bookkeeping only**; translation truth is still on disk.
   - Job id: `<origin_file_name>::<chapter_num>`.
 
 ### TTS
@@ -187,9 +198,10 @@ When editing with Cursor, keep these **hard constraints** in mind:
    - `.progress/*.json` files and `.parts` layout enable safe restarts.
    - Do not convert operations into all-or-nothing behaviors that delete partial results.
 5. **External tool assumptions**
-   - FFmpeg/FFprobe availability and CLI flags.
-   - Gradio TTS server and model settings from `configs/providers/*.json`.
-   - Redis presence for queue mode.
+  - FFmpeg/FFprobe availability and CLI flags.
+  - Gradio TTS server and model settings from `configs/providers/*.json`.
+  - Redis presence for queue mode.
+  - `quota-supervisor` should be running for queue translation (it grants central quota requests and publishes ETA hints used by `queue ps-all`).
 
 If a change touches any of the above, you must **inspect and update all dependent subsystems**, not just local code.
 

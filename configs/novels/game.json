@@ -4,7 +4,6 @@
   "slug": "game",
   "source_language": "zh",
   "target_language": "vi",
-  "source_id": "69shuba",
   "storage": {
     "input_dir": "input/game",
     "output_dir": "output/game",
@@ -13,11 +12,16 @@
     "tmp_dir": "tmp"
   },
   "crawl": {
-    "directory_url": "https://www.69shuba.com/book/51036.htm",
-    "chapter_url_pattern": "https://www.69shuba.com/txt/51036/{chapter}",
-    "selectors": {
-      "content": [".txtnav", "#content"]
-    }
+    "sources": [
+      {
+        "source_id": "69shuba",
+        "directory_url": "https://www.69shuba.com/book/51036.htm",
+        "chapter_url_pattern": "https://www.69shuba.com/txt/51036/{chapter}",
+        "selectors": {
+          "content": [".txtnav", "#content"]
+        }
+      }
+    ]
   },
   "translation": {
     "glossary_file": "configs/glossaries/game.json",
@@ -30,11 +34,9 @@
     },
     "captions": {}
   },
+  "models": {},
   "queue": {},
-  "tts": {
-    "provider": "gradio_vie_tts",
-    "voice": "Tuyen"
-  },
+  "tts": {},
   "visual": {
     "background_video": "background.mp4",
     "tag_text": "Audio Novel",

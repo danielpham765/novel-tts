@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -11,6 +12,20 @@ from .providers import get_translation_provider
 
 LOGGER = get_logger(__name__)
 HAN_REGEX = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _effective_translate_model(config: NovelConfig) -> str:
+    model = (
+        os.environ.get("NOVEL_TTS_TRANSLATION_MODEL")
+        or os.environ.get("NOVEL_TTS_TRANSLATE_MODEL")
+        or os.environ.get("GEMINI_MODEL")
+        or ""
+    ).strip()
+    if model:
+        return model
+    if config.models.enabled_models:
+        return str(config.models.enabled_models[0]).strip()
+    raise KeyError("Missing models.enabled_models[0]")
 
 
 def collect_subtitle_text_line_indices(lines: list[str]) -> list[int]:
@@ -66,7 +81,8 @@ def translate_captions(config: NovelConfig) -> Path:
     output_path = config.storage.caption_dir / caption_cfg.output_file
     if not input_path.exists():
         raise FileNotFoundError(f"Caption source not found: {input_path}")
-    provider = get_translation_provider(caption_cfg.provider)
+    provider = get_translation_provider(config.models.provider, config=config)
+    model = _effective_translate_model(config)
     content = input_path.read_text(encoding="utf-8")
     eol = "\r\n" if "\r\n" in content else "\n"
     lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -88,7 +104,7 @@ def translate_captions(config: NovelConfig) -> Path:
             "Giữ nguyên định dạng subtitle trong dòng nếu có: <i>, </i>, {\\an8}, dấu câu, ký hiệu.\n\n"
             f"{json.dumps({'lines': batch}, ensure_ascii=False)}"
         )
-        raw = provider.generate(caption_cfg.model, prompt)
+        raw = provider.generate(model, prompt)
         (debug_dir / f"chunk_{chunk_index // caption_cfg.chunk_size + 1}.txt").write_text(prompt, encoding="utf-8")
         (response_dir / f"chunk_{chunk_index // caption_cfg.chunk_size + 1}.txt").write_text(raw, encoding="utf-8")
         match = re.search(r"\{.*\}", raw, flags=re.S)

@@ -9,6 +9,7 @@ from novel_tts.config.models import NovelConfig
 from novel_tts.translate.novel import (
     PLACEHOLDER_TOKEN_RE,
     chapter_part_path,
+    chapter_source_changed,
     count_han_chars,
     has_han,
     load_source_chapters,
@@ -58,7 +59,7 @@ def find_repair_jobs_in_range(config: NovelConfig, start: int, end: int) -> list
 
     jobs: list[RepairJob] = []
     for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
-        for chapter_num_str, _chapter_text in load_source_chapters(config, source_path):
+        for chapter_num_str, chapter_text in load_source_chapters(config, source_path):
             try:
                 chap = int(str(chapter_num_str))
             except Exception:
@@ -73,7 +74,13 @@ def find_repair_jobs_in_range(config: NovelConfig, start: int, end: int) -> list
             else:
                 if part_path.stat().st_size <= 0:
                     reasons.append("empty-part")
-                if part_path.stat().st_mtime < source_path.stat().st_mtime:
+                if chapter_source_changed(
+                    config,
+                    source_path,
+                    str(chap),
+                    source_text=chapter_text,
+                    baseline_if_missing=True,
+                ):
                     reasons.append("stale-part")
                 text = _read_text(part_path)
                 if not text.strip():
@@ -102,7 +109,58 @@ def find_repair_jobs_in_range(config: NovelConfig, start: int, end: int) -> list
     return jobs
 
 
-def enqueue_repair_jobs(config: NovelConfig, jobs: list[RepairJob]) -> int:
+def find_repair_jobs_all(config: NovelConfig) -> list[RepairJob]:
+    """Find all chapters across origin batches that likely need re-translation."""
+    jobs: list[RepairJob] = []
+    for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
+        for chapter_num_str, chapter_text in load_source_chapters(config, source_path):
+            try:
+                chap = int(str(chapter_num_str))
+            except Exception:
+                continue
+
+            reasons: list[str] = []
+            part_path = chapter_part_path(config, source_path, str(chap))
+            if not part_path.exists():
+                reasons.append("missing-part")
+            else:
+                if part_path.stat().st_size <= 0:
+                    reasons.append("empty-part")
+                if chapter_source_changed(
+                    config,
+                    source_path,
+                    str(chap),
+                    source_text=chapter_text,
+                    baseline_if_missing=True,
+                ):
+                    reasons.append("stale-part")
+                text = _read_text(part_path)
+                if not text.strip():
+                    reasons.append("empty-part")
+                if PLACEHOLDER_TOKEN_RE.search(text):
+                    reasons.append("placeholder-token")
+                if has_han(text):
+                    reasons.append(f"han-residue:{count_han_chars(text)}")
+                heading_count = len(CHAPTER_HEADING_RE.findall(text))
+                if heading_count > 1:
+                    reasons.append(f"duplicate-headers:{heading_count}")
+                dup_paras = _count_duplicate_paragraphs(text)
+                if dup_paras >= 3:
+                    reasons.append(f"duplicate-paragraphs:{dup_paras}")
+
+            if reasons:
+                jobs.append(
+                    RepairJob(
+                        job_id=_job_id(source_path.name, chap),
+                        file_name=source_path.name,
+                        chapter_num=chap,
+                        reasons=tuple(reasons),
+                    )
+                )
+    return jobs
+
+
+def enqueue_repair_jobs(config: NovelConfig, jobs: list[RepairJob], *, label: str = "translate repair") -> int:
     if not jobs:
         print("No repair jobs found.")
         return 0
@@ -111,4 +169,4 @@ def enqueue_repair_jobs(config: NovelConfig, jobs: list[RepairJob]) -> int:
     from novel_tts.queue.translation_queue import add_job_ids_to_queue
 
     job_ids = [job.job_id for job in jobs]
-    return add_job_ids_to_queue(config, job_ids, force=True, label="translate repair")
+    return add_job_ids_to_queue(config, job_ids, force=True, label=label)

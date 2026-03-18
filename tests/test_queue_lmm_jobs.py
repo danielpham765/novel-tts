@@ -10,8 +10,10 @@ from novel_tts.config.models import (
     BrowserDebugConfig,
     CaptionConfig,
     CrawlConfig,
+    ModelsConfig,
     NovelConfig,
     QueueConfig,
+    QueueModelConfig,
     SourceConfig,
     StorageConfig,
     TtsConfig,
@@ -38,17 +40,18 @@ def _make_config(tmp_path: Path) -> NovelConfig:
     crawl = CrawlConfig(site_id="test")
     browser_debug = BrowserDebugConfig()
     source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl, browser_debug=browser_debug)
-    translation = TranslationConfig(
+    models = ModelsConfig(
         provider="gemini_http",
-        model="dummy",
-        chunk_max_len=4000,
-        chunk_sleep_seconds=0.0,
+        enabled_models=["dummy"],
+        model_configs={"dummy": QueueModelConfig(chunk_max_len=4000, chunk_sleep_seconds=0.0)},
+    )
+    translation = TranslationConfig(
         chapter_regex=r"^第(\d+)章([^\n]*)",
         base_rules="",
         auto_update_glossary=True,
         glossary_file="",
     )
-    captions = CaptionConfig(provider="gemini_http", model="dummy")
+    captions = CaptionConfig()
     queue = QueueConfig()
     return NovelConfig(
         novel_id="novel",
@@ -61,6 +64,7 @@ def _make_config(tmp_path: Path) -> NovelConfig:
         storage=storage,
         crawl=crawl,
         browser_debug=browser_debug,
+        models=models,
         translation=translation,
         captions=captions,
         queue=queue,
@@ -125,7 +129,7 @@ def test_translate_chapter_skips_translation_but_runs_glossary_when_pending(
             # Return empty glossary updates (valid JSON object).
             return "{}"
 
-    monkeypatch.setattr(novel_translate, "get_translation_provider", lambda _name: _DummyProvider())
+    monkeypatch.setattr(novel_translate, "get_translation_provider", lambda _name, *, config=None: _DummyProvider())
 
     out_path = novel_translate.translate_chapter(config, origin_path, "1", force=False)
     assert out_path == part_path

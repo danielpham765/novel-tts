@@ -4,7 +4,6 @@
   "slug": "thai-hu-chi-ton",
   "source_language": "zh",
   "target_language": "vi",
-  "source_id": "hjwzw",
   "storage": {
     "input_dir": "input/thai-hu-chi-ton",
     "output_dir": "output/thai-hu-chi-ton",
@@ -13,7 +12,12 @@
     "tmp_dir": "tmp"
   },
   "crawl": {
-    "directory_url": "https://tw.hjwzw.com/Book/Chapter/49948"
+    "sources": [
+      {
+        "source_id": "hjwzw",
+        "directory_url": "https://tw.hjwzw.com/Book/Chapter/49948"
+      }
+    ]
   },
   "translation": {
     "glossary_file": "configs/glossaries/thai-hu-chi-ton.json",
@@ -47,26 +51,8 @@
       "output_file": "caption_vn.srt"
     }
   },
-  "queue": {
-    "worker_models": ["gemma-3-27b-it", "gemma-3-12b-it"],
-    "model_chunk_max_len": {
-      "gemma-3-27b-it": 800,
-      "gemma-3-12b-it": 900
-    }
-  },
-  "tts": {
-    "provider": "gradio_vie_tts",
-    "voice": "Tuyen",
-    "server_name": "local",
-    "model_name": "macos",
-    "generation_mode": "Standard (Một lần)",
-    "use_batch": true,
-    "max_batch_size_run": 128,
-    "temperature": 1.0,
-    "max_chars_chunk": 512,
-    "tempo": 1.15,
-    "bitrate": "128k"
-  },
+  "queue": {},
+  "tts": {},
   "visual": {
     "background_video": "background.mp4",
     "font_file": "",

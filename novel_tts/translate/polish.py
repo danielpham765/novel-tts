@@ -58,7 +58,67 @@ POLISH_REPLACEMENTS = {
     "ngư hương nhục丝": "ngư hương nhục ti",
     "“Gỗ... Cố tổng": "“Cố tổng",
     "Gu tiên sinh": "Cố tiên sinh",
+    "Haizz": "Hầy",
+    "haizz": "Hầy",
 }
+
+_ALLOWLIST_SINGLE_WORD_REPEATS = {
+    # Common intentional emphasis/onomatopoeia in Vietnamese prose.
+    "rất",
+    "quá",
+    "lắm",
+    "thật",
+    "đúng",
+    "cực",
+    "siêu",
+    "hơi",
+    "mãi",
+}
+
+
+def _dedupe_immediate_repeats(text: str) -> str:
+    """
+    Remove immediate duplicated words/phrases that commonly appear as LLM glitches.
+
+    Examples:
+      - "tập đoàn tập đoàn Trác Hàng" -> "tập đoàn Trác Hàng"
+      - "khách sạn khách sạn năm sao" -> "khách sạn năm sao"
+
+    Notes:
+      - Multi-word repeats (>= 2 words) are always collapsed.
+      - Single-word repeats are collapsed unless in an allowlist (e.g. "rất rất").
+      - Only collapses repeats separated by spaces/tabs (won't cross newlines).
+    """
+
+    word = r"[A-Za-zÀ-Ỵà-ỹĐđ]+"
+
+    # Multi-word phrases (2..6 words): collapse aggressively.
+    multi_word_repeat = re.compile(
+        rf"\b({word}(?:[ \t]+{word}){{1,5}})\b[ \t]+\1\b",
+        flags=re.IGNORECASE,
+    )
+    while True:
+        cleaned = multi_word_repeat.sub(r"\1", text)
+        if cleaned == text:
+            break
+        text = cleaned
+
+    # Single words: collapse with allowlist.
+    single_word_repeat = re.compile(rf"\b({word})\b[ \t]+\1\b", flags=re.IGNORECASE)
+
+    def _single_repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token.casefold() in _ALLOWLIST_SINGLE_WORD_REPEATS:
+            return match.group(0)
+        return token
+
+    while True:
+        cleaned = single_word_repeat.sub(_single_repl, text)
+        if cleaned == text:
+            break
+        text = cleaned
+
+    return text
 
 
 def _chapter_numbers(raw: str, chapter_regex: str) -> list[str]:
@@ -161,14 +221,7 @@ def normalize_text(text: str, chapter_num: str) -> str:
     text = re.sub(r'([.!?…])"([A-ZÀ-Ỵ])', r'\1"\n\n\2', text)
     text = re.sub(r'([.!?…])”([“"])', r'\1”\n\n\2', text)
     text = re.sub(r'([.!?…])"([“"])', r'\1"\n\n\2', text)
-
-    # Remove duplicated proper nouns and multi-word phrases (e.g., "Phong Vân bảng Phong Vân bảng")
-    duplicate_pattern = r'\b([A-ZÀ-ỴĐ][a-zà-ỹđA-ZÀ-ỴĐ]*(?:[ \t]+[a-zà-ỹđA-ZÀ-ỴĐ]+){1,5})\s+\1\b'
-    while True:
-        cleaned = re.sub(duplicate_pattern, r'\1', text)
-        if cleaned == text:
-            break
-        text = cleaned
+    text = _dedupe_immediate_repeats(text)
 
     text = re.sub(r"(?m)^[ \t]+", "", text)
     text = re.sub(r"[ \t]+\n", "\n", text)

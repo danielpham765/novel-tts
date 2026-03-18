@@ -7,10 +7,11 @@
 1. crawl source novel text
 2. translate to Vietnamese
 3. optionally queue translation via Redis
-4. inspect per-key telemetry (Redis-backed)
-5. synthesize audio
-6. render visual
-7. mux final video
+4. coordinate RPM/TPM/RPD via a global quota gate (`quota-supervisor`)
+5. inspect per-key telemetry (Redis-backed)
+6. synthesize audio
+7. render visual
+8. mux final video
 
 Primary package: `novel_tts`
 
@@ -29,6 +30,26 @@ Most stages do not talk directly to each other.
 They communicate through files under `input/<novel>` and `output/<novel>`.
 
 If changing behavior, preserve artifact contracts.
+
+## AI Agent Read Rules (Repo Hygiene)
+
+Avoid loading large/generated artifacts into context.
+Do **not** read these folders (or files under them) unless the task explicitly requires it:
+
+- `./input`
+- `./output`
+- `./image`
+- `./tmp`
+
+If you must inspect artifacts, do it surgically (one file, small excerpts).
+
+## AI Agent Change Rules (Refactor/Architecture)
+
+When doing a **refactor**, **architecture change**, or **strategy change**:
+
+- Do not default to aliases/backward-compatible code paths.
+- Prefer a **clean cutover**: update all call sites, configs, and docs so there is only one “true” design in the code.
+- Only keep backward-compatibility when explicitly required; make it time-boxed and plan removal to avoid long-term code rot.
 
 ## Runtime Config
 
@@ -123,6 +144,7 @@ Resolver extension path:
 - `novel_tts/translate/glossary.py`
 - `novel_tts/translate/captions.py`
 - `novel_tts/translate/polish.py`
+- `novel_tts/translate/repair.py`
 
 Public entrypoints:
 
@@ -140,6 +162,7 @@ Important facts:
 - `translated/*.txt` is rebuilt from `.parts`
 - translation does multiple cleanup/repair passes for residual Han
 - glossary can auto-update from translated chapters
+- `translate repair` scans ranges and enqueues broken chapters back into Redis for queue workers to re-translate
 
 Provider support:
 
@@ -160,16 +183,18 @@ Public entrypoints:
 Important facts:
 
 - queue job = one chapter in one source batch
+- queue also supports a special captions job id: `captions` (runs `translate captions`)
 - job id format: `<file_name>::<chapter_num>`
 - workers spawn `python -m novel_tts translate chapter ...`
 - Redis stores queue bookkeeping only
 - disk files remain source of truth
+- queue workers enable central quota for their translate subprocesses (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`)
 
 Operator UX:
 
 - `uv run novel-tts queue ps-all` prints a pm2-like table grouped by novel.
 - The column header `TARGET (N)` shows the number of **unique** chapter targets currently being processed (deduped across worker + translate-chapter subprocess rows).
-- `uv run novel-tts queue reset <novel_id> --key kN [...]` clears per-key Redis cooldown/quota/throttle state when a key gets stuck.
+- `uv run novel-tts queue reset-key <novel_id> --key kN [...]` clears per-key Redis cooldown/quota/throttle state when a key gets stuck.
 
 Redis key suffixes:
 
@@ -178,6 +203,20 @@ Redis key suffixes:
 - `inflight`
 - `retries`
 - `done`
+
+### Central Quota (v2)
+
+- `novel_tts/quota/client.py`
+- `novel_tts/quota/supervisor.py`
+
+What it is:
+
+- a Redis-backed gate to coordinate RPM/TPM/RPD across worker processes (prevents per-process “sleep storms”)
+- `quota-supervisor` is a **global** process that grants requests and publishes short-lived ETA hints used by `queue ps-all`
+
+Operator command:
+
+- `uv run novel-tts quota-supervisor` (run once globally; uses `configs/app.yaml` queue.redis.*)
 
 ### AI Key Telemetry
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from pathlib import Path
 import redis
 import yaml
 
+from novel_tts.config.models import ProxyGatewayConfig
+from novel_tts.net.proxy_gateway import select_proxy_for_key_index
 
 @dataclass(frozen=True)
 class RedisCfg:
@@ -23,6 +26,12 @@ _KEY_MODEL_API_CALLS_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):api:calls
 _KEY_MODEL_API_REQS_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):api:reqs$")
 _KEY_MODEL_LLM_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):llm:reqs$")
 _KEY_MODEL_QUOTA_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:reqs$")
+_KEY_MODEL_TPM_FREEZED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:tpm:freezed$")
+_KEY_MODEL_TPM_LOCKED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:tpm:locked$")
+_KEY_MODEL_RPM_FREEZED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpm:freezed$")
+_KEY_MODEL_RPM_LOCKED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpm:locked$")
+_KEY_MODEL_RPD_FREEZED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpd:freezed$")
+_KEY_MODEL_RPD_LOCKED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpd:locked$")
 
 
 def _repo_root() -> Path:
@@ -75,6 +84,159 @@ def _load_enabled_models() -> list[str]:
                 out.append(value)
         return out
     return []
+
+
+def _load_model_limits() -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    path = _repo_root() / "configs" / "app.yaml"
+    payload = {}
+    if path.exists():
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    models = payload.get("models") if isinstance(payload, dict) else {}
+    if not isinstance(models, dict):
+        models = {}
+
+    model_cfgs = models.get("model_configs")
+    tpm: dict[str, int] = {}
+    rpm: dict[str, int] = {}
+    rpd: dict[str, int] = {}
+    if isinstance(model_cfgs, dict):
+        for model, cfg in model_cfgs.items():
+            model_name = str(model or "").strip()
+            if not model_name or not isinstance(cfg, dict):
+                continue
+            try:
+                tpm[model_name] = int(cfg.get("tpm_limit") or 0)
+            except (TypeError, ValueError):
+                tpm[model_name] = 0
+            try:
+                rpm[model_name] = int(cfg.get("rpm_limit") or 0)
+            except (TypeError, ValueError):
+                rpm[model_name] = 0
+            try:
+                rpd[model_name] = int(cfg.get("rpd_limit") or 0)
+            except (TypeError, ValueError):
+                rpd[model_name] = 0
+
+    # Backward-compatible: legacy config key `model_tpm_limits`.
+    legacy = models.get("model_tpm_limits")
+    if isinstance(legacy, dict):
+        for model, limit in legacy.items():
+            model_name = str(model or "").strip()
+            if not model_name:
+                continue
+            try:
+                tpm.setdefault(model_name, int(limit or 0))
+            except (TypeError, ValueError):
+                tpm.setdefault(model_name, 0)
+
+    legacy_rpm = models.get("model_rpm_limits")
+    if isinstance(legacy_rpm, dict):
+        for model, limit in legacy_rpm.items():
+            model_name = str(model or "").strip()
+            if not model_name:
+                continue
+            try:
+                rpm.setdefault(model_name, int(limit or 0))
+            except (TypeError, ValueError):
+                rpm.setdefault(model_name, 0)
+
+    legacy_rpd = models.get("model_rpd_limits")
+    if isinstance(legacy_rpd, dict):
+        for model, limit in legacy_rpd.items():
+            model_name = str(model or "").strip()
+            if not model_name:
+                continue
+            try:
+                rpd.setdefault(model_name, int(limit or 0))
+            except (TypeError, ValueError):
+                rpd.setdefault(model_name, 0)
+
+    return tpm, rpm, rpd
+
+
+def _load_proxy_gateway_cfg() -> ProxyGatewayConfig:
+    path = _repo_root() / "configs" / "app.yaml"
+    payload = {}
+    if path.exists():
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    proxy_raw = payload.get("proxy_gateway") if isinstance(payload, dict) else {}
+    if proxy_raw is None:
+        proxy_raw = {}
+    if not isinstance(proxy_raw, dict):
+        proxy_raw = {}
+
+    def _clean_text(value) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return text
+
+    def _clean_bool(value, *, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        text = str(value).strip().lower()
+        if not text:
+            return bool(default)
+        return text in {"1", "true", "yes", "on", "y"}
+
+    enabled = _clean_bool(proxy_raw.get("enabled"), default=False)
+    base_url = _clean_text(proxy_raw.get("base_url")) or "http://localhost:8888"
+    mode = (_clean_text(proxy_raw.get("mode")) or "direct").strip().lower()
+    auto_discovery = _clean_bool(proxy_raw.get("auto_discovery"), default=True)
+    try:
+        keys_per_proxy = int(proxy_raw.get("keys_per_proxy", 3) or 3)
+    except Exception:
+        keys_per_proxy = 3
+    proxies_raw = proxy_raw.get("proxies") or []
+    proxies: list[str] = []
+    if isinstance(proxies_raw, list):
+        for item in proxies_raw:
+            t = _clean_text(item)
+            if t:
+                proxies.append(t)
+    direct_strategy = (_clean_text(proxy_raw.get("direct_run_strategy")) or "proxy_1").strip().lower()
+    return ProxyGatewayConfig(
+        enabled=enabled,
+        base_url=base_url,
+        mode=mode,
+        auto_discovery=auto_discovery,
+        keys_per_proxy=max(1, int(keys_per_proxy)),
+        proxies=proxies,
+        direct_run_strategy=direct_strategy,
+    )
+
+
+def _proxy_gateway_proxies_key(prefix: str) -> str:
+    return f"{prefix}:proxy_gateway:proxies:v1"
+
+
+def _load_healthy_proxy_names(client, *, prefix: str) -> list[str]:
+    raw = None
+    try:
+        raw = client.get(_proxy_gateway_proxies_key(prefix))
+    except Exception:
+        raw = None
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+    proxies = payload.get("proxies") if isinstance(payload, dict) else None
+    if not isinstance(proxies, list):
+        return []
+    healthy: list[str] = []
+    for item in proxies:
+        if not isinstance(item, dict):
+            continue
+        if not bool(item.get("is_healthy")):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            healthy.append(name)
+    return healthy
 
 
 def _parse_filter_values(values: list[str]) -> list[str]:
@@ -212,12 +374,23 @@ def _zcount_1m(client, key: str, now: float) -> int:
         return 0
 
 
+def _zcount_window(client, key: str, now: float, *, window_seconds: float) -> int:
+    window_start = now - float(window_seconds)
+    try:
+        return int(client.zcount(key, window_start, "+inf"))
+    except Exception:
+        return 0
+
+
 def _scan_counts(
     client, *, prefix: str
 ) -> tuple[
     dict[int, int],
     dict[int, int],
     dict[int, int],
+    dict[int, dict[str, int]],
+    dict[int, dict[str, int]],
+    dict[int, dict[str, int]],
     dict[int, dict[str, int]],
     dict[int, dict[str, int]],
     dict[int, dict[str, int]],
@@ -229,6 +402,9 @@ def _scan_counts(
     api_by_model: dict[int, dict[str, int]] = {}
     api_429_by_model: dict[int, dict[str, int]] = {}
     llm_by_model: dict[int, dict[str, int]] = {}
+    quota_tokens_by_model: dict[int, dict[str, int]] = {}
+    rpm_used_by_model: dict[int, dict[str, int]] = {}
+    rpd_used_by_model: dict[int, dict[str, int]] = {}
 
     # LLM metric should represent *attempts* (including retries), so prefer :llm:reqs.
     # Fallbacks exist for older workers that didn't emit :llm:reqs.
@@ -237,6 +413,12 @@ def _scan_counts(
     quota_pattern = f"{prefix}:*:k*:*:quota:reqs"
     api_pattern = f"{prefix}:*:k*:*:api:reqs"
     api_429_pattern = f"{prefix}:*:k*:*:api:429"
+    tpm_freezed_pattern = f"{prefix}:*:k*:*:quota:tpm:freezed"
+    tpm_locked_pattern = f"{prefix}:*:k*:*:quota:tpm:locked"
+    rpm_freezed_pattern = f"{prefix}:*:k*:*:quota:rpm:freezed"
+    rpm_locked_pattern = f"{prefix}:*:k*:*:quota:rpm:locked"
+    rpd_freezed_pattern = f"{prefix}:*:k*:*:quota:rpd:freezed"
+    rpd_locked_pattern = f"{prefix}:*:k*:*:quota:rpd:locked"
 
     llm_keys: set[str] = set()
     llm_bases: set[str] = set()
@@ -286,6 +468,98 @@ def _scan_counts(
         by_model = llm_by_model.setdefault(idx, {})
         by_model[model] = by_model.get(model, 0) + count
 
+    # Quota TPM usage: sum estimated tokens for active members in the last 60s.
+    def _sum_tokens_for_zset(zset_key: str, *, token_hash_key: str, window_seconds: float) -> int:
+        window_start = now - float(window_seconds)
+        try:
+            members = list(client.zrangebyscore(zset_key, window_start, "+inf"))
+        except Exception:
+            return 0
+        if not members:
+            return 0
+        try:
+            token_vals = client.hmget(token_hash_key, members)
+        except Exception:
+            token_vals = []
+        total = 0
+        for raw in token_vals or []:
+            try:
+                total += int(raw or 0)
+            except (TypeError, ValueError):
+                continue
+        return max(0, int(total))
+
+    # Central quota v2 preferred: TPM is split across freezed + locked.
+    for key in client.scan_iter(match=tpm_freezed_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_TPM_FREEZED_RE)
+        if idx is None or not model:
+            continue
+        token_key = f"{str(key).removesuffix(':quota:tpm:freezed')}:quota:tpm:freezed_tokens"
+        total_tokens = _sum_tokens_for_zset(str(key), token_hash_key=token_key, window_seconds=60.0)
+        if total_tokens <= 0:
+            continue
+        by_model = quota_tokens_by_model.setdefault(idx, {})
+        by_model[model] = by_model.get(model, 0) + total_tokens
+
+    for key in client.scan_iter(match=tpm_locked_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_TPM_LOCKED_RE)
+        if idx is None or not model:
+            continue
+        token_key = f"{str(key).removesuffix(':quota:tpm:locked')}:quota:tpm:locked_tokens"
+        total_tokens = _sum_tokens_for_zset(str(key), token_hash_key=token_key, window_seconds=60.0)
+        if total_tokens <= 0:
+            continue
+        by_model = quota_tokens_by_model.setdefault(idx, {})
+        by_model[model] = by_model.get(model, 0) + total_tokens
+
+    # Backward-compatible fallback: older workers used :quota:reqs + :quota:tokens.
+    for key in client.scan_iter(match=quota_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_QUOTA_RE)
+        if idx is None or not model:
+            continue
+        token_key = f"{str(key).removesuffix(':quota:reqs')}:quota:tokens"
+        total_tokens = _sum_tokens_for_zset(str(key), token_hash_key=token_key, window_seconds=60.0)
+        if total_tokens <= 0:
+            continue
+        by_model = quota_tokens_by_model.setdefault(idx, {})
+        by_model.setdefault(model, 0)
+        # Only use fallback when v2 hasn't already populated it.
+        if by_model[model] <= 0:
+            by_model[model] = total_tokens
+
+    # Central quota v2: RPM and RPD usage.
+    for key in client.scan_iter(match=rpm_freezed_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPM_FREEZED_RE)
+        if idx is None or not model:
+            continue
+        count = _zcount_window(client, str(key), now, window_seconds=60.0)
+        by_model = rpm_used_by_model.setdefault(idx, {})
+        by_model[model] = by_model.get(model, 0) + count
+
+    for key in client.scan_iter(match=rpm_locked_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPM_LOCKED_RE)
+        if idx is None or not model:
+            continue
+        count = _zcount_window(client, str(key), now, window_seconds=60.0)
+        by_model = rpm_used_by_model.setdefault(idx, {})
+        by_model[model] = by_model.get(model, 0) + count
+
+    for key in client.scan_iter(match=rpd_freezed_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPD_FREEZED_RE)
+        if idx is None or not model:
+            continue
+        count = _zcount_window(client, str(key), now, window_seconds=86400.0)
+        by_model = rpd_used_by_model.setdefault(idx, {})
+        by_model[model] = by_model.get(model, 0) + count
+
+    for key in client.scan_iter(match=rpd_locked_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPD_LOCKED_RE)
+        if idx is None or not model:
+            continue
+        count = _zcount_window(client, str(key), now, window_seconds=86400.0)
+        by_model = rpd_used_by_model.setdefault(idx, {})
+        by_model[model] = by_model.get(model, 0) + count
+
     for key in client.scan_iter(match=api_pattern, count=1000):
         idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_API_REQS_RE)
         if idx is None or not model:
@@ -304,7 +578,17 @@ def _scan_counts(
         by_model = api_429_by_model.setdefault(idx, {})
         by_model[model] = by_model.get(model, 0) + count
 
-    return api_counts, api_429_counts, llm_counts, api_by_model, api_429_by_model, llm_by_model
+    return (
+        api_counts,
+        api_429_counts,
+        llm_counts,
+        api_by_model,
+        api_429_by_model,
+        llm_by_model,
+        quota_tokens_by_model,
+        rpm_used_by_model,
+        rpd_used_by_model,
+    )
 
 
 def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None = None) -> int:
@@ -312,14 +596,24 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
     cfg = _load_redis_cfg()
     client = _client(cfg)
     enabled_models = _load_enabled_models()
+    tpm_limits_by_model, rpm_limits_by_model, rpd_limits_by_model = _load_model_limits()
+    proxy_cfg = _load_proxy_gateway_cfg()
 
     filter_tokens = _parse_filter_values(filters or [])
     filter_raw_tokens = _parse_filter_values(filters_raw or [])
     selected, unknown_raw = _select_indices(keys, filter_tokens=filter_tokens, filter_raw_tokens=filter_raw_tokens)
 
-    api_counts, api_429_counts, llm_counts, api_by_model, api_429_by_model, llm_by_model = _scan_counts(
-        client, prefix=cfg.prefix
-    )
+    (
+        api_counts,
+        api_429_counts,
+        llm_counts,
+        api_by_model,
+        api_429_by_model,
+        llm_by_model,
+        quota_tokens_by_model,
+        rpm_used_by_model,
+        rpd_used_by_model,
+    ) = _scan_counts(client, prefix=cfg.prefix)
 
     all_indices: set[int] = set(range(1, len(keys) + 1))
     all_indices.update(api_counts.keys())
@@ -366,16 +660,36 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
         print("No keys matched.")
         return 0
 
+    proxy_by_key_index: dict[int, str] = {}
+    if proxy_cfg.enabled:
+        if proxy_cfg.auto_discovery:
+            proxy_list = _load_healthy_proxy_names(client, prefix=cfg.prefix)
+        else:
+            proxy_list = list(proxy_cfg.proxies or [])
+        if proxy_list:
+            for idx in all_indices:
+                proxy = select_proxy_for_key_index(
+                    key_index=idx,
+                    proxies=proxy_list,
+                    keys_per_proxy=int(proxy_cfg.keys_per_proxy or 3),
+                )
+                if proxy:
+                    proxy_by_key_index[int(idx)] = proxy
+
     headers = [
         "KEY",
-        "API_CALL_COUNT_1M",
-        "LLM_CALL_COUNT_1M",
-        "API_SUCCESS_COUNT_1M",
-        "API_429_COUNT_1M",
+        "API_CALL_COUNT",
+        "LLM_CALL_COUNT",
+        "API_SUCCESS_COUNT",
+        "API_429_COUNT",
+        "PROXY",
         "MODEL_NAME",
-        "LLM_CALL_1M",
-        "API_SUCCESS_1M",
-        "API_429_1M",
+        "LLM_CALL",
+        "API_SUCCESS",
+        "API_429",
+        "RPM",
+        "RPD",
+        "TPM",
     ]
 
     models_to_show = list(enabled_models)
@@ -397,6 +711,9 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
     total_api_by_model: dict[str, int] = {}
     total_api_429_by_model: dict[str, int] = {}
     total_llm_by_model: dict[str, int] = {}
+    total_quota_tokens_by_model: dict[str, int] = {}
+    total_rpm_used_by_model: dict[str, int] = {}
+    total_rpd_used_by_model: dict[str, int] = {}
     for idx in displayed_indices:
         for model, count in (api_by_model.get(idx, {}) or {}).items():
             total_api_by_model[model] = total_api_by_model.get(model, 0) + int(count or 0)
@@ -404,6 +721,12 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
             total_api_429_by_model[model] = total_api_429_by_model.get(model, 0) + int(count or 0)
         for model, count in (llm_by_model.get(idx, {}) or {}).items():
             total_llm_by_model[model] = total_llm_by_model.get(model, 0) + int(count or 0)
+        for model, count in (quota_tokens_by_model.get(idx, {}) or {}).items():
+            total_quota_tokens_by_model[model] = total_quota_tokens_by_model.get(model, 0) + int(count or 0)
+        for model, count in (rpm_used_by_model.get(idx, {}) or {}).items():
+            total_rpm_used_by_model[model] = total_rpm_used_by_model.get(model, 0) + int(count or 0)
+        for model, count in (rpd_used_by_model.get(idx, {}) or {}).items():
+            total_rpd_used_by_model[model] = total_rpd_used_by_model.get(model, 0) + int(count or 0)
 
     if not models_to_show:
         models_to_show = [""]
@@ -420,21 +743,82 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
             attempts = int((api_by_model.get(idx, {}) or {}).get(model, 0) or 0)
             rate_limited = int((api_429_by_model.get(idx, {}) or {}).get(model, 0) or 0)
             api_success = max(attempts - rate_limited, 0)
+            quota_used = int((quota_tokens_by_model.get(idx, {}) or {}).get(model, 0) or 0)
+            tpm_limit = int((tpm_limits_by_model or {}).get(model, 0) or 0)
+            quota_cell = f"{quota_used:,} / {tpm_limit:,}" if tpm_limit > 0 else f"{quota_used:,}"
+            rpm_used = int((rpm_used_by_model.get(idx, {}) or {}).get(model, 0) or 0)
+            rpm_limit = int((rpm_limits_by_model or {}).get(model, 0) or 0)
+            rpm_cell = f"{rpm_used} / {rpm_limit}" if rpm_limit > 0 else str(rpm_used)
+            rpd_used = int((rpd_used_by_model.get(idx, {}) or {}).get(model, 0) or 0)
+            rpd_limit = int((rpd_limits_by_model or {}).get(model, 0) or 0)
+            rpd_cell = f"{rpd_used} / {rpd_limit}" if rpd_limit > 0 else str(rpd_used)
             display_rows.append(
                 {
                     "KEY": key_label if i == 0 else "",
-                    "API_CALL_COUNT_1M": api_val if i == 0 else "",
-                    "LLM_CALL_COUNT_1M": llm_val if i == 0 else "",
-                    "API_SUCCESS_COUNT_1M": api_success_count_val if i == 0 else "",
-                    "API_429_COUNT_1M": api_429_val if i == 0 else "",
+                    "API_CALL_COUNT": api_val if i == 0 else "",
+                    "LLM_CALL_COUNT": llm_val if i == 0 else "",
+                    "API_SUCCESS_COUNT": api_success_count_val if i == 0 else "",
+                    "API_429_COUNT": api_429_val if i == 0 else "",
+                    "PROXY": proxy_by_key_index.get(int(idx), "") if i == 0 else "",
                     "MODEL_NAME": model,
-                    "LLM_CALL_1M": llm_model_val,
-                    "API_SUCCESS_1M": str(int(api_success)),
-                    "API_429_1M": str(int(rate_limited)),
+                    "LLM_CALL": llm_model_val,
+                    "API_SUCCESS": str(int(api_success)),
+                    "API_429": str(int(rate_limited)),
+                    "RPM": rpm_cell,
+                    "RPD": rpd_cell,
+                    "TPM": quota_cell,
                 }
             )
+
+    total_api = sum(int(api_counts.get(idx, 0) or 0) for idx in displayed_indices)
+    total_api_429 = sum(int(api_429_counts.get(idx, 0) or 0) for idx in displayed_indices)
+    total_llm = sum(int(llm_counts.get(idx, 0) or 0) for idx in displayed_indices)
+    total_api_success_count = max(int(total_api) - int(total_api_429), 0)
+    key_count = sum(1 for idx in displayed_indices if 1 <= idx <= len(keys))
+
+    total_api_success_by_model: dict[str, int] = {}
+    for model in models_to_show:
+        attempts = int((total_api_by_model or {}).get(model, 0) or 0)
+        rate_limited = int((total_api_429_by_model or {}).get(model, 0) or 0)
+        total_api_success_by_model[model] = max(attempts - rate_limited, 0)
+
+    total_rows: list[dict[str, str]] = []
+    for i, model in enumerate(models_to_show):
+        llm_model_val = str(int((total_llm_by_model or {}).get(model, 0) or 0))
+        api_success_val = str(int((total_api_success_by_model or {}).get(model, 0) or 0))
+        api_429_val = str(int((total_api_429_by_model or {}).get(model, 0) or 0))
+        total_quota_used = int((total_quota_tokens_by_model or {}).get(model, 0) or 0)
+        tpm_limit = int((tpm_limits_by_model or {}).get(model, 0) or 0)
+        total_limit = tpm_limit * key_count if (tpm_limit > 0 and key_count > 0) else 0
+        total_quota_cell = f"{total_quota_used:,} / {total_limit:,}" if total_limit > 0 else f"{total_quota_used:,}"
+        total_rpm_used = int((total_rpm_used_by_model or {}).get(model, 0) or 0)
+        rpm_limit = int((rpm_limits_by_model or {}).get(model, 0) or 0)
+        total_rpm_limit = rpm_limit * key_count if (rpm_limit > 0 and key_count > 0) else 0
+        total_rpm_cell = f"{total_rpm_used} / {total_rpm_limit}" if total_rpm_limit > 0 else str(total_rpm_used)
+        total_rpd_used = int((total_rpd_used_by_model or {}).get(model, 0) or 0)
+        rpd_limit = int((rpd_limits_by_model or {}).get(model, 0) or 0)
+        total_rpd_limit = rpd_limit * key_count if (rpd_limit > 0 and key_count > 0) else 0
+        total_rpd_cell = f"{total_rpd_used} / {total_rpd_limit}" if total_rpd_limit > 0 else str(total_rpd_used)
+        total_rows.append(
+            {
+                "KEY": "TOTAL" if i == 0 else "",
+                "API_CALL_COUNT": str(total_api) if i == 0 else "",
+                "LLM_CALL_COUNT": str(total_llm) if i == 0 else "",
+                "API_SUCCESS_COUNT": str(total_api_success_count) if i == 0 else "",
+                "API_429_COUNT": str(total_api_429) if i == 0 else "",
+                "PROXY": "",
+                "MODEL_NAME": model,
+                "LLM_CALL": llm_model_val,
+                "API_SUCCESS": api_success_val,
+                "API_429": api_429_val,
+                "RPM": total_rpm_cell,
+                "RPD": total_rpd_cell,
+                "TPM": total_quota_cell,
+            }
+        )
+
     widths: dict[str, int] = {h: len(h) for h in headers}
-    for r in display_rows:
+    for r in (display_rows + total_rows):
         for h in headers:
             widths[h] = max(widths[h], len(r.get(h, "")))
 
@@ -450,13 +834,16 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
         for h in headers:
             val = values.get(h, "")
             if h in {
-                "API_CALL_COUNT_1M",
-                "LLM_CALL_COUNT_1M",
-                "API_SUCCESS_COUNT_1M",
-                "API_429_COUNT_1M",
-                "LLM_CALL_1M",
-                "API_SUCCESS_1M",
-                "API_429_1M",
+                "API_CALL_COUNT",
+                "LLM_CALL_COUNT",
+                "API_SUCCESS_COUNT",
+                "API_429_COUNT",
+                "LLM_CALL",
+                "API_SUCCESS",
+                "API_429",
+                "RPM",
+                "RPD",
+                "TPM",
             }:
                 cells.append(val.rjust(widths[h]))
             else:
@@ -476,36 +863,8 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
             current_key = row_key
         print(_row(r))
 
-    total_api = sum(int(api_counts.get(idx, 0) or 0) for idx in displayed_indices)
-    total_api_429 = sum(int(api_429_counts.get(idx, 0) or 0) for idx in displayed_indices)
-    total_llm = sum(int(llm_counts.get(idx, 0) or 0) for idx in displayed_indices)
-    total_api_success_count = max(int(total_api) - int(total_api_429), 0)
-
-    total_api_success_by_model: dict[str, int] = {}
-    for model in models_to_show:
-        attempts = int((total_api_by_model or {}).get(model, 0) or 0)
-        rate_limited = int((total_api_429_by_model or {}).get(model, 0) or 0)
-        total_api_success_by_model[model] = max(attempts - rate_limited, 0)
-
     print(_hr())
-    for i, model in enumerate(models_to_show):
-        llm_model_val = str(int((total_llm_by_model or {}).get(model, 0) or 0))
-        api_success_val = str(int((total_api_success_by_model or {}).get(model, 0) or 0))
-        api_429_val = str(int((total_api_429_by_model or {}).get(model, 0) or 0))
-        print(
-            _row(
-                {
-                    "KEY": "TOTAL" if i == 0 else "",
-                    "API_CALL_COUNT_1M": str(total_api) if i == 0 else "",
-                    "LLM_CALL_COUNT_1M": str(total_llm) if i == 0 else "",
-                    "API_SUCCESS_COUNT_1M": str(total_api_success_count) if i == 0 else "",
-                    "API_429_COUNT_1M": str(total_api_429) if i == 0 else "",
-                    "MODEL_NAME": model,
-                    "LLM_CALL_1M": llm_model_val,
-                    "API_SUCCESS_1M": api_success_val,
-                    "API_429_1M": api_429_val,
-                }
-            )
-        )
+    for r in total_rows:
+        print(_row(r))
     print(_hr())
     return 0

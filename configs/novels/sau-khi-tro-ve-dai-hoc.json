@@ -4,7 +4,6 @@
   "slug": "sau-khi-tro-ve-dai-hoc",
   "source_language": "zh",
   "target_language": "vi",
-  "source_id": "69shuba",
   "storage": {
     "input_dir": "input/sau-khi-tro-ve-dai-hoc",
     "output_dir": "output/sau-khi-tro-ve-dai-hoc",
@@ -13,7 +12,12 @@
     "tmp_dir": "tmp"
   },
   "crawl": {
-    "directory_url": "https://69shuba.tw/indexlist/85400/"
+    "sources": [
+      {
+        "source_id": "69shuba",
+        "directory_url": "https://69shuba.tw/indexlist/85400/"
+      }
+    ]
   },
   "translation": {
     "glossary_file": "configs/glossaries/sau-khi-tro-ve-dai-hoc.json",
@@ -27,11 +31,9 @@
     },
     "captions": {}
   },
+  "models": {},
   "queue": {},
-  "tts": {
-    "provider": "gradio_vie_tts",
-    "voice": "Tuyen"
-  },
+  "tts": {},
   "visual": {
     "background_video": "background.mp4",
     "tag_text": "Sau Khi Tro Ve Dai Hoc",

@@ -4,7 +4,6 @@
   "slug": "vo-cuc-thien-ton",
   "source_language": "zh",
   "target_language": "vi",
-  "source_id": "novel543",
   "storage": {
     "input_dir": "input/vo-cuc-thien-ton",
     "output_dir": "output/vo-cuc-thien-ton",
@@ -13,11 +12,16 @@
     "tmp_dir": "tmp"
   },
   "crawl": {
-    "directory_url": "https://www.novel543.com/1007666933/dir",
-    "chapter_url_pattern": "https://www.novel543.com/1007666933/8096_{chapter}.html",
-    "selectors": {
-      "content": ["#txt", "#content", ".content", ".chapter-content", ".txtnav"]
-    }
+    "sources": [
+      {
+        "source_id": "novel543",
+        "directory_url": "https://www.novel543.com/1007666933/dir",
+        "chapter_url_pattern": "https://www.novel543.com/1007666933/8096_{chapter}.html",
+        "selectors": {
+          "content": ["#txt", "#content", ".content", ".chapter-content", ".txtnav"]
+        }
+      }
+    ]
   },
   "translation": {
     "glossary_file": "configs/glossaries/vo-cuc-thien-ton.json",
@@ -51,19 +55,8 @@
       "output_file": "caption_vn.srt"
     }
   },
-  "tts": {
-    "provider": "gradio_vie_tts",
-    "voice": "Ly",
-    "server_name": "local",
-    "model_name": "macos",
-    "generation_mode": "Standard (Một lần)",
-    "use_batch": true,
-    "max_batch_size_run": 128,
-    "temperature": 1.0,
-    "max_chars_chunk": 512,
-    "tempo": 1.15,
-    "bitrate": "128k"
-  },
+  "models": {},
+  "tts": {},
   "visual": {
     "background_video": "background.mp4",
     "font_file": "",

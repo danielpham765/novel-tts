@@ -4,7 +4,6 @@
   "slug": "tram-than",
   "source_language": "zh",
   "target_language": "vi",
-  "source_id": "spudnovel",
   "storage": {
     "input_dir": "input/tram-than",
     "output_dir": "output/tram-than",
@@ -13,7 +12,12 @@
     "tmp_dir": "tmp"
   },
   "crawl": {
-    "directory_url": "https://spudnovel.com/site/detail?id=3"
+    "sources": [
+      {
+        "source_id": "spudnovel",
+        "directory_url": "https://spudnovel.com/site/detail?id=3"
+      }
+    ]
   },
   "translation": {
     "glossary_file": "configs/glossaries/tram-than.json",
@@ -26,11 +30,9 @@
     },
     "captions": {}
   },
+  "models": {},
   "queue": {},
-  "tts": {
-    "provider": "gradio_vie_tts",
-    "voice": "Tuyen"
-  },
+  "tts": {},
   "visual": {
     "background_video": "background.mp4",
     "tag_text": "Trảm Thần",

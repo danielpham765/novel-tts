@@ -5,6 +5,25 @@ from pathlib import Path
 
 
 @dataclass
+class ModelsConfig:
+    provider: str
+    enabled_models: list[str] = field(default_factory=list)
+    repair_model: str = ""
+    glossary_model: str = ""
+    model_configs: dict[str, QueueModelConfig] = field(default_factory=dict)
+
+@dataclass
+class ProxyGatewayConfig:
+    enabled: bool = False
+    base_url: str = "http://localhost:8888"
+    mode: str = "direct"  # "direct" | "socket"
+    auto_discovery: bool = True
+    keys_per_proxy: int = 3
+    proxies: list[str] = field(default_factory=list)
+    direct_run_strategy: str = "proxy_1"  # "proxy_1" | "gateway_rr"
+
+
+@dataclass
 class StorageConfig:
     root: Path
     input_dir: Path
@@ -81,13 +100,8 @@ class BrowserDebugConfig:
 
 @dataclass
 class TranslationConfig:
-    provider: str
-    model: str
-    chunk_max_len: int
-    chunk_sleep_seconds: float
     chapter_regex: str
     base_rules: str
-    repair_model: str = ""
     glossary: dict[str, str] = field(default_factory=dict)
     post_replacements: dict[str, str] = field(default_factory=dict)
     han_fallback_replacements: dict[str, str] = field(default_factory=dict)
@@ -99,8 +113,6 @@ class TranslationConfig:
 
 @dataclass
 class CaptionConfig:
-    provider: str
-    model: str
     chunk_size: int = 120
     chunk_concurrency: int = 1
     request_timeout_ms: int = 90000
@@ -125,8 +137,9 @@ class QueueModelConfig:
     tpm_limit: int = 0
     rpd_limit: int = 0
     repair_model: str = ""
+    glossary_model: str = ""
     chunk_max_len: int = 0
-    chunk_sleep_seconds: float = 0.0
+    chunk_sleep_seconds: float = 0.1
 
 
 @dataclass
@@ -137,11 +150,16 @@ class QueueConfig:
     min_pick_interval_seconds: float = 0.5
     # When the supervisor needs to spawn new workers, pace the spawning by key to avoid bursts.
     spawn_key_interval_seconds: float = 0.1
+    # When the queue stack is (re)launched and many workers start at once, ramp up LLM attempts
+    # to avoid triggering an upstream IP-level throttle (429 storms).
+    # This gate is enforced via Redis and shared by all workers for the same novel+model.
+    startup_ramp_seconds: float = 60.0
+    startup_ramp_rps: int = 1
     max_retries: int = 3
     inflight_ttl_seconds: int = 3600
     supervisor_interval_seconds: int = 15
     status_interval_seconds: int = 60
-    enabled_models: list[str] = field(default_factory=lambda: ["gemma-3-27b-it", "gemma-3-12b-it"])
+    enabled_models: list[str] = field(default_factory=lambda: ["gemma-3-27b-it"])
     model_configs: dict[str, QueueModelConfig] = field(default_factory=dict)
 
 
@@ -200,9 +218,11 @@ class NovelConfig:
     storage: StorageConfig
     crawl: CrawlConfig
     browser_debug: BrowserDebugConfig
+    models: ModelsConfig
     translation: TranslationConfig
     captions: CaptionConfig
     queue: QueueConfig
     tts: TtsConfig
     visual: VisualConfig
     video: VideoConfig
+    proxy_gateway: ProxyGatewayConfig = field(default_factory=ProxyGatewayConfig)

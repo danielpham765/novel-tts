@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
@@ -19,6 +20,20 @@ from novel_tts.translate.providers import get_translation_provider
 
 
 VN_CHAPTER_HEADER = re.compile(r"^(Chương|Đoạn)\s+(\d+)\s*[:：]?\s*(.*)$", re.M)
+
+
+def _effective_translate_model(config) -> str:
+    model = (
+        os.environ.get("NOVEL_TTS_TRANSLATION_MODEL")
+        or os.environ.get("NOVEL_TTS_TRANSLATE_MODEL")
+        or os.environ.get("GEMINI_MODEL")
+        or ""
+    ).strip()
+    if model:
+        return model
+    if getattr(config, "models", None) and config.models.enabled_models:
+        return str(config.models.enabled_models[0]).strip()
+    raise KeyError("Missing models.enabled_models[0]")
 
 
 def _load_part_paths(config, filenames: list[str] | None) -> list[tuple[Path, list[tuple[str, Path]]]]:
@@ -55,7 +70,7 @@ def _clean_polish_response(text: str) -> str:
     return text.strip() + "\n"
 
 
-def _polish_translation(config, provider, source_text: str, translated_text: str, glossary: dict[str, str]) -> str:
+def _polish_translation(config, provider, model: str, source_text: str, translated_text: str, glossary: dict[str, str]) -> str:
     if not glossary:
         return translated_text
     glossary_text = build_glossary(glossary)
@@ -72,7 +87,7 @@ def _polish_translation(config, provider, source_text: str, translated_text: str
         f"BẢN GỐC:\n{source_text}\n\n"
         f"BẢN DỊCH HIỆN CÓ:\n{translated_text}"
     )
-    return _clean_polish_response(provider.generate(config.translation.model, prompt))
+    return _clean_polish_response(provider.generate(model, prompt))
 
 
 def _normalize_chapter_header(text: str, chapter_num: str) -> str:
@@ -104,7 +119,8 @@ def main() -> int:
     args = parser.parse_args()
 
     config = load_novel_config(args.novel_id)
-    provider = get_translation_provider(config.translation.provider)
+    provider = get_translation_provider(config.models.provider)
+    model = _effective_translate_model(config)
     payload = _load_part_paths(config, args.file or None)
     total_added = 0
     total_polished = 0
@@ -117,7 +133,7 @@ def main() -> int:
             translated_text = part_path.read_text(encoding="utf-8")
             relevant = _relevant_glossary(config.translation.glossary, source_text)
             if relevant and not args.skip_polish:
-                polished = _polish_translation(config, provider, source_text, translated_text, relevant)
+                polished = _polish_translation(config, provider, model, source_text, translated_text, relevant)
                 polished = _normalize_chapter_header(polished, chapter_num)
                 if polished != translated_text:
                     part_path.write_text(polished, encoding="utf-8")
