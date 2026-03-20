@@ -8,11 +8,34 @@ from bs4 import BeautifulSoup
 from novel_tts.common.text import normalize_whitespace
 
 from ..base import BaseResolver, parse_chapter_number
-from ..types import ParsedChapter
+from ..types import ChapterEntry, ParsedChapter
 
 
 class TtkanResolver(BaseResolver):
     source_id = "ttkan"
+    _NOISE_LINE_PATTERN = re.compile(
+        r"("
+        r"上一章|下一章|返回目录|加入书签|加入收藏|本章完|手机阅读"
+        r"|^作者[:：]"
+        r"|^更新时间[:：]"
+        r"|^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?$"
+        r")",
+        re.I,
+    )
+
+    def parse_directory(self, html: str, base_url: str) -> dict[int, ChapterEntry]:
+        soup = BeautifulSoup(html, "html.parser")
+        entries: dict[int, ChapterEntry] = {}
+        for link in soup.select("a[href]"):
+            href = link.get("href", "").strip()
+            title = normalize_whitespace(link.get_text(" ", strip=True))
+            if not href or not title:
+                continue
+            chapter_number = parse_chapter_number(title)
+            if chapter_number is None:
+                continue
+            entries[chapter_number] = ChapterEntry(chapter_number, title, urljoin(base_url, href))
+        return entries
 
     def parse_chapter(self, html: str, expected_chapter_number: int, fallback_title: str = "") -> ParsedChapter:
         soup = BeautifulSoup(html, "html.parser")
@@ -59,7 +82,7 @@ class TtkanResolver(BaseResolver):
             clean = normalize_whitespace(line)
             if not clean:
                 continue
-            if re.search(r"(上一章|下一章|返回目录|加入书签|加入收藏|本章完|手机阅读)", clean):
+            if self._NOISE_LINE_PATTERN.search(clean):
                 continue
             if raw_title and clean == normalize_whitespace(raw_title):
                 continue
@@ -83,4 +106,3 @@ class TtkanResolver(BaseResolver):
             if re.search(r"(下一页|下页|next)", text, flags=re.I):
                 return href
         return None
-

@@ -214,6 +214,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep crawl_failures.json even if it becomes empty after pruning.",
     )
+    crawl_verify_parser.add_argument(
+        "--sync-repair-config",
+        action="store_true",
+        help="Create/update input/<novel_id>/repair_config.yaml by merging existing config with research-derived suggestions.",
+    )
 
     crawl_repair_parser = crawl_sub.add_parser("repair")
     crawl_repair_parser.add_argument("novel_id")
@@ -234,7 +239,7 @@ def _build_parser() -> argparse.ArgumentParser:
     crawl_repair_parser.add_argument(
         "--run",
         action="store_true",
-        help="Run repair using input/<novel_id>/repair_config.yaml (must exist). If no --range/--from/--to is provided, infer range from origin batch filenames.",
+        help="Run repair using input/<novel_id>/repair_config.yaml. If missing, generate a minimal config first. If no --range/--from/--to is provided, infer range from origin batch filenames.",
     )
 
     translate_parser = subparsers.add_parser("translate")
@@ -595,6 +600,30 @@ def main(argv: list[str] | None = None) -> int:
                     fix_stale_manifest=not bool(getattr(args, "no_fix_manifest", False)),
                     delete_empty_manifest=not bool(getattr(args, "keep_empty_manifest", False)),
                 )
+                if bool(getattr(args, "sync_repair_config", False)):
+                    from novel_tts.crawl.repair_config import (
+                        generate_repair_config_from_research,
+                        load_repair_config,
+                        merge_repair_config,
+                        repair_config_path,
+                        save_repair_config,
+                    )
+
+                    rc_path = repair_config_path(config.storage.input_dir)
+                    generated_cfg = generate_repair_config_from_research(
+                        root=config.storage.root,
+                        novel_id=config.novel_id,
+                        logs_dir=config.storage.logs_dir,
+                        input_dir=config.storage.input_dir,
+                    )
+                    if rc_path.exists():
+                        existing_cfg = load_repair_config(rc_path)
+                        merged_cfg = merge_repair_config(existing_cfg, generated_cfg)
+                        save_repair_config(rc_path, merged_cfg)
+                        LOGGER.info("Merged repair config: %s", _format_click_path(rc_path))
+                    else:
+                        save_repair_config(rc_path, generated_cfg)
+                        LOGGER.info("Generated repair config: %s", _format_click_path(rc_path))
                 issue_count = len(report.issues)
                 if issue_count:
                     noun = "issue" if issue_count == 1 else "issues"
@@ -680,7 +709,19 @@ def main(argv: list[str] | None = None) -> int:
                         parser.error("crawl repair --run requires both --from and --to when using explicit bounds")
                 repair_cfg_path = config.storage.input_dir / "repair_config.yaml"
                 if not repair_cfg_path.exists():
-                    parser.error(f"crawl repair --run requires repair config: {repair_cfg_path}")
+                    from novel_tts.crawl.repair_config import (
+                        generate_repair_config_from_research,
+                        save_repair_config,
+                    )
+
+                    repair_cfg = generate_repair_config_from_research(
+                        root=config.storage.root,
+                        novel_id=config.novel_id,
+                        logs_dir=config.storage.logs_dir,
+                        input_dir=config.storage.input_dir,
+                    )
+                    save_repair_config(repair_cfg_path, repair_cfg)
+                    LOGGER.info("Generated missing repair config: %s", _format_click_path(repair_cfg_path))
                 repair_report = repair_crawled_content(
                     config,
                     start,

@@ -59,3 +59,46 @@ def test_tts_defaults_from_app_yaml_and_novel_overrides(tmp_path, monkeypatch):
     assert cfg2.tts.voice == "Ly"
     assert cfg2.tts.tempo == 1.1
 
+
+def test_load_novel_config_allows_captions_only_novel(tmp_path, monkeypatch):
+    monkeypatch.setattr(loader, "_root_dir", lambda: tmp_path)
+
+    (tmp_path / "configs" / "novels").mkdir(parents=True)
+
+    app_cfg = {
+        "models": {
+            "provider": "gemini_http",
+            "enabled_models": ["m1"],
+            "model_configs": {"m1": {"chunk_max_len": 100, "worker_count": 1, "rpm_limit": 1, "tpm_limit": 1}},
+        },
+        "queue": {"redis": {"host": "127.0.0.1", "port": 6379, "database": 1, "prefix": "novel_tts"}},
+        "tts": {"provider": "gradio_vie_tts", "voice": "Tuyen"},
+    }
+    (tmp_path / "configs" / "app.yaml").write_text(yaml.safe_dump(app_cfg, sort_keys=False), encoding="utf-8")
+
+    novel_cfg = {
+        "novel_id": "captions-only",
+        "title": "Captions Only",
+        "slug": "captions-only",
+        "storage": {
+            "input_dir": "input/captions-only",
+            "output_dir": "output/captions-only",
+            "image_dir": "image/captions-only",
+            "logs_dir": ".logs",
+            "tmp_dir": "tmp",
+        },
+        "translation": {
+            "chapter": {"chapter_regex": "^$", "base_rules": "x"},
+            "captions": {"input_file": "caption_cn.srt", "output_file": "caption_vn.srt"},
+        },
+        "models": {},
+        "tts": {},
+    }
+    (tmp_path / "configs" / "novels" / "captions-only.json").write_text(json.dumps(novel_cfg), encoding="utf-8")
+
+    cfg = loader.load_novel_config("captions-only")
+    assert cfg.source_id == ""
+    assert cfg.source.source_id == ""
+    assert cfg.source.resolver_id == ""
+    assert cfg.captions.input_file == "caption_cn.srt"
+    assert cfg.captions.output_file == "caption_vn.srt"

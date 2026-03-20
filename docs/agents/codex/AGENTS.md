@@ -86,7 +86,7 @@ Per novel under `input/<novel>/`:
 
 - `origin/*.txt`: crawled source batches
 - `translated/*.txt`: rebuilt translated batches
-- `caption/*.srt`: caption in/out
+- `captions/*.srt`: caption in/out
 - `.parts/<origin_stem>/<chapter>.txt`: per-chapter translation truth
 - `.progress/*.json`: resumable state and crawl failures
 

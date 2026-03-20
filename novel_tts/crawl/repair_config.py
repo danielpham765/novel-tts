@@ -35,6 +35,58 @@ class RepairConfig:
     replacements: dict[int, ChapterRepairRule] = field(default_factory=dict)
 
 
+def _candidate_key(candidate: RepairCandidate) -> tuple[str, str, str, str, str]:
+    return (
+        candidate.kind,
+        candidate.source_id,
+        candidate.url,
+        candidate.title,
+        candidate.content,
+    )
+
+
+def merge_repair_config(existing: RepairConfig, incoming: RepairConfig) -> RepairConfig:
+    """
+    Merge incoming config into existing config without dropping existing values.
+
+    Rules:
+    - keep existing placeholder fields and dedupe_repeated_blocks preference.
+    - union index_gaps and generated_from.
+    - merge replacement candidates by chapter, deduplicated by full candidate payload.
+    """
+    merged = RepairConfig(
+        version=max(int(existing.version), int(incoming.version)),
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_from=list(dict.fromkeys([*existing.generated_from, *incoming.generated_from])),
+        index_gaps=sorted({*existing.index_gaps, *incoming.index_gaps}),
+        placeholder_title_suffix=existing.placeholder_title_suffix,
+        placeholder_content_zh=existing.placeholder_content_zh,
+        dedupe_repeated_blocks=existing.dedupe_repeated_blocks,
+        replacements={},
+    )
+
+    all_chapters = sorted({*existing.replacements.keys(), *incoming.replacements.keys()})
+    for chapter in all_chapters:
+        existing_rule = existing.replacements.get(chapter)
+        incoming_rule = incoming.replacements.get(chapter)
+        merged_candidates: list[RepairCandidate] = []
+        seen: set[tuple[str, str, str, str, str]] = set()
+
+        for rule in [existing_rule, incoming_rule]:
+            if rule is None:
+                continue
+            for candidate in rule.candidates:
+                key = _candidate_key(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_candidates.append(candidate)
+
+        merged.replacements[chapter] = ChapterRepairRule(chapter=chapter, candidates=merged_candidates)
+
+    return merged
+
+
 def repair_config_path(input_dir: Path) -> Path:
     return input_dir / "repair_config.yaml"
 

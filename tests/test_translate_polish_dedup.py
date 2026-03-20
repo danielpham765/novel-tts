@@ -30,3 +30,35 @@ def test_normalize_text_replaces_haizz() -> None:
 
     assert "Hầy" in out
     assert "Haizz" not in out
+
+
+def test_normalize_text_keeps_three_dots() -> None:
+    raw = "Anh ấy ngập ngừng... rồi mới nói.\n"
+    out = normalize_text(raw, chapter_num="1")
+
+    assert "ngập ngừng... rồi mới nói" in out.lower()
+    assert "," not in out
+
+
+def test_normalize_text_replaces_unicode_ellipsis_with_three_dots() -> None:
+    raw = "Anh ấy ngập ngừng… rồi mới nói.\n"
+    out = normalize_text(raw, chapter_num="1")
+
+    assert "ngập ngừng... rồi mới nói" in out.lower()
+    assert "…" not in out
+
+
+def test_normalize_text_splits_glued_camelcase_tokens() -> None:
+    raw = "Tu Hành Giới: Thê tử Phương Thiến, Thiên Địa Thương HộiLâm Tư Hân……\n"
+    out = normalize_text(raw, chapter_num="1")
+
+    assert "Thương Hội Lâm" in out
+    assert "HộiLâm" not in out
+
+
+def test_normalize_text_does_not_split_lowercase_camelcase() -> None:
+    raw = "Anh ấy dùng iPhone mỗi ngày.\n"
+    out = normalize_text(raw, chapter_num="1")
+
+    assert "iPhone" in out
+    assert "i Phone" not in out

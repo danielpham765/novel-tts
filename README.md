@@ -46,7 +46,8 @@ Tip: all commands support `--log-file /path/to/file.log` at the top level.
 ### Secrets / API keys
 
 Queue workers read Gemini API keys from `.secrets/gemini-keys.txt` (one key per line).
-For one-off direct translation runs, `GEMINI_API_KEY` from env still works.
+For one-off direct translation runs, `GEMINI_API_KEY` from env still works. If it is unset, direct translate
+commands fall back to the first non-empty key in `.secrets/gemini-keys.txt`.
 
 If you use OpenAI as a provider, set `OPENAI_API_KEY`.
 
@@ -164,7 +165,7 @@ Translate a single chapter (used by queue workers; also useful for debugging):
 uv run novel-tts translate chapter <novel_id> --file chuong_1-10.txt --chapter 7
 ```
 
-Translate captions (SRT) when they exist under `input/<novel_id>/caption/`:
+Translate captions (SRT) when they exist under `input/<novel_id>/captions/`:
 
 ```bash
 uv run novel-tts translate captions <novel_id>

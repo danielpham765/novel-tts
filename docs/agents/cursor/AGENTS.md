@@ -79,7 +79,7 @@ When answering questions or making edits, **anchor your reasoning** to these fil
 - Under `input/<novel>/`:
   - `origin/*.txt` – crawled source batches (truth for chapter discovery).
   - `translated/*.txt` – rebuilt translated batches (derived from `.parts`).
-  - `caption/*.srt` – caption inputs/outputs.
+  - `captions/*.srt` – caption inputs/outputs.
   - `.parts/<origin_stem>/<chapter>.txt` – **canonical per-chapter translation truth**.
   - `.progress/*.json` – resumable state (crawl failures, translation chunk progress, etc.).
 - Under `output/<novel>/`:

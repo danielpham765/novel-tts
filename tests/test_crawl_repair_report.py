@@ -146,3 +146,64 @@ def test_crawl_repair_rewrites_index_gap_placeholder_body(tmp_path: Path) -> Non
     updated = batch_path.read_text(encoding="utf-8")
     assert "本章内容与主线剧情无关。" in updated
     assert any(action.action == "replaced_from_source" and action.chapter == 2 for action in report.actions)
+
+
+def test_crawl_repair_strips_watermark_lines(tmp_path: Path) -> None:
+    config = _make_config(tmp_path)
+    config.storage.origin_dir.mkdir(parents=True, exist_ok=True)
+    config.storage.input_dir.mkdir(parents=True, exist_ok=True)
+    (config.storage.input_dir / "repair_config.yaml").write_text(
+        "version: 1\nindex_gaps: []\nreplacements: []\n",
+        encoding="utf-8",
+    )
+
+    body = ("这是正常章节内容。" * 20).strip()
+    raw = "\n".join(
+        [
+            "第1章 标题",
+            "",
+            body,
+            "",
+            "【記住本站域名 台灣小說網書庫多，t̲̲̅̅w̲̲̅̅k̲̲̅̅a̲̲̅̅n̲̲̅̅.c̲̲̅̅o̲̲̅̅m̲̲̅̅任你選 】",
+        ]
+    )
+    batch_path = config.storage.origin_dir / "chuong_1-1.txt"
+    batch_path.write_text(raw, encoding="utf-8")
+
+    report_path = tmp_path / "report.txt"
+    report = repair_crawled_content(config, 1, 1, log_path=report_path, generate_repair_config_if_missing=False)
+
+    updated = batch_path.read_text(encoding="utf-8")
+    assert "twkan" not in updated.lower()
+    assert any(action.action == "watermark_removed" and action.chapter == 1 for action in report.actions)
+
+
+def test_crawl_repair_strips_metadata_noise_lines(tmp_path: Path) -> None:
+    config = _make_config(tmp_path)
+    config.storage.origin_dir.mkdir(parents=True, exist_ok=True)
+    config.storage.input_dir.mkdir(parents=True, exist_ok=True)
+    (config.storage.input_dir / "repair_config.yaml").write_text(
+        "version: 1\nindex_gaps: []\nreplacements: []\n",
+        encoding="utf-8",
+    )
+
+    raw = "\n".join(
+        [
+            "第1章 标题",
+            "",
+            "2026-03-09 11:41:07",
+            "作者： 七柒四十九",
+            "宋楚薇起身離開辦公室後，顧若塵拿起手機看著照片上的喬喬微微一笑。",
+        ]
+    )
+    batch_path = config.storage.origin_dir / "chuong_1-1.txt"
+    batch_path.write_text(raw, encoding="utf-8")
+
+    report_path = tmp_path / "report.txt"
+    report = repair_crawled_content(config, 1, 1, log_path=report_path, generate_repair_config_if_missing=False)
+
+    updated = batch_path.read_text(encoding="utf-8")
+    assert "2026-03-09 11:41:07" not in updated
+    assert "作者： 七柒四十九" not in updated
+    assert "宋楚薇起身離開辦公室後" in updated
+    assert any(action.action == "metadata_removed" and action.chapter == 1 for action in report.actions)

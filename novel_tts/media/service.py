@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from novel_tts.common.ffmpeg import ffprobe_duration, run_ffmpeg
+from novel_tts.common.ffmpeg import ffmpeg_has_filter, ffprobe_duration, run_ffmpeg
 from novel_tts.config.models import NovelConfig
 
 
@@ -16,6 +16,11 @@ def _esc_drawtext(text: str) -> str:
 
 
 def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Path]:
+    if not ffmpeg_has_filter("drawtext"):
+        raise RuntimeError(
+            "ffmpeg filter 'drawtext' is unavailable. Install an ffmpeg build with drawtext/libfreetype "
+            "support, then verify with: ffmpeg -hide_banner -filters | rg drawtext"
+        )
     range_key = _range_key(start, end)
     background = config.storage.image_dir / config.visual.background_video
     if not background.exists():
@@ -28,12 +33,12 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
     part_index = ((start - 1) // 20) + 1
     filters = ",".join(
         [
-            f"drawtext=text='{_esc_drawtext(f'Phần {part_index}')}'{font_arg}:fontcolor=#FFD200:fontsize=48:borderw=4:bordercolor=black:x=10:y=35",
+            f"drawtext=text='{_esc_drawtext(f'Tập {part_index}')}'{font_arg}:fontcolor=#FFD200:fontsize=48:borderw=4:bordercolor=black:x=10:y=35",
             f"drawtext=text='{_esc_drawtext(f'Chương {start} -> {end}')}'{font_arg}:fontcolor=white:fontsize=32:borderw=4:bordercolor=black:x=10:y=95",
             f"drawtext=text='{_esc_drawtext(config.visual.tag_text)}'{font_arg}:fontcolor=#FFD200:fontsize=36:borderw=4:bordercolor=black:x=w-text_w-20:y=35",
-            f"drawtext=text='{_esc_drawtext(config.visual.line1)}'{font_arg}:fontcolor=#FFD200:fontsize=60:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-350",
-            f"drawtext=text='{_esc_drawtext(config.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=60:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-250",
-            f"drawtext=text='{_esc_drawtext(config.visual.line3)}'{font_arg}:fontcolor=white:fontsize=50:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-120",
+            f"drawtext=text='{_esc_drawtext(config.visual.line1)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-200",
+            f"drawtext=text='{_esc_drawtext(config.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-130",
+            f"drawtext=text='{_esc_drawtext(config.visual.line3)}'{font_arg}:fontcolor=white:fontsize=30:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-60",
         ]
     )
     run_ffmpeg(["-y", "-i", str(background), "-vf", filters, "-c:a", "copy", str(output_video)])

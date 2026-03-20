@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +40,22 @@ INVALID_CONTENT_TOKENS = (
     "verify you are human",
     "performing security verification",
 )
+WATERMARK_CONTENT_PATTERNS = (
+    re.compile(r"记住本站域名", re.I),
+    re.compile(r"記住本站域名", re.I),
+    re.compile(r"本站域名", re.I),
+    re.compile(r"追台灣小說就上台灣小說網", re.I),
+    re.compile(r"台灣小說網", re.I),
+    re.compile(r"google搜索\s*twkan", re.I),
+    re.compile(r"twkan\.com", re.I),
+    re.compile(r"twkan", re.I),
+)
+METADATA_NOISE_LINE_PATTERNS = (
+    re.compile(r"^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?$", re.I),
+    re.compile(r"^作者[:：]\s*.+$", re.I),
+    re.compile(r"^更新时间[:：]\s*.+$", re.I),
+)
+METADATA_NOISE_SCAN_LINES = 6
 MIN_CONTENT_CHARS = 80
 BATCH_FILENAME_PATTERN = re.compile(r"chuong_(\d+)-(\d+)\.txt$")
 MIN_DUPLICATE_BLOCK_CHARS = 160
@@ -169,6 +186,59 @@ def _normalize_duplicate_token(value: str) -> str:
     return value
 
 
+def _normalize_detection_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalize_whitespace(normalized).casefold()
+    return normalized
+
+
+def _detect_watermark_content(content: str) -> str | None:
+    normalized_content = _normalize_detection_text(content)
+    if not normalized_content:
+        return None
+    for pattern in WATERMARK_CONTENT_PATTERNS:
+        if pattern.search(normalized_content):
+            return pattern.pattern
+    for line in content.splitlines():
+        normalized_line = _normalize_detection_text(line)
+        if not normalized_line:
+            continue
+        for pattern in WATERMARK_CONTENT_PATTERNS:
+            if pattern.search(normalized_line):
+                return pattern.pattern
+    return None
+
+
+def _is_watermark_line(line: str) -> bool:
+    return _detect_watermark_content(line) is not None
+
+
+def _detect_metadata_noise_content(content: str) -> str | None:
+    non_empty_seen = 0
+    for line in content.splitlines():
+        clean = normalize_whitespace(line)
+        if not clean:
+            continue
+        non_empty_seen += 1
+        if non_empty_seen > METADATA_NOISE_SCAN_LINES:
+            break
+        for pattern in METADATA_NOISE_LINE_PATTERNS:
+            if pattern.search(clean):
+                return pattern.pattern
+    return None
+
+
+def _is_metadata_noise_line(line: str) -> bool:
+    clean = normalize_whitespace(line)
+    if not clean:
+        return False
+    for pattern in METADATA_NOISE_LINE_PATTERNS:
+        if pattern.search(clean):
+            return True
+    return False
+
+
 def _detect_duplicated_content(content: str) -> str | None:
     """
     Heuristic duplicate detection for buggy sources that repeat paragraphs/blocks inside a chapter.
@@ -235,6 +305,48 @@ def _write_batch(origin_dir: Path, start_chapter: int, end_chapter: int, blocks:
     origin_dir.mkdir(parents=True, exist_ok=True)
     output_path = origin_dir / f"chuong_{start_chapter}-{end_chapter}.txt"
     output_path.write_text("\n\n\n".join(blocks).strip() + "\n", encoding="utf-8")
+    return output_path
+
+
+def _write_merged_batch(
+    origin_dir: Path,
+    start_chapter: int,
+    end_chapter: int,
+    blocks: list[str],
+    chapter_numbers: list[int],
+    chapter_regex: str,
+) -> Path:
+    """
+    Write a batch file while preserving already-crawled chapters from overlapping batch files.
+
+    This keeps partial historical batches from splitting one logical batch into multiple files
+    after incremental crawls.
+    """
+    origin_dir.mkdir(parents=True, exist_ok=True)
+    output_path = origin_dir / f"chuong_{start_chapter}-{end_chapter}.txt"
+
+    merged_blocks: dict[int, str] = {}
+    overlapping_sources: list[Path] = []
+    for path in _iter_origin_batch_files(origin_dir):
+        if not _batch_file_overlaps_range(path, start_chapter, end_chapter):
+            continue
+        overlapping_sources.append(path)
+        raw = path.read_text(encoding="utf-8")
+        for chapter_number, title, body in _split_crawled_chapters(raw, chapter_regex):
+            merged_blocks.setdefault(chapter_number, f"{title}\n\n{body}".strip())
+
+    for chapter_number, block in zip(chapter_numbers, blocks):
+        merged_blocks[chapter_number] = block.strip()
+
+    merged = [merged_blocks[number].strip() for number in sorted(merged_blocks)]
+    output_path.write_text("\n\n\n".join(merged).strip() + "\n", encoding="utf-8")
+
+    for source_path in overlapping_sources:
+        if source_path == output_path:
+            continue
+        if source_path.exists():
+            source_path.unlink()
+
     return output_path
 
 
@@ -475,8 +587,105 @@ def _replace_chapter_in_batch(*, path: Path, chapter: int, new_block: str, chapt
         if updated != raw:
             path.write_text(updated, encoding="utf-8")
             return True
-        return False
+            return False
     return False
+
+
+def _remove_watermark_lines_in_batch(*, path: Path, chapters: set[int], chapter_regex: str) -> tuple[bool, list[int]]:
+    """
+    Removes watermark/promo lines from selected chapters in a batch file.
+    Returns (changed, cleaned_chapters).
+    """
+    if not chapters:
+        return False, []
+
+    raw = path.read_text(encoding="utf-8")
+    spans = _split_crawled_chapter_spans(raw, chapter_regex)
+    if not spans:
+        return False, []
+
+    changed = False
+    cleaned: list[int] = []
+    rebuilt_parts: list[str] = []
+    last_end = 0
+
+    for number, start, end in spans:
+        rebuilt_parts.append(raw[last_end:start])
+        block = raw[start:end]
+        if number in chapters:
+            header, sep, body = block.partition("\n")
+            if sep:
+                lines = [line for line in body.splitlines() if not _is_watermark_line(line)]
+                new_body = "\n".join(line.rstrip() for line in lines).strip()
+                new_block = header.strip() + ("\n\n" + new_body if new_body else "")
+                new_block = new_block.strip() + "\n"
+                if new_block != block:
+                    changed = True
+                    cleaned.append(number)
+                block = new_block
+        rebuilt_parts.append(block)
+        last_end = end
+
+    rebuilt_parts.append(raw[last_end:])
+    updated = "".join(rebuilt_parts).strip() + "\n"
+    if changed and updated != raw:
+        path.write_text(updated, encoding="utf-8")
+        return True, sorted(set(cleaned))
+    return False, []
+
+
+def _remove_metadata_lines_in_batch(*, path: Path, chapters: set[int], chapter_regex: str) -> tuple[bool, list[int]]:
+    """
+    Removes metadata/noise lines from selected chapters in a batch file.
+    Only scans the first few non-empty body lines to avoid over-cleaning prose.
+    Returns (changed, cleaned_chapters).
+    """
+    if not chapters:
+        return False, []
+
+    raw = path.read_text(encoding="utf-8")
+    spans = _split_crawled_chapter_spans(raw, chapter_regex)
+    if not spans:
+        return False, []
+
+    changed = False
+    cleaned: list[int] = []
+    rebuilt_parts: list[str] = []
+    last_end = 0
+
+    for number, start, end in spans:
+        rebuilt_parts.append(raw[last_end:start])
+        block = raw[start:end]
+        if number in chapters:
+            header, sep, body = block.partition("\n")
+            if sep:
+                lines: list[str] = []
+                non_empty_seen = 0
+                removed = False
+                for line in body.splitlines():
+                    clean = normalize_whitespace(line)
+                    if clean:
+                        non_empty_seen += 1
+                    if clean and non_empty_seen <= METADATA_NOISE_SCAN_LINES and _is_metadata_noise_line(clean):
+                        removed = True
+                        continue
+                    lines.append(line)
+                new_body = "\n".join(line.rstrip() for line in lines).strip()
+                new_block = header.strip() + ("\n\n" + new_body if new_body else "")
+                new_block = new_block.strip() + "\n"
+                if removed and new_block != block:
+                    changed = True
+                    cleaned.append(number)
+                block = new_block
+        rebuilt_parts.append(block)
+        last_end = end
+
+    rebuilt_parts.append(raw[last_end:])
+    updated = "".join(rebuilt_parts).strip() + "\n"
+    if changed and updated != raw:
+        path.write_text(updated, encoding="utf-8")
+        return True, sorted(set(cleaned))
+    return False, []
 
 
 def _remove_duplicate_chapters_in_batch(*, path: Path, chapters: set[int], chapter_regex: str) -> tuple[bool, list[int]]:
@@ -800,6 +1009,30 @@ def verify_crawled_content(
                 )
                 continue
 
+            watermark_error = _detect_watermark_content(body)
+            if watermark_error is not None:
+                issues.append(
+                    CrawlVerifyIssue(
+                        code="watermark_content",
+                        message=f"Chuong {chapter_number} co dong watermark/promo: {watermark_error}",
+                        chapter_number=chapter_number,
+                        path=batch_file,
+                    )
+                )
+                continue
+
+            metadata_noise_error = _detect_metadata_noise_content(body)
+            if metadata_noise_error is not None:
+                issues.append(
+                    CrawlVerifyIssue(
+                        code="metadata_content",
+                        message=f"Chuong {chapter_number} co dong metadata/noise: {metadata_noise_error}",
+                        chapter_number=chapter_number,
+                        path=batch_file,
+                    )
+                )
+                continue
+
             validation_error = _validate_chapter_content(normalized_title, normalized_body)
             if validation_error is not None:
                 issues.append(
@@ -842,7 +1075,13 @@ def verify_crawled_content(
                 range_end = to_chapter if to_chapter is not None else expected_range[1]
                 expected_numbers &= set(range(range_start, range_end + 1))
             actual_numbers = set(chapter_numbers_in_file)
+            actual_min = min(actual_numbers) if actual_numbers else None
+            actual_max = max(actual_numbers) if actual_numbers else None
             for missing in sorted(expected_numbers - actual_numbers):
+                if actual_min is not None and missing < actual_min:
+                    continue
+                if actual_max is not None and missing > actual_max:
+                    continue
                 issues.append(
                     CrawlVerifyIssue(
                         code="missing_chapter_in_batch",
@@ -991,6 +1230,8 @@ def repair_crawled_content(
     missing_in_range: set[int] = set()
     invalid_chapters: set[int] = set()
     duplicate_chapters: dict[Path, set[int]] = {}
+    watermark_chapters: set[int] = set()
+    metadata_noise_chapters: set[int] = set()
     for issue in verify_report.issues:
         if issue.chapter_number is None:
             continue
@@ -1002,6 +1243,12 @@ def repair_crawled_content(
             continue
         if issue.code == "duplicate_chapter" and issue.path is not None:
             duplicate_chapters.setdefault(issue.path, set()).add(int(issue.chapter_number))
+            continue
+        if issue.code == "watermark_content":
+            watermark_chapters.add(int(issue.chapter_number))
+            continue
+        if issue.code == "metadata_content":
+            metadata_noise_chapters.add(int(issue.chapter_number))
             continue
         if issue.code in {"invalid_chapter_content", "duplicated_content"}:
             invalid_chapters.add(int(issue.chapter_number))
@@ -1112,7 +1359,7 @@ def repair_crawled_content(
                             timestamp=actions[idx].timestamp,
                             from_source_id=actions[idx].from_source_id,
                             from_url=actions[idx].from_url,
-                        )
+                )
                         break
                 if dedup_applied:
                     actions.append(
@@ -1126,6 +1373,66 @@ def repair_crawled_content(
                             from_url=url,
                         )
                     )
+
+    # 1b) Strip watermark / promo lines from affected chapters.
+    for batch_file in batch_files:
+        if not batch_file.exists() or not batch_file.is_file():
+            continue
+        raw = batch_file.read_text(encoding="utf-8")
+        present = {num for num, _, _ in _split_crawled_chapter_spans(raw, config.translation.chapter_regex)}
+        targets = {chapter for chapter in watermark_chapters if from_chapter <= chapter <= to_chapter and chapter in present}
+        if not targets:
+            continue
+        changed, cleaned = _remove_watermark_lines_in_batch(
+            path=batch_file,
+            chapters=targets,
+            chapter_regex=config.translation.chapter_regex,
+        )
+        if changed:
+            modified_files.append(batch_file)
+        for chapter in cleaned:
+            handled_chapters.add(int(chapter))
+            actions.append(
+                RepairAction(
+                    action="watermark_removed",
+                    chapter=int(chapter),
+                    reason="watermark_content",
+                    target_file=batch_file.name,
+                    timestamp=now,
+                )
+            )
+
+    # 1c) Strip leading metadata/noise lines from affected chapters.
+    for batch_file in batch_files:
+        if not batch_file.exists() or not batch_file.is_file():
+            continue
+        raw = batch_file.read_text(encoding="utf-8")
+        present = {num for num, _, _ in _split_crawled_chapter_spans(raw, config.translation.chapter_regex)}
+        targets = {
+            chapter
+            for chapter in metadata_noise_chapters
+            if from_chapter <= chapter <= to_chapter and chapter in present
+        }
+        if not targets:
+            continue
+        changed, cleaned = _remove_metadata_lines_in_batch(
+            path=batch_file,
+            chapters=targets,
+            chapter_regex=config.translation.chapter_regex,
+        )
+        if changed:
+            modified_files.append(batch_file)
+        for chapter in cleaned:
+            handled_chapters.add(int(chapter))
+            actions.append(
+                RepairAction(
+                    action="metadata_removed",
+                    chapter=int(chapter),
+                    reason="metadata_content",
+                    target_file=batch_file.name,
+                    timestamp=now,
+                )
+            )
 
     # 2) Insert placeholders for index gaps (batch-level missing).
     for batch_file, missing_chapters in sorted(missing_by_file.items(), key=lambda item: item[0].name):
@@ -1600,7 +1907,14 @@ def crawl_range(
                 )
             time.sleep(config.crawl.delay_between_chapters_seconds)
         if blocks:
-            output_path = _write_batch(config.storage.origin_dir, batch_start, batch_end, blocks)
+            output_path = _write_merged_batch(
+                config.storage.origin_dir,
+                batch_start,
+                batch_end,
+                blocks,
+                fetched_numbers,
+                config.translation.chapter_regex,
+            )
             LOGGER.info(
                 "Batch wrote file | novel=%s source=%s batch=%s-%s output=%s chapters=%s success=%s failed=%s",
                 config.novel_id,

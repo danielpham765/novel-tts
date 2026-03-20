@@ -13,6 +13,7 @@ from novel_tts.common.errors import RateLimitExceededError
 from novel_tts.config.models import NovelConfig
 
 from .glossary import normalize_glossary_text, sanitize_glossary_entries
+from .model import _clean_model_name, resolve_translation_model
 from .providers import PromptBlockedError, get_translation_provider
 
 LOGGER = get_logger(__name__)
@@ -22,34 +23,6 @@ PLACEHOLDER_TOKEN_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}QXZ")
 PLACEHOLDER_LIKE_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}Q(?:XZ)?")
 GLOSSARY_STATUS_PENDING = "pending"
 GLOSSARY_STATUS_DONE = "done"
-
-def _clean_model_name(value) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if not text:
-        return ""
-    if text.lower() in {"none", "null"}:
-        return ""
-    return text
-
-
-def _effective_translate_model(config: NovelConfig) -> str:
-    model = _clean_model_name(
-        os.environ.get("NOVEL_TTS_TRANSLATION_MODEL")
-        or os.environ.get("NOVEL_TTS_TRANSLATE_MODEL")
-        or os.environ.get("GEMINI_MODEL")
-        or ""
-    )
-    if model:
-        return model
-    enabled = getattr(config, "models", None) and config.models.enabled_models
-    if enabled:
-        return _clean_model_name(enabled[0])
-    enabled_queue = getattr(config, "queue", None) and config.queue.enabled_models
-    if enabled_queue:
-        return _clean_model_name(enabled_queue[0])
-    raise KeyError("Missing models.enabled_models[0]")
 
 
 def _get_model_cfg(config: NovelConfig, model: str):
@@ -466,7 +439,7 @@ def _extract_glossary_updates(config: NovelConfig, provider, source_text: str, t
         f"BẢN GỐC{' (TRÍCH)' if was_compacted else ''}:\n{compact_source}\n\n"
         f"BẢN DỊCH{' (TRÍCH)' if was_compacted else ''}:\n{compact_translated}\n"
     )
-    default_model = _effective_translate_model(config)
+    default_model = resolve_translation_model(config)
     model = _effective_glossary_model(config, default_model)
     if was_compacted:
         LOGGER.info(
@@ -1151,7 +1124,7 @@ def _extract_glossary_updates_chunked(
     if (not was_compacted) and (total_chars <= (win_source_chars + win_translated_chars)):
         return _extract_glossary_updates(config, provider, source_text, translated_text)
 
-    default_model = _effective_translate_model(config)
+    default_model = resolve_translation_model(config)
     model = _effective_glossary_model(config, default_model)
     LOGGER.info(
         "Glossary extract chunked | unit=%s windows=%s src_win=%s tr_win=%s model=%s",
@@ -1426,7 +1399,7 @@ def update_glossary_from_chapter(
         return
     provider = get_translation_provider(config.models.provider, config=config)
     if unit_key:
-        default_model = _effective_translate_model(config)
+        default_model = resolve_translation_model(config)
         glossary_model = _effective_glossary_model(config, default_model)
         LOGGER.info("QUEUE_PHASE glossary | unit=%s model=%s", unit_key, glossary_model or "unknown")
     if marker_path is not None:
@@ -1900,7 +1873,7 @@ def strip_all_remaining_han(text: str) -> str:
 
 def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
     translation_cfg = config.translation
-    translate_model = _effective_translate_model(config)
+    translate_model = resolve_translation_model(config)
     repair_model = _effective_repair_model(config, translate_model)
     refresh_glossary(config)
     provider = get_translation_provider(config.models.provider, config=config)

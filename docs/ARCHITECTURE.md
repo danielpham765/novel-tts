@@ -41,7 +41,7 @@ flowchart LR
     TRANS --> PARTS["input/<novel>/.parts/<batch>/*.txt"]
     TRANS --> TRANSLATED["input/<novel>/translated/*.txt"]
     TRANS --> GLOSSARY["configs/glossaries/<novel>.json"]
-    CAP --> CAPTION["input/<novel>/caption/*.srt"]
+    CAP --> CAPTION["input/<novel>/captions/*.srt"]
     QUEUE --> PARTS
     QUEUE --> TRANSLATED
     QUOTA --> REDISQUOTA["Redis quota keys (per key/model)"]
@@ -105,6 +105,9 @@ The translation config schema is:
 Legacy configs that embed chapter fields under `chapter` or older `translation` shapes are still supported,
 but `load_novel_config()` will warn and normalize them into the new shape.
 
+For captions-only novels, `crawl.sources` may be omitted; the loader will still build a minimal runtime config
+so `translate captions` and queue management can run without a crawl source.
+
 Model pool config can live in `configs/app.yaml` under `models` and is shared by direct translation and queue mode:
 
 - `models.provider`
@@ -136,11 +139,12 @@ Key merge behavior:
 Environment variables that materially affect behavior:
 
 - Model selection:
-  - `NOVEL_TTS_TRANSLATION_MODEL` (or `NOVEL_TTS_TRANSLATE_MODEL`, or `GEMINI_MODEL`)
-  - `NOVEL_TTS_CAPTIONS_MODEL` (or `CAPTIONS_MODEL`)
+  - `NOVEL_TTS_TRANSLATION_MODEL` (or `GEMINI_MODEL`)
+  - captions translation uses the same model selection path
 - Provider auth:
   - `GEMINI_API_KEY`
   - `OPENAI_API_KEY`
+  - direct Gemini translate commands fall back to the first non-empty key in `.secrets/gemini-keys.txt` when `GEMINI_API_KEY` is unset
 - Central quota (v2):
   - `NOVEL_TTS_CENTRAL_QUOTA` (enable flag)
   - `NOVEL_TTS_CENTRAL_QUOTA_WAIT_SECONDS` (blocking wait when acquiring a grant)
@@ -192,7 +196,7 @@ Within `input/<novel_id>/`:
 
 - `origin/`: source-language crawl outputs, usually batched as `chuong_<start>-<end>.txt`
 - `translated/`: merged Vietnamese outputs per source batch
-- `caption/`: subtitle inputs and outputs
+- `captions/`: subtitle inputs and outputs
 - `.parts/`: per-chapter translated fragments, one file per chapter under each origin batch folder
 - `.progress/`: resumable work state such as chunk progress and crawl failure manifests
 

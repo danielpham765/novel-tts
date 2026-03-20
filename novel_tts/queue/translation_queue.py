@@ -57,6 +57,7 @@ _IP_BAN_MAX_BACKOFF_SECONDS = _IP_BAN_MAX_SECONDS
 _IP_BAN_PROBE_LOCK_SECONDS = 12
 _IP_RECOVER_SECONDS = 60.0
 _IP_RECOVER_RPS = 1
+_DIRECT_FALLBACK_MAX_KEYS = 5
 
 
 def _rate_limit_requeue_delay_seconds(consecutive_releases: int) -> float:
@@ -1449,6 +1450,46 @@ def _load_keys(config: NovelConfig) -> list[str]:
     return keys
 
 
+def _effective_worker_key_limit(config: NovelConfig, *, total_keys: int) -> tuple[int, str]:
+    """
+    Compute effective max key-index that supervisor may spawn workers for.
+
+    Rules:
+    - Proxy gateway disabled -> direct mode -> cap to first 5 keys.
+    - Proxy gateway enabled but healthy proxy list is unavailable/empty -> fallback direct -> cap to first 5 keys.
+    - Proxy gateway enabled and has proxies -> no cap (use all keys).
+    """
+
+    total = max(0, int(total_keys))
+    if total <= 0:
+        return 0, ""
+
+    proxy_cfg = getattr(config, "proxy_gateway", None)
+    if not bool(proxy_cfg and getattr(proxy_cfg, "enabled", False)):
+        return min(total, _DIRECT_FALLBACK_MAX_KEYS), "proxy_gateway_disabled"
+
+    proxies: list[str] = []
+    reason = ""
+    if bool(getattr(proxy_cfg, "auto_discovery", True)):
+        try:
+            healthy, reason = proxy_gateway_mod.load_healthy_proxy_names_from_redis(
+                cfg=proxy_cfg,
+                redis_cfg=config.queue.redis,
+                now=time.time(),
+            )
+            proxies = [str(x).strip() for x in (healthy or []) if str(x).strip()]
+        except Exception:
+            proxies = []
+            reason = "proxy_lookup_failed"
+    else:
+        proxies = [str(x).strip() for x in (getattr(proxy_cfg, "proxies", None) or []) if str(x).strip()]
+
+    if not proxies:
+        detail = (reason or "proxy_list_empty").strip()
+        return min(total, _DIRECT_FALLBACK_MAX_KEYS), f"proxy_gateway_no_proxies:{detail}"
+    return total, ""
+
+
 def _job_id(file_name: str, chapter_num: str) -> str:
     return f"{file_name}::{int(chapter_num):04d}"
 
@@ -1501,8 +1542,8 @@ def _chapter_needs_work(
 
 
 def _captions_needs_translation(config: NovelConfig) -> bool:
-    input_path = config.storage.caption_dir / config.captions.input_file
-    output_path = config.storage.caption_dir / config.captions.output_file
+    input_path = config.storage.captions_dir / config.captions.input_file
+    output_path = config.storage.captions_dir / config.captions.output_file
     if not input_path.exists():
         return False
     if not output_path.exists():
@@ -2931,18 +2972,27 @@ def _reap_unwanted_worker_processes(config: NovelConfig, *, max_key_index: int, 
 
 def _ensure_worker_processes(config: NovelConfig) -> int:
     keys = _load_keys(config)
+    max_key_index, cap_reason = _effective_worker_key_limit(config, total_keys=len(keys))
     worker_models = config.queue.enabled_models or ["gemma-3-27b-it", "gemma-3-12b-it"]
     client = _client(config)
     for model in worker_models:
         _maybe_apply_startup_ramp(client, config, model=model)
-    _reap_unwanted_worker_processes(config, max_key_index=len(keys), worker_models=worker_models)
+    _reap_unwanted_worker_processes(config, max_key_index=max_key_index, worker_models=worker_models)
+    if cap_reason:
+        LOGGER.info(
+            "Worker key limit active | novel=%s reason=%s using_keys=%s total_keys=%s",
+            config.novel_id,
+            cap_reason,
+            max_key_index,
+            len(keys),
+        )
     spawn_interval = 0.0
     try:
         spawn_interval = float(getattr(config.queue, "spawn_key_interval_seconds", 0.0) or 0.0)
     except Exception:
         spawn_interval = 0.0
     launched = 0
-    for key_index in range(1, len(keys) + 1):
+    for key_index in range(1, max_key_index + 1):
         launched_before = launched
         for model in worker_models:
             model_cfg = config.queue.model_configs.get(model)
@@ -2961,13 +3011,14 @@ def _ensure_worker_processes(config: NovelConfig) -> int:
                     worker_log,
                 )
         key_launched = launched - launched_before
-        if key_launched > 0 and spawn_interval > 0 and key_index < len(keys):
+        if key_launched > 0 and spawn_interval > 0 and key_index < max_key_index:
             time.sleep(spawn_interval)
     return launched
 
 
 def launch_queue_stack(config: NovelConfig, restart: bool = False, *, add_queue: bool = False) -> int:
     keys = _load_keys(config)
+    worker_keys, worker_cap_reason = _effective_worker_key_limit(config, total_keys=len(keys))
     client = _client(config)
     if restart:
         patterns = [
@@ -3089,9 +3140,11 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False, *, add_queue:
     # Do NOT call _ensure_worker_processes here to avoid a race condition
     # where both launch_queue_stack and the supervisor spawn workers simultaneously.
     LOGGER.info(
-        "Queue stack launched | novel=%s keys=%s supervisor=%s monitor=%s (supervisor will spawn workers)",
+        "Queue stack launched | novel=%s keys=%s worker_keys=%s worker_key_cap_reason=%s supervisor=%s monitor=%s (supervisor will spawn workers)",
         config.novel_id,
         len(keys),
+        worker_keys,
+        worker_cap_reason or "-",
         supervisor_pid,
         status_pid,
     )

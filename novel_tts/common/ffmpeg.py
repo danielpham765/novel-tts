@@ -9,6 +9,17 @@ def run_ffmpeg(args: list[str]) -> None:
     subprocess.run(["ffmpeg", *args], check=True)
 
 
+def ffmpeg_has_filter(filter_name: str) -> bool:
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-filters"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    marker = f" {filter_name} "
+    return any(marker in line for line in result.stdout.splitlines())
+
+
 def ffprobe_duration(path: Path) -> float:
     result = subprocess.run(
         [

@@ -121,6 +121,35 @@ def _dedupe_immediate_repeats(text: str) -> str:
     return text
 
 
+def _split_glued_camelcase(text: str) -> str:
+    """
+    Split glued words where a token starts with an uppercase letter and contains a
+    lower->upper boundary without whitespace, e.g. "HộiLâm" -> "Hội Lâm".
+
+    This intentionally does not touch tokens starting with lowercase (e.g. "iPhone").
+    """
+
+    def _split_token(token: str) -> str:
+        if not token:
+            return token
+        # Only touch tokens that start with uppercase (proper-noun-ish).
+        if not token[0].isupper():
+            return token
+        # Common Western prefix that should remain glued: McDonald, McArthur, ...
+        if token.startswith("Mc") and len(token) >= 3 and token[2].isupper():
+            return token
+
+        out: list[str] = [token[0]]
+        for prev, cur in zip(token, token[1:]):
+            if prev.isalpha() and cur.isalpha() and prev.islower() and cur.isupper():
+                out.append(" ")
+            out.append(cur)
+        return "".join(out)
+
+    # Letters-only tokens (unicode), so we don't accidentally split digits/punctuation.
+    return re.sub(r"[^\W\d_]+", lambda m: _split_token(m.group(0)), text, flags=re.UNICODE)
+
+
 def _chapter_numbers(raw: str, chapter_regex: str) -> list[str]:
     return [m.group(1) for m in re.finditer(chapter_regex, raw, flags=re.M)]
 
@@ -221,6 +250,7 @@ def normalize_text(text: str, chapter_num: str) -> str:
     text = re.sub(r'([.!?…])"([A-ZÀ-Ỵ])', r'\1"\n\n\2', text)
     text = re.sub(r'([.!?…])”([“"])', r'\1”\n\n\2', text)
     text = re.sub(r'([.!?…])"([“"])', r'\1"\n\n\2', text)
+    text = _split_glued_camelcase(text)
     text = _dedupe_immediate_repeats(text)
 
     text = re.sub(r"(?m)^[ \t]+", "", text)
@@ -241,6 +271,7 @@ def normalize_text(text: str, chapter_num: str) -> str:
     lines = _merge_broken_paragraphs(lines)
     text = "\n\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.replace("…", "...")
     return text.strip() + "\n"
 
 

@@ -14,14 +14,13 @@
     "rate_limit_cooldown_seconds": 30.0
   },
   "browser_debug": {
-    "mode": "auto",
-    "remote_debugging_url": "",
+    "mode": "debug-attach",
+    "remote_debugging_url": "http://127.0.0.1:9222",
     "remote_debugging_port": 9222,
-    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "executable_path": "",
     "user_data_dir": "",
     "profile_directory": "",
     "headless": false,
     "debug_image_dir": "debug/img"
   }
 }
-

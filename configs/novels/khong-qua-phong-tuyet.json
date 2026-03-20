@@ -1,30 +1,18 @@
 {
-  "novel_id": "vo-cuc-thien-ton",
+  "novel_id": "khong-qua-phong-tuyet",
   "title": "Vo Cuc Thien Ton",
-  "slug": "vo-cuc-thien-ton",
+  "slug": "khong-qua-phong-tuyet",
   "source_language": "zh",
   "target_language": "vi",
   "storage": {
-    "input_dir": "input/vo-cuc-thien-ton",
-    "output_dir": "output/vo-cuc-thien-ton",
-    "image_dir": "image/vo-cuc-thien-ton",
+    "input_dir": "input/khong-qua-phong-tuyet",
+    "output_dir": "output/khong-qua-phong-tuyet",
+    "image_dir": "image/khong-qua-phong-tuyet",
     "logs_dir": ".logs",
     "tmp_dir": "tmp"
   },
-  "crawl": {
-    "sources": [
-      {
-        "source_id": "novel543",
-        "directory_url": "https://www.novel543.com/1007666933/dir",
-        "chapter_url_pattern": "https://www.novel543.com/1007666933/8096_{chapter}.html",
-        "selectors": {
-          "content": ["#txt", "#content", ".content", ".chapter-content", ".txtnav"]
-        }
-      }
-    ]
-  },
   "translation": {
-    "glossary_file": "configs/glossaries/vo-cuc-thien-ton.json",
+    "glossary_file": "configs/glossaries/khong-qua-phong-tuyet.json",
     "line_token": "QZXBRQ",
     "post_replacements": {
       "bạn": "ngươi",
@@ -54,22 +42,5 @@
       "input_file": "caption_cn.srt",
       "output_file": "caption_vn.srt"
     }
-  },
-  "models": {},
-  "tts": {},
-  "visual": {
-    "background_video": "background.mp4",
-    "font_file": "",
-    "tag_text": "Đan Tu Chân",
-    "line1": "Thiên Tài Từ Phàm Giới Phi Thăng",
-    "line2": "Tại Thần Giới Bị Coi Như Sâu Kiến",
-    "line3": "Vô Cực Thiên Tôn"
-  },
-  "video": {
-    "video_codec": "libx264",
-    "audio_codec": "aac",
-    "preset": "veryfast",
-    "crf": 28,
-    "audio_bitrate": "96k"
   }
 }

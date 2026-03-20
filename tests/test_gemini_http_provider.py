@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -107,3 +108,47 @@ def test_gemini_generate_in_queue_worker_mode_releases_on_timeout(monkeypatch) -
     assert "timeout" in str(exc.value).lower()
     assert len(request_calls) == 1
     assert len(acquire_calls) == 1
+
+
+def test_gemini_generate_uses_first_key_from_file_when_env_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_RATE_LIMIT_KEY_PREFIX", raising=False)
+    monkeypatch.delenv("NOVEL_TTS_CENTRAL_QUOTA", raising=False)
+    monkeypatch.delenv("NOVEL_TTS_QUOTA_MODE", raising=False)
+    monkeypatch.delenv("NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS", raising=False)
+
+    (tmp_path / ".secrets").mkdir(parents=True)
+    (tmp_path / ".secrets" / "gemini-keys.txt").write_text("\n# comment\nfirst-key\nsecond-key\n", encoding="utf-8")
+
+    seen_urls: list[str] = []
+
+    def fake_request(method, url, **kwargs):
+        del method, kwargs
+        seen_urls.append(url)
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(providers.proxy_gateway_mod, "request", fake_request)
+    monkeypatch.setattr(providers, "_acquire_gemini_rate_slot", lambda *args, **kwargs: None)
+
+    p = providers.GeminiHttpProvider(config=SimpleNamespace(storage=SimpleNamespace(root=tmp_path), queue=SimpleNamespace(redis=None), proxy_gateway=providers.ProxyGatewayConfig()))
+    assert p.generate("gemma-3-27b-it", "hi", "sys") == "ok"
+    assert seen_urls and "key=first-key" in seen_urls[0]
+
+
+def test_gemini_generate_does_not_fallback_to_file_in_queue_worker_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("NOVEL_TTS_QUOTA_MODE", "raise")
+    monkeypatch.setenv("NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS", "0")
+    monkeypatch.setenv("NOVEL_TTS_CENTRAL_QUOTA", "1")
+    monkeypatch.setenv("GEMINI_RATE_LIMIT_KEY_PREFIX", "novel_tts:novel:k1")
+
+    (tmp_path / ".secrets").mkdir(parents=True)
+    (tmp_path / ".secrets" / "gemini-keys.txt").write_text("first-key\n", encoding="utf-8")
+
+    p = providers.GeminiHttpProvider(config=SimpleNamespace(storage=SimpleNamespace(root=tmp_path), queue=SimpleNamespace(redis=None), proxy_gateway=providers.ProxyGatewayConfig()))
+    with pytest.raises(RuntimeError, match="Missing GEMINI_API_KEY"):
+        p.generate("gemma-3-27b-it", "hi", "sys")

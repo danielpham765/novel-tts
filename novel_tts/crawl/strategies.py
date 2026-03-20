@@ -174,6 +174,13 @@ class BootstrapHttpFetchStrategy(FetchStrategy):
 
 class BrowserFetchStrategy(FetchStrategy):
     name = "browser"
+    _stabilize_wait_ms = 5000
+    _expand_text_candidates = (
+        "展開全部",
+        "展开全部",
+        "點擊展開全部",
+        "点击展开全部",
+    )
 
     def __init__(self, browser_config: BrowserDebugConfig, policy: ChallengePolicy) -> None:
         self.browser_config = browser_config
@@ -209,6 +216,19 @@ class BrowserFetchStrategy(FetchStrategy):
         self._page = self._context.new_page()
         return self._page
 
+    def _expand_directory(self, page) -> None:
+        for text in self._expand_text_candidates:
+            try:
+                locator = page.get_by_text(text, exact=False)
+                if locator.count() <= 0:
+                    continue
+                locator.first.click(timeout=2000)
+                page.wait_for_timeout(self._stabilize_wait_ms)
+                LOGGER.info("browser fetch expanded directory using text=%s", text)
+                return
+            except Exception:
+                LOGGER.debug("browser fetch expand attempt failed for text=%s", text, exc_info=True)
+
     def fetch(self, url: str, timeout_seconds: int) -> FetchResult:
         try:
             from playwright.sync_api import sync_playwright
@@ -228,6 +248,8 @@ class BrowserFetchStrategy(FetchStrategy):
                 LOGGER.warning("browser worker page aborted for %s; recreating page and retrying once", url)
                 page = self._get_attached_page(fresh=True)
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            page.wait_for_timeout(self._stabilize_wait_ms)
+            self._expand_directory(page)
             screenshot_path = debug_dir / "crawl-page.png"
             page.screenshot(path=str(screenshot_path), full_page=True)
             debug_artifacts.append(screenshot_path)
@@ -269,6 +291,8 @@ class BrowserFetchStrategy(FetchStrategy):
 
             assert page is not None
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            page.wait_for_timeout(self._stabilize_wait_ms)
+            self._expand_directory(page)
             screenshot_path = debug_dir / "crawl-page.png"
             page.screenshot(path=str(screenshot_path), full_page=True)
             debug_artifacts.append(screenshot_path)

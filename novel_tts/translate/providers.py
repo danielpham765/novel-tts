@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+from pathlib import Path
 import requests
 import sys
 import time
@@ -37,6 +38,53 @@ class PromptBlockedError(RuntimeError):
 _RATE_LIMIT_CLIENT = None
 _RATE_LIMIT_CONFIGS = None
 _RATE_LIMIT_CONFIGS_RAW = None
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _keys_file_path(config: NovelConfig | None = None) -> Path:
+    if config is not None:
+        return config.storage.root / ".secrets" / "gemini-keys.txt"
+    return _repo_root() / ".secrets" / "gemini-keys.txt"
+
+
+def _is_queue_worker_env() -> bool:
+    key_prefix = os.environ.get("GEMINI_RATE_LIMIT_KEY_PREFIX", "").strip()
+    if key_prefix:
+        return True
+    quota_mode = os.environ.get("NOVEL_TTS_QUOTA_MODE", "wait").strip().lower()
+    central = os.environ.get("NOVEL_TTS_CENTRAL_QUOTA", "").strip().lower() in {"1", "true", "yes", "on"}
+    max_wait_raw = os.environ.get("NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS", "").strip()
+    try:
+        max_wait_seconds = float(max_wait_raw) if max_wait_raw else 0.0
+    except ValueError:
+        max_wait_seconds = 0.0
+    return bool(central and quota_mode == "raise" and max_wait_seconds <= 0.0)
+
+
+def is_queue_worker_env() -> bool:
+    return _is_queue_worker_env()
+
+
+def _resolve_gemini_api_key(*, config: NovelConfig | None = None) -> str:
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    if _is_queue_worker_env():
+        return ""
+    path = _keys_file_path(config)
+    if not path.exists():
+        return ""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key = line.strip()
+            if key and not key.startswith("#"):
+                return key
+    except Exception:
+        return ""
+    return ""
 
 
 def _get_rate_limit_client():
@@ -520,16 +568,21 @@ class GeminiHttpProvider(TranslationProvider):
     def __init__(
         self,
         *,
+        config: NovelConfig | None = None,
         proxy_gateway: ProxyGatewayConfig | None = None,
         redis_cfg: RedisConfig | None = None,
     ) -> None:
+        self.config = config
         self.proxy_gateway = proxy_gateway or ProxyGatewayConfig()
         self.redis_cfg = redis_cfg
 
     def generate(self, model: str, prompt: str, system_prompt: str = "") -> str:
-        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        api_key = _resolve_gemini_api_key(config=self.config)
         if not api_key:
-            raise RuntimeError("Missing GEMINI_API_KEY")
+            key_path = _keys_file_path(self.config)
+            if _is_queue_worker_env():
+                raise RuntimeError("Missing GEMINI_API_KEY")
+            raise RuntimeError(f"Missing GEMINI_API_KEY and no keys found in {key_path}")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         url_with_key = f"{url}?key={api_key}"
         body = {
@@ -840,7 +893,7 @@ def get_translation_provider(provider_name: str, *, config: NovelConfig | None =
     proxy_cfg = config.proxy_gateway if config is not None else ProxyGatewayConfig()
     redis_cfg = config.queue.redis if (config is not None and getattr(config, "queue", None) is not None) else None
     if provider_name == "gemini_http":
-        return GeminiHttpProvider(proxy_gateway=proxy_cfg, redis_cfg=redis_cfg)
+        return GeminiHttpProvider(config=config, proxy_gateway=proxy_cfg, redis_cfg=redis_cfg)
     if provider_name == "openai_chat":
         return OpenAIChatProvider(proxy_gateway=proxy_cfg, redis_cfg=redis_cfg)
     if provider_name not in {"gemini_http", "openai_chat"}:

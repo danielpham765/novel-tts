@@ -159,6 +159,17 @@ def normalize_glossary_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def build_glossary_text(entries: dict[str, str]) -> str:
+    lines = []
+    for source, target in entries.items():
+        source = normalize_glossary_text(source)
+        target = normalize_glossary_text(target)
+        if not source or not target:
+            continue
+        lines.append(f"- {source} = {target}")
+    return "\n".join(lines)
+
+
 def _is_han_dominant_source(source: str) -> bool:
     stripped = ALLOWED_SOURCE_PUNCT_RE.sub("", source)
     return bool(stripped) and all(HAN_RE.fullmatch(ch) for ch in stripped)

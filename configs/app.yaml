@@ -1,5 +1,5 @@
 proxy_gateway:
-  enabled: true
+  enabled: false
   base_url: http://localhost:8888
   mode: socket
   auto_discovery: true
@@ -11,8 +11,8 @@ proxy_gateway:
 models:
   provider: gemini_http
   enabled_models:
-    - gemma-3-27b-it
     - gemini-3.1-flash-lite-preview
+    - gemma-3-27b-it
   repair_model: gemma-3-27b-it
   glossary_model: 
   model_configs:
@@ -50,9 +50,9 @@ tts:
   model_name: macos
   generation_mode: Standard (Một lần)
   use_batch: true
-  max_batch_size_run: 128
-  temperature: 1.0
-  max_chars_chunk: 512
+  max_batch_size_run: 64
+  temperature: 0.8
+  max_chars_chunk: 256
   tempo: 1.15
   bitrate: 192k
 

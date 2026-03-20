@@ -41,8 +41,8 @@ class StorageConfig:
         return self.input_dir / "translated"
 
     @property
-    def caption_dir(self) -> Path:
-        return self.input_dir / "caption"
+    def captions_dir(self) -> Path:
+        return self.input_dir / "captions"
 
     @property
     def progress_dir(self) -> Path:
