@@ -413,6 +413,16 @@ def _build_parser() -> argparse.ArgumentParser:
     video_parser.add_argument("novel_id")
     video_parser.add_argument("--range", required=True)
 
+    upload_parser = subparsers.add_parser("upload")
+    upload_parser.add_argument("novel_id")
+    upload_parser.add_argument("--platform", choices=["youtube", "tiktok"], required=True)
+    upload_parser.add_argument("--range", required=True)
+    upload_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate/build payload and log upload plan without publishing.",
+    )
+
     pipeline_parser = subparsers.add_parser("pipeline")
     pipeline_sub = pipeline_parser.add_subparsers(dest="pipeline_command", required=True)
     pipeline_run = pipeline_sub.add_parser("run")
@@ -426,6 +436,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run.add_argument("--skip-tts", action="store_true")
     pipeline_run.add_argument("--skip-visual", action="store_true")
     pipeline_run.add_argument("--skip-video", action="store_true")
+    pipeline_run.add_argument("--skip-upload", action="store_true")
+    pipeline_run.add_argument(
+        "--upload-platform",
+        choices=["youtube", "tiktok"],
+        help="Override upload platform for pipeline upload step. Defaults to upload.default_platform.",
+    )
 
     quota_supervisor_parser = subparsers.add_parser("quota-supervisor")
     quota_supervisor_parser.add_argument(
@@ -509,6 +525,9 @@ def _default_log_path(args) -> Path | None:
         log_name = "media/visual.log"
     elif command == "video":
         log_name = "media/video.log"
+    elif command == "upload":
+        upload_platform = getattr(args, "platform", None) or "unknown"
+        log_name = f"upload/{upload_platform}.log"
     elif command == "pipeline":
         pipeline_command = getattr(args, "pipeline_command", None) or "run"
         log_name = f"pipeline/{pipeline_command}.log"
@@ -965,11 +984,28 @@ def main(argv: list[str] | None = None) -> int:
                 LOGGER.info("Video: %s", create_video(config, c_start, c_end))
             return 0
 
+        if args.command == "upload":
+            from novel_tts.upload import run_upload
+
+            config = load_novel_config(args.novel_id)
+            start, end = parse_range(args.range)
+            for c_start, c_end, _ in get_translated_ranges(config, start, end):
+                result = run_upload(
+                    config,
+                    c_start,
+                    c_end,
+                    platform=str(args.platform),
+                    dry_run=bool(getattr(args, "dry_run", False)),
+                )
+                LOGGER.info("Upload result: %s", result)
+            return 0
+
         if args.command == "pipeline":
             from novel_tts.crawl import crawl_range
             from novel_tts.media import create_video, generate_visual
             from novel_tts.translate import translate_captions, translate_novel
             from novel_tts.tts import run_tts
+            from novel_tts.upload import run_upload
 
             config = load_novel_config(args.novel_id)
             if args.range:
@@ -996,6 +1032,12 @@ def main(argv: list[str] | None = None) -> int:
             if not args.skip_video:
                 for c_start, c_end, _ in get_translated_ranges(config, start, end):
                     create_video(config, c_start, c_end)
+            if not args.skip_upload:
+                upload_platform = str(
+                    getattr(args, "upload_platform", None) or getattr(config.upload, "default_platform", "youtube")
+                )
+                for c_start, c_end, _ in get_translated_ranges(config, start, end):
+                    run_upload(config, c_start, c_end, platform=upload_platform, dry_run=False)
             return 0
 
         if args.command == "ai-key":

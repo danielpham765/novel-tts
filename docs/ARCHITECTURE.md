@@ -4,13 +4,14 @@
 
 `novel-tts` is a file-oriented CLI pipeline for turning serialized web novels into publishable audio/video assets.
 
-At a high level it does five things:
+At a high level it does six things:
 
 1. Crawl chapter text from supported source sites into local batch files.
 2. Translate those source batches into Vietnamese, either directly or via a Redis-backed queue.
 3. Translate subtitle files separately when captions exist.
 4. Generate audio from translated chapter ranges.
 5. Render a visual layer and mux visual + audio into a final video.
+6. Upload final videos to distribution platforms (YouTube now; TikTok dry-run scaffold).
 
 The codebase is intentionally simple in shape:
 
@@ -78,6 +79,7 @@ Important command families:
 - `tts`
 - `visual`
 - `video`
+- `upload`
 - `pipeline`
 
 The CLI is thin by design. It parses arguments, resolves the novel config once, chooses a log target, and dispatches into a stage service.

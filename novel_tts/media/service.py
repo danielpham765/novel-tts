@@ -30,7 +30,8 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
     output_video = output_dir / f"{range_key}.mp4"
     thumbnail = output_dir / f"{range_key}.png"
     font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
-    part_index = ((start - 1) // 20) + 1
+    episode_batch_size = max(1, int(getattr(config.video, "episode_batch_size", 10) or 10))
+    part_index = ((start - 1) // episode_batch_size) + 1
     filters = ",".join(
         [
             f"drawtext=text='{_esc_drawtext(f'Tập {part_index}')}'{font_arg}:fontcolor=#FFD200:fontsize=48:borderw=4:bordercolor=black:x=10:y=35",

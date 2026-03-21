@@ -21,6 +21,9 @@ from .models import (
     StorageConfig,
     TranslationConfig,
     TtsConfig,
+    UploadConfig,
+    UploadTikTokConfig,
+    UploadYouTubeConfig,
     VideoConfig,
     VisualConfig,
 )
@@ -438,6 +441,25 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         video_raw = {}
     if not isinstance(video_raw, dict):
         raise ValueError('Invalid novel "video" config (expected object)')
+    upload_raw = _deep_merge(app_raw.get("upload", {}) or {}, raw.get("upload", {}) or {})
+    if upload_raw is None:
+        upload_raw = {}
+    if not isinstance(upload_raw, dict):
+        raise ValueError('Invalid novel "upload" config (expected object)')
+    youtube_raw = upload_raw.get("youtube", {}) or {}
+    tiktok_raw = upload_raw.get("tiktok", {}) or {}
+    if not isinstance(youtube_raw, dict):
+        raise ValueError('Invalid "upload.youtube" config (expected object)')
+    if not isinstance(tiktok_raw, dict):
+        raise ValueError('Invalid "upload.tiktok" config (expected object)')
+    default_platform = _clean_text(upload_raw.get("default_platform")) or "youtube"
+    if default_platform not in {"youtube", "tiktok"}:
+        raise ValueError('Invalid "upload.default_platform" (expected "youtube" or "tiktok")')
+    upload_cfg = UploadConfig(
+        default_platform=default_platform,
+        youtube=UploadYouTubeConfig(**youtube_raw),
+        tiktok=UploadTikTokConfig(**tiktok_raw),
+    )
 
     return NovelConfig(
         novel_id=raw["novel_id"],
@@ -462,4 +484,5 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         tts=TtsConfig(**merged_tts_raw),
         visual=VisualConfig(**visual_raw),
         video=VideoConfig(**video_raw),
+        upload=upload_cfg,
     )

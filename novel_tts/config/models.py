@@ -196,6 +196,44 @@ class VideoConfig:
     preset: str = "veryfast"
     crf: int = 28
     audio_bitrate: str = "96k"
+    episode_batch_size: int = 10
+
+
+@dataclass
+class UploadYouTubeConfig:
+    enabled: bool = False
+    credentials_path: str = ".secrets/youtube/client_secrets.json"
+    token_path: str = ".secrets/youtube/token.json"
+    category_id: str = "22"
+    privacy_status: str = "public"
+    self_declared_made_for_kids: bool = False
+    title_file: str = "title.txt"
+    description_file: str = "description.txt"
+    playlist_file: str = "playlist.txt"
+
+
+@dataclass
+class UploadTikTokConfig:
+    enabled: bool = False
+    dry_run: bool = True
+    client_key: str = ""
+    client_secret: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+    account_name: str = ""
+    privacy_level: str = "PUBLIC_TO_EVERYONE"
+    disable_comment: bool = False
+    disable_duet: bool = False
+    disable_stitch: bool = False
+    title_file: str = "title.txt"
+    description_file: str = "description.txt"
+
+
+@dataclass
+class UploadConfig:
+    default_platform: str = "youtube"
+    youtube: UploadYouTubeConfig = field(default_factory=UploadYouTubeConfig)
+    tiktok: UploadTikTokConfig = field(default_factory=UploadTikTokConfig)
 
 
 @dataclass
@@ -225,4 +263,5 @@ class NovelConfig:
     tts: TtsConfig
     visual: VisualConfig
     video: VideoConfig
+    upload: UploadConfig = field(default_factory=UploadConfig)
     proxy_gateway: ProxyGatewayConfig = field(default_factory=ProxyGatewayConfig)

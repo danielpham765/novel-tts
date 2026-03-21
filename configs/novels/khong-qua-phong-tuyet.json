@@ -42,5 +42,13 @@
       "input_file": "caption_cn.srt",
       "output_file": "caption_vn.srt"
     }
+  },
+  "visual": {
+    "background_cover": "background.jpg",
+    "font_file": "",
+    "tag_text": "Đan Tu Chân",
+    "line1": "Tập 1",
+    "line2": "Không Qua Phong Tuyết,",
+    "line3": "Làm Sao Thấy Cầu Vồng?"
   }
 }

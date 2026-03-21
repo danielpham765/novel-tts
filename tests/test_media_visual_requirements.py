@@ -77,3 +77,25 @@ def test_generate_visual_requires_drawtext(tmp_path: Path, monkeypatch: pytest.M
 
     with pytest.raises(RuntimeError, match="drawtext"):
         media_service.generate_visual(config, 1, 10)
+
+
+def test_generate_visual_part_index_uses_video_episode_batch_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    config.video.episode_batch_size = 10
+    config.storage.image_dir.mkdir(parents=True, exist_ok=True)
+    (config.storage.image_dir / config.visual.background_video).write_bytes(b"fake")
+
+    ffmpeg_calls: list[list[str]] = []
+
+    monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
+    monkeypatch.setattr(media_service, "run_ffmpeg", lambda args: ffmpeg_calls.append(args))
+
+    media_service.generate_visual(config, 11, 20)
+
+    assert ffmpeg_calls, "Expected ffmpeg to be invoked"
+    first_call = ffmpeg_calls[0]
+    vf_idx = first_call.index("-vf")
+    filters = first_call[vf_idx + 1]
+    assert "Tập 2" in filters

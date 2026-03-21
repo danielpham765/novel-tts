@@ -56,7 +56,10 @@
     }
   },
   "models": {},
-  "tts": {},
+  "tts": {
+    "server_name": "onPremise",
+    "model_name": "cpu"
+  },
   "visual": {
     "background_video": "background.mp4",
     "font_file": "",
@@ -70,6 +73,7 @@
     "audio_codec": "aac",
     "preset": "veryfast",
     "crf": 28,
-    "audio_bitrate": "96k"
+    "audio_bitrate": "96k",
+    "episode_batch_size": 10
   }
 }

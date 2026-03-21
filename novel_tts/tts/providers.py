@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, cast
 
 from novel_tts.common.logging import get_logger
 from novel_tts.config.models import NovelConfig
@@ -12,14 +12,66 @@ from novel_tts.config.models import NovelConfig
 LOGGER = get_logger(__name__)
 
 
-def _server_configs(root: Path) -> dict[str, dict[str, str]]:
+def _strip_json_comments(raw: str) -> str:
+    """Strip // and /* */ comments outside JSON strings."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    n = len(raw)
+
+    while i < n:
+        ch = raw[i]
+        nxt = raw[i + 1] if i + 1 < n else ""
+
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < n and raw[i] != "\n":
+                i += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (raw[i] == "*" and raw[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, n)
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _load_json_config(path: Path) -> Any:
+    return json.loads(_strip_json_comments(path.read_text(encoding="utf-8")))
+
+
+def _server_configs(root: Path) -> dict[str, str]:
     path = root / "configs" / "providers" / "tts_servers.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return cast(dict[str, str], _load_json_config(path))
 
 
 def _model_configs(root: Path) -> dict[str, list[object]]:
     path = root / "configs" / "providers" / "tts_models.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return cast(dict[str, list[object]], _load_json_config(path))
 
 
 class GradioTtsProvider:

@@ -140,6 +140,36 @@
     "audio_codec": "aac",
     "preset": "veryfast",
     "crf": 28,
-    "audio_bitrate": "96k"
+    "audio_bitrate": "96k",
+    "episode_batch_size": 10
+  },
+  "upload": {
+    "default_platform": "youtube",
+    "youtube": {
+      "enabled": false,
+      "credentials_path": ".secrets/youtube/client_secrets.json",
+      "token_path": ".secrets/youtube/token.json",
+      "category_id": "22",
+      "privacy_status": "public",
+      "self_declared_made_for_kids": false,
+      "title_file": "title.txt",
+      "description_file": "description.txt",
+      "playlist_file": "playlist.txt"
+    },
+    "tiktok": {
+      "enabled": false,
+      "dry_run": true,
+      "client_key": "",
+      "client_secret": "",
+      "access_token": "",
+      "refresh_token": "",
+      "account_name": "",
+      "privacy_level": "PUBLIC_TO_EVERYONE",
+      "disable_comment": false,
+      "disable_duet": false,
+      "disable_stitch": false,
+      "title_file": "title.txt",
+      "description_file": "description.txt"
+    }
   }
 }

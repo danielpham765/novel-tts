@@ -12,6 +12,7 @@
 6. synthesize audio
 7. render visual
 8. mux final video
+9. upload video (YouTube; TikTok dry-run scaffold)
 
 Primary package: `novel_tts`
 

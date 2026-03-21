@@ -68,3 +68,30 @@ queue:
   inflight_ttl_seconds: 3600
   supervisor_interval_seconds: 15
   status_interval_seconds: 60
+
+upload:
+  default_platform: youtube
+  youtube:
+    enabled: true
+    credentials_path: .secrets/youtube/client_secrets.json
+    token_path: .secrets/youtube/token.json
+    category_id: "22"
+    privacy_status: public
+    self_declared_made_for_kids: false
+    title_file: title.txt
+    description_file: description.txt
+    playlist_file: playlist.txt
+  tiktok:
+    enabled: false
+    dry_run: true
+    client_key: ""
+    client_secret: ""
+    access_token: ""
+    refresh_token: ""
+    account_name: ""
+    privacy_level: PUBLIC_TO_EVERYONE
+    disable_comment: false
+    disable_duet: false
+    disable_stitch: false
+    title_file: title.txt
+    description_file: description.txt

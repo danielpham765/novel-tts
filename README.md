@@ -109,6 +109,9 @@ uv run novel-tts queue ps <novel_id>
 uv run novel-tts tts <novel_id> --range <start>-<end>
 uv run novel-tts visual <novel_id> --range <start>-<end>
 uv run novel-tts video <novel_id> --range <start>-<end>
+
+# 8) Upload
+uv run novel-tts upload <novel_id> --platform youtube --range <start>-<end>
 ```
 
 ## Command reference
@@ -303,6 +306,56 @@ Writes final MP4s under `output/<novel_id>/video/`.
 uv run novel-tts video <novel_id> --range 1-10
 ```
 
+### Upload
+
+Uploads rendered videos by range.
+
+- `youtube`: real upload via OAuth local token + YouTube Data API.
+- `tiktok`: dry-run payload/validation only (real API upload is not implemented yet).
+
+YouTube metadata convention:
+
+- `title`: `output/<novel_id>/title.txt`
+- `description`: `output/<novel_id>/description.txt` + `output/<novel_id>/subtitle/chuong_<start>-<end>_menu.txt`
+- `thumbnail`: `output/<novel_id>/visual/chuong_<start>-<end>.png`
+- `playlist`: `output/<novel_id>/playlist.txt`
+- audience: not made for kids
+- visibility: public
+
+```bash
+uv run novel-tts upload <novel_id> --platform youtube --range 1-10
+uv run novel-tts upload <novel_id> --platform youtube --range 1-10 --dry-run
+uv run novel-tts upload <novel_id> --platform tiktok --range 1-10
+```
+
+#### YouTube OAuth setup
+
+Required files:
+
+- `.secrets/youtube/client_secrets.json`
+- `.secrets/youtube/token.json`
+
+Example templates are available at:
+
+- `.secrets/youtube/client_secrets.example.json`
+- `.secrets/youtube/token.example.json`
+
+How to get `client_secrets.json`:
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/).
+2. Create/select a project.
+3. Enable **YouTube Data API v3** in “APIs & Services > Library”.
+4. Configure OAuth consent screen (External/Internal as appropriate), add your account as test user if needed.
+5. Create OAuth client credentials: “APIs & Services > Credentials > Create Credentials > OAuth client ID”.
+6. Choose app type **Desktop app**, then download JSON and save as `.secrets/youtube/client_secrets.json`.
+
+How to get `token.json`:
+
+1. Ensure `upload.youtube.credentials_path` points to `.secrets/youtube/client_secrets.json`.
+2. Run first upload/dry-run command:
+   - `uv run novel-tts upload <novel_id> --platform youtube --range 1-10 --dry-run`
+3. Browser login/consent will open once; after consent, CLI auto-creates `.secrets/youtube/token.json`.
+
 ### Pipeline (end-to-end orchestration)
 
 Runs multiple stages in order for a given range, with optional `--skip-*` flags for iteration.
@@ -310,10 +363,15 @@ Runs multiple stages in order for a given range, with optional `--skip-*` flags 
 Note: the pipeline's translation step uses direct `translate novel`. With a queue-only translation policy, run pipeline
 with `--skip-translate`, translate via `novel-tts queue ...`, and resume the remaining stages.
 
+By default, pipeline now runs upload at the end (using `upload.default_platform`, default `youtube`).
+Use `--skip-upload` to disable or `--upload-platform` to override.
+
 ```bash
 uv run novel-tts pipeline run <novel_id> --range 1-10
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-captions
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-translate
+uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-upload
+uv run novel-tts pipeline run <novel_id> --range 1-10 --upload-platform tiktok
 ```
 
 ## Troubleshooting
