@@ -55,6 +55,16 @@ def _format_click_path(path: Path | None) -> str:
         return str(path)
 
 
+def _apply_tts_cli_overrides(config: NovelConfig, args: argparse.Namespace) -> NovelConfig:
+    server_name = getattr(args, "tts_server_name", None)
+    model_name = getattr(args, "tts_model_name", None)
+    if server_name:
+        config.tts.server_name = str(server_name)
+    if model_name:
+        config.tts.model_name = str(model_name)
+    return config
+
+
 @contextlib.contextmanager
 def _stdin_cbreak_if_tty() -> bool:
     if not sys.stdin.isatty():
@@ -400,6 +410,14 @@ def _build_parser() -> argparse.ArgumentParser:
     tts_parser.add_argument("novel_id")
     tts_parser.add_argument("--range", required=True)
     tts_parser.add_argument(
+        "--tts-server-name",
+        help="Override tts.server_name for this run only.",
+    )
+    tts_parser.add_argument(
+        "--tts-model-name",
+        help="Override tts.model_name for this run only.",
+    )
+    tts_parser.add_argument(
         "--force",
         action="store_true",
         help="Regenerate per-chapter audio even if cached (also refreshes cache when translated text changes).",
@@ -407,7 +425,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     visual_parser = subparsers.add_parser("visual")
     visual_parser.add_argument("novel_id")
-    visual_parser.add_argument("--range", required=True)
+    visual_group = visual_parser.add_mutually_exclusive_group(required=True)
+    visual_group.add_argument("--range")
+    visual_group.add_argument("--chapter", type=int)
 
     video_parser = subparsers.add_parser("video")
     video_parser.add_argument("novel_id")
@@ -549,10 +569,36 @@ def _rate_limit_exit_code(message: str) -> int:
     return 75 if is_429 else 76
 
 
+def _reroute_tts_away_from_uv(raw_argv: list[str]) -> int | None:
+    if not raw_argv or raw_argv[0] != "tts":
+        return None
+    if not os.environ.get("UV_RUN_RECURSION_DEPTH"):
+        return None
+    if os.environ.get("NOVEL_TTS_SKIP_UV_REROUTE") == "1":
+        return None
+
+    repo_root = Path(__file__).resolve().parents[2]
+    entrypoint = repo_root / ".venv" / "bin" / "novel-tts"
+    if not entrypoint.exists():
+        return None
+
+    env = dict(os.environ)
+    env["NOVEL_TTS_SKIP_UV_REROUTE"] = "1"
+    for key in list(env.keys()):
+        if key == "UV" or key.startswith("UV_"):
+            env.pop(key, None)
+    LOGGER.info("Rerouting tts away from uv-run via %s", entrypoint)
+    proc = subprocess.run([str(entrypoint), *raw_argv], cwd=str(repo_root), env=env, check=False)
+    return int(proc.returncode)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if len(raw_argv) >= 2 and raw_argv[0] == "crawl" and raw_argv[1] not in {"run", "verify", "repair", "-h", "--help"}:
         raw_argv.insert(1, "run")
+    rerouted_rc = _reroute_tts_away_from_uv(raw_argv)
+    if rerouted_rc is not None:
+        return rerouted_rc
 
     parser = _build_parser()
     args = parser.parse_args(raw_argv)
@@ -956,6 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
             from novel_tts.tts import run_tts
 
             config = load_novel_config(args.novel_id)
+            config = _apply_tts_cli_overrides(config, args)
             start, end = parse_range(args.range)
             for c_start, c_end, r_key in get_translated_ranges(config, start, end):
                 LOGGER.info(
@@ -965,9 +1012,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "visual":
-            from novel_tts.media import generate_visual
+            from novel_tts.media import generate_visual, generate_visual_for_chapter
 
             config = load_novel_config(args.novel_id)
+            chapter = getattr(args, "chapter", None)
+            if chapter is not None:
+                visual, thumbnail = generate_visual_for_chapter(config, int(chapter))
+                LOGGER.info("Visual video: %s", visual)
+                LOGGER.info("Thumbnail: %s", thumbnail)
+                return 0
+
             start, end = parse_range(args.range)
             for c_start, c_end, _ in get_translated_ranges(config, start, end):
                 visual, thumbnail = generate_visual(config, c_start, c_end)

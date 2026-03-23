@@ -56,10 +56,6 @@
     }
   },
   "models": {},
-  "tts": {
-    "server_name": "onPremise",
-    "model_name": "cpu"
-  },
   "visual": {
     "background_video": "background.mp4",
     "font_file": "",

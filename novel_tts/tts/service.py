@@ -275,6 +275,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         else:
             source_audio = Path(str(result))
         shutil.copyfile(source_audio, output_path)
+        provider.cleanup_output_audio(client, str(source_audio))
         _write_cached_hash(parts_dir, chapter_number, expected_hash)
         elapsed = time.monotonic() - chapter_started_at
         LOGGER.info(

@@ -436,6 +436,7 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     if not isinstance(visual_raw, dict):
         raise ValueError('Invalid novel "visual" config (expected object)')
     visual_raw.setdefault("background_video", "")
+    visual_raw.setdefault("background_cover", "")
     video_raw = raw.get("video", {})
     if video_raw is None:
         video_raw = {}

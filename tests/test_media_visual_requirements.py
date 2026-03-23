@@ -99,3 +99,44 @@ def test_generate_visual_part_index_uses_video_episode_batch_size(
     vf_idx = first_call.index("-vf")
     filters = first_call[vf_idx + 1]
     assert "Tập 2" in filters
+
+
+def test_generate_visual_for_chapter_uses_background_cover(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _make_config(tmp_path)
+    config.visual.background_cover = "background.jpg"
+    config.visual.line1 = "Tập 1"
+    config.visual.line2 = "Không Qua Phong Tuyết,"
+    config.visual.line3 = "Làm Sao Thấy Cầu Vồng?"
+    config.storage.image_dir.mkdir(parents=True, exist_ok=True)
+    (config.storage.image_dir / config.visual.background_cover).write_bytes(b"fake")
+
+    ffmpeg_calls: list[list[str]] = []
+
+    monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
+    monkeypatch.setattr(media_service, "run_ffmpeg", lambda args: ffmpeg_calls.append(args))
+
+    media_service.generate_visual_for_chapter(config, 2)
+
+    assert len(ffmpeg_calls) >= 1
+    first_call = ffmpeg_calls[0]
+    assert "-loop" in first_call
+    assert str(config.storage.image_dir / config.visual.background_cover) in first_call
+    vf_idx = first_call.index("-vf")
+    filters = first_call[vf_idx + 1]
+    assert "pad=iw:ih+220:0:0:color=black" not in filters
+    assert "Tập 2" in filters
+    assert "Không Qua Phong Tuyết," in filters
+    assert "Làm Sao Thấy Cầu Vồng?" in filters
+
+
+def test_generate_visual_for_chapter_requires_valid_cover_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    config.visual.background_cover = "background.gif"
+    config.storage.image_dir.mkdir(parents=True, exist_ok=True)
+    (config.storage.image_dir / config.visual.background_cover).write_bytes(b"fake")
+    monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
+
+    with pytest.raises(ValueError, match=r"\.jpg, \.jpeg, or \.png"):
+        media_service.generate_visual_for_chapter(config, 1)

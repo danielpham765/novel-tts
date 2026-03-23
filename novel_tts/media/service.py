@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import shutil
+import re
 from pathlib import Path
 
 from novel_tts.common.ffmpeg import ffmpeg_has_filter, ffprobe_duration, run_ffmpeg
@@ -13,6 +13,17 @@ def _range_key(start: int, end: int) -> str:
 
 def _esc_drawtext(text: str) -> str:
     return str(text or "").replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _line1_for_chapter(template: str, chapter: int) -> str:
+    text = str(template or "").strip()
+    if not text:
+        return f"Tập {chapter}"
+    if "{chapter}" in text:
+        return text.replace("{chapter}", str(chapter))
+    if re.search(r"\d+", text):
+        return re.sub(r"\d+", str(chapter), text, count=1)
+    return f"{text} {chapter}"
 
 
 def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Path]:
@@ -43,6 +54,64 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
         ]
     )
     run_ffmpeg(["-y", "-i", str(background), "-vf", filters, "-c:a", "copy", str(output_video)])
+    run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", str(thumbnail)])
+    return output_video, thumbnail
+
+
+def generate_visual_for_chapter(config: NovelConfig, chapter: int) -> tuple[Path, Path]:
+    if not ffmpeg_has_filter("drawtext"):
+        raise RuntimeError(
+            "ffmpeg filter 'drawtext' is unavailable. Install an ffmpeg build with drawtext/libfreetype "
+            "support, then verify with: ffmpeg -hide_banner -filters | rg drawtext"
+        )
+    if chapter < 1:
+        raise ValueError("chapter must be >= 1")
+    background_cover = config.storage.image_dir / config.visual.background_cover
+    if not config.visual.background_cover:
+        raise ValueError('Missing visual.background_cover in novel config for --chapter flow')
+    if background_cover.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+        raise ValueError("visual.background_cover must be a .jpg, .jpeg, or .png file")
+    if not background_cover.exists():
+        raise FileNotFoundError(f"Background cover image not found: {background_cover}")
+
+    range_key = _range_key(chapter, chapter)
+    output_dir = config.storage.visual_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_video = output_dir / f"{range_key}.mp4"
+    thumbnail = output_dir / f"{range_key}.png"
+    font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
+    line1_text = _line1_for_chapter(config.visual.line1, chapter)
+
+    # Render all lines inside the cover image area.
+    filters = ",".join(
+        [
+            f"scale={int(config.visual.render_width)}:-2",
+            f"drawtext=text='{_esc_drawtext(line1_text)}'{font_arg}:fontcolor=#FFD200:fontsize=56:borderw=6:bordercolor=black:x=(w-text_w)/2 - 150:y=20",
+            f"drawtext=text='{_esc_drawtext(config.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=42:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-180",
+            f"drawtext=text='{_esc_drawtext(config.visual.line3)}'{font_arg}:fontcolor=white:fontsize=36:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-120",
+        ]
+    )
+
+    run_ffmpeg(
+        [
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            str(background_cover),
+            "-vf",
+            filters,
+            "-t",
+            "1",
+            "-r",
+            "30",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_video),
+        ]
+    )
     run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", str(thumbnail)])
     return output_video, thumbnail
 

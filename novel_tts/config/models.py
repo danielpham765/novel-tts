@@ -181,6 +181,7 @@ class TtsConfig:
 @dataclass
 class VisualConfig:
     background_video: str
+    background_cover: str = ""
     font_file: str = ""
     tag_text: str = ""
     line1: str = ""

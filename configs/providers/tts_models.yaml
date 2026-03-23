@@ -1,0 +1,46 @@
+# Toplevel key = value dùng cho `tts.model_name`.
+# Đổi tên key ở đây thì phải set `tts.model_name` tương ứng trong config novel / CLI flag.
+#
+# Các field bắt buộc:
+# - backbone: tên model backend để gọi `/load_model`
+#   UI hiện thấy các option:
+#   - `VieNeu-TTS (GPU)`
+#   - `VieNeu-TTS-0.3B (GPU)`
+#   - `VieNeu-TTS-q8-gguf`
+#   - `VieNeu-TTS-q4-gguf`
+#   - `VieNeu-TTS-0.3B-q4-gguf`
+#   - `VieNeu-TTS-0.3B-q8-gguf`
+#   - `Custom Model`
+# - codec: tên codec / inference pipeline đúng theo label mà Gradio server expose
+#   UI hiện thấy các option:
+#   - `NeuCodec (Standard)`
+#   - `NeuCodec (Distill)`
+#   - `NeuCodec ONNX (Fast CPU)`
+# - device: thiết bị chạy model; các giá trị đang dùng trong repo là `MPS`, `CPU`
+# - base_model: tên model gốc đúng theo label mà Gradio server expose
+#
+# Các field tùy chọn:
+# - use_lmdeploy: `true` | `false`
+# - custom_model_id: dùng khi `backbone` = `Custom Model`, ngược lại để `""`
+# - hf_token: để `""` nếu server không cần Hugging Face token
+#
+# Các profile hiện có:
+# - `macos`: ưu tiên chất lượng cao nhất cho Apple Silicon mạnh (ví dụ M2 Max / M3 Max)
+# - `cpu`: chạy bằng CPU / on-prem hoặc máy không có GPU phù hợp
+macos:
+  # Preset cho Mac Studio M2 Max 32 GB: ưu tiên chất lượng tối đa hơn tốc độ.
+  backbone: "VieNeu-TTS (GPU)"
+  codec: "NeuCodec (Standard)"
+  device: "MPS"
+  use_lmdeploy: false
+  custom_model_id: ""
+  base_model: "VieNeu-TTS (GPU)"
+  hf_token: ""
+cpu:
+  backbone: "VieNeu-TTS-q8-gguf"
+  codec: "NeuCodec (Standard)"
+  device: "CPU"
+  use_lmdeploy: false
+  custom_model_id: ""
+  base_model: "VieNeu-TTS (GPU)"
+  hf_token: ""

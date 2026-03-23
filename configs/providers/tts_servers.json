@@ -1,5 +1,0 @@
-{
-  "local": "http://127.0.0.1:7860/",
-  // "onPremise": "http://192.168.2.1:7860/"
-  "onPremise": "https://tts.aquafox.io/"
-}

@@ -199,7 +199,7 @@ When editing with Cursor, keep these **hard constraints** in mind:
    - Do not convert operations into all-or-nothing behaviors that delete partial results.
 5. **External tool assumptions**
   - FFmpeg/FFprobe availability and CLI flags.
-  - Gradio TTS server and model settings from `configs/providers/*.json`.
+  - Gradio TTS server and model settings from `configs/providers/*.yaml`.
   - Redis presence for queue mode.
   - `quota-supervisor` should be running for queue translation (it grants central quota requests and publishes ETA hints used by `queue ps-all`).
 

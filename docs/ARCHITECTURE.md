@@ -683,8 +683,21 @@ Current provider support:
 
 Provider runtime dependencies:
 
-- a reachable Gradio server URL from `configs/providers/tts_servers.json`
-- model payload in `configs/providers/tts_models.json`
+- a reachable Gradio server URL from `configs/providers/tts_servers.yaml`
+- model payload in `configs/providers/tts_models.yaml`
+
+`tts_models.yaml` uses an explicit mapping per model. Each entry must define:
+
+- `backbone`
+- `codec`
+- `device`
+- `base_model`
+
+Optional fields:
+
+- `use_lmdeploy`
+- `custom_model_id`
+- `hf_token`
 
 ## Media Subsystem
 

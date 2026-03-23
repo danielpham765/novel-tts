@@ -108,6 +108,7 @@ uv run novel-tts queue ps <novel_id>
 # 7) TTS + media
 uv run novel-tts tts <novel_id> --range <start>-<end>
 uv run novel-tts visual <novel_id> --range <start>-<end>
+uv run novel-tts visual <novel_id> --chapter <chapter>
 uv run novel-tts video <novel_id> --range <start>-<end>
 
 # 8) Upload
@@ -296,6 +297,7 @@ Generates the visual layer under `output/<novel_id>/visual/` (typically requires
 
 ```bash
 uv run novel-tts visual <novel_id> --range 1-10
+uv run novel-tts visual <novel_id> --chapter 1
 ```
 
 ### Video
