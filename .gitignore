@@ -10,4 +10,5 @@ tmp/
 debug/
 .logs/
 .secrets/
+.stignore
 image/
