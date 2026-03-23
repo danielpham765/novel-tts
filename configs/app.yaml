@@ -45,7 +45,8 @@ models:
 
 tts:
   provider: gradio_vie_tts
-  voice: Ly
+  # voice: Ly
+  voice: Doan
   server_name: local
   model_name: macos
   generation_mode: Standard (Một lần)

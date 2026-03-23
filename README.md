@@ -289,6 +289,7 @@ Reads `input/<novel_id>/translated/chuong_<start>-<end>.txt` and writes audio as
 ```bash
 uv run novel-tts tts <novel_id> --range 1-10
 uv run novel-tts tts <novel_id> --range 1-10 --force
+uv run novel-tts tts <novel_id> --range 701-800 --tts-server-name onPremise --tts-model-name cpu
 ```
 
 ### Visual

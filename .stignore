@@ -1,0 +1,3 @@
+(?d)output/**/*.mp4
+(?d)output/**/*.mp3
+(?d)output/**/*.wav
