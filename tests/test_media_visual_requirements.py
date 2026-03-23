@@ -86,6 +86,8 @@ def test_generate_visual_part_index_uses_video_episode_batch_size(
     config.video.episode_batch_size = 10
     config.storage.image_dir.mkdir(parents=True, exist_ok=True)
     (config.storage.image_dir / config.visual.background_video).write_bytes(b"fake")
+    (config.storage.root / "image").mkdir(parents=True, exist_ok=True)
+    (config.storage.root / "image" / "channel-name.png").write_bytes(b"fake")
 
     ffmpeg_calls: list[list[str]] = []
 
@@ -96,9 +98,25 @@ def test_generate_visual_part_index_uses_video_episode_batch_size(
 
     assert ffmpeg_calls, "Expected ffmpeg to be invoked"
     first_call = ffmpeg_calls[0]
-    vf_idx = first_call.index("-vf")
-    filters = first_call[vf_idx + 1]
+    filter_idx = first_call.index("-filter_complex")
+    filters = first_call[filter_idx + 1]
     assert "Tập 2" in filters
+    assert "scale=-1:114[channel]" in filters
+    assert "overlay=x=W-w-10:y=35" in filters
+    assert str(config.storage.root / "image" / "channel-name.png") in first_call
+    assert "-an" in first_call
+    assert "0:a?" not in first_call
+
+
+def test_generate_visual_requires_channel_name_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _make_config(tmp_path)
+    config.storage.image_dir.mkdir(parents=True, exist_ok=True)
+    (config.storage.image_dir / config.visual.background_video).write_bytes(b"fake")
+
+    monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
+
+    with pytest.raises(FileNotFoundError, match="channel-name.png"):
+        media_service.generate_visual(config, 1, 10)
 
 
 def test_generate_visual_for_chapter_uses_background_cover(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -29,7 +29,7 @@
 # - `cpu`: chạy bằng CPU / on-prem hoặc máy không có GPU phù hợp
 macos:
   # Preset cho Mac Studio M2 Max 32 GB: ưu tiên chất lượng tối đa hơn tốc độ.
-  backbone: "VieNeu-TTS (GPU)"
+  backbone: "VieNeu-TTS-q8-gguf"
   codec: "NeuCodec (Standard)"
   device: "MPS"
   use_lmdeploy: false

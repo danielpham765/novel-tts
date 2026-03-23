@@ -36,6 +36,9 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
     background = config.storage.image_dir / config.visual.background_video
     if not background.exists():
         raise FileNotFoundError(f"Background video not found: {background}")
+    channel_name_image = config.storage.root / "image" / "channel-name.png"
+    if not channel_name_image.exists():
+        raise FileNotFoundError(f"Channel name image not found: {channel_name_image}")
     output_dir = config.storage.visual_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     output_video = output_dir / f"{range_key}.mp4"
@@ -43,17 +46,35 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
     font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
     episode_batch_size = max(1, int(getattr(config.video, "episode_batch_size", 10) or 10))
     part_index = ((start - 1) // episode_batch_size) + 1
-    filters = ",".join(
+    drawtext_filters = ",".join(
         [
             f"drawtext=text='{_esc_drawtext(f'Tập {part_index}')}'{font_arg}:fontcolor=#FFD200:fontsize=48:borderw=4:bordercolor=black:x=10:y=35",
             f"drawtext=text='{_esc_drawtext(f'Chương {start} -> {end}')}'{font_arg}:fontcolor=white:fontsize=32:borderw=4:bordercolor=black:x=10:y=95",
-            f"drawtext=text='{_esc_drawtext(config.visual.tag_text)}'{font_arg}:fontcolor=#FFD200:fontsize=36:borderw=4:bordercolor=black:x=w-text_w-20:y=35",
             f"drawtext=text='{_esc_drawtext(config.visual.line1)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-200",
             f"drawtext=text='{_esc_drawtext(config.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-130",
             f"drawtext=text='{_esc_drawtext(config.visual.line3)}'{font_arg}:fontcolor=white:fontsize=30:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-60",
         ]
     )
-    run_ffmpeg(["-y", "-i", str(background), "-vf", filters, "-c:a", "copy", str(output_video)])
+    filter_complex = (
+        f"[0:v]{drawtext_filters}[base];"
+        f"[1:v]scale=-1:114[channel];"
+        f"[base][channel]overlay=x=W-w-5:y=10[v]"
+    )
+    run_ffmpeg(
+        [
+            "-y",
+            "-i",
+            str(background),
+            "-i",
+            str(channel_name_image),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[v]",
+            "-an",
+            str(output_video),
+        ]
+    )
     run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", str(thumbnail)])
     return output_video, thumbnail
 

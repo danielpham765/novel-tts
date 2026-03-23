@@ -114,5 +114,7 @@ tests/test_translation_prompt_glossary_budget.py
 tests/test_ttkan_resolver.py
 tests/test_tts_cache_invalidation_and_force.py
 tests/test_tts_provider_config_jsonc.py
+tests/test_upload_config_loader.py
 tests/test_upload_flags.py
 tests/test_upload_service.py
+tests/test_visual_flags.py
