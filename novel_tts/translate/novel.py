@@ -1649,6 +1649,39 @@ def load_chapter_map(config: NovelConfig, source_path: Path) -> dict[str, str]:
     return {chapter_num: chapter_text for chapter_num, chapter_text in load_source_chapters(config, source_path)}
 
 
+def _source_chapter_has_title(config: NovelConfig, source_text: str) -> bool:
+    match = re.search(config.translation.chapter_regex, source_text, flags=re.M)
+    if match is None:
+        return False
+    try:
+        title = match.group(2)
+    except IndexError:
+        return False
+    return bool(str(title or "").strip())
+
+
+def _normalize_translated_chapter_text(
+    config: NovelConfig,
+    chapter_num: str,
+    source_text: str,
+    translated_text: str,
+) -> str:
+    cleaned = (translated_text or "").strip()
+    if not cleaned:
+        return ""
+    if not _source_chapter_has_title(config, source_text):
+        return cleaned + "\n"
+
+    from .polish import normalize_text
+
+    return normalize_text(
+        cleaned,
+        chapter_num,
+        config.translation.polish_replacements,
+        force_title_fold=True,
+    )
+
+
 def _generate_once(provider, model: str, prompt: str) -> str:
     return strip_model_wrappers(provider.generate(model, prompt))
 
@@ -2135,11 +2168,14 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
         else:
             # No hash yet: fall back to mtime (migration behavior).
             needs_translate = part_path.stat().st_mtime < source_path.stat().st_mtime
+    existing_text = part_path.read_text(encoding="utf-8", errors="replace") if part_path.exists() else ""
     if needs_translate:
         text = translate_unit(config, unit_key, source_text)
-        part_path.write_text(text, encoding="utf-8")
     else:
-        text = part_path.read_text(encoding="utf-8", errors="replace")
+        text = existing_text
+    text = _normalize_translated_chapter_text(config, chapter_num, source_text, text)
+    if needs_translate or text != existing_text:
+        part_path.write_text(text, encoding="utf-8")
 
     if config.translation.auto_update_glossary and (pending_glossary or needs_translate):
         update_glossary_from_chapter(
@@ -2156,13 +2192,14 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
 def rebuild_translated_file(config: NovelConfig, source_path: Path, require_complete: bool = True) -> Path | None:
     chapters = load_source_chapters(config, source_path)
     merged_parts: list[str] = []
-    for chapter_num, _chapter_text in chapters:
+    for chapter_num, chapter_text in chapters:
         part_path = chapter_part_path(config, source_path, chapter_num)
         if not part_path.exists():
             if require_complete:
                 return None
             continue
-        merged_parts.append(part_path.read_text(encoding="utf-8").strip())
+        part_text = part_path.read_text(encoding="utf-8")
+        merged_parts.append(_normalize_translated_chapter_text(config, chapter_num, chapter_text, part_text).strip())
     if require_complete and len(merged_parts) != len(chapters):
         return None
     if not merged_parts:

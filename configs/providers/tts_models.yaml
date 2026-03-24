@@ -16,7 +16,7 @@
 #   - `NeuCodec (Standard)`
 #   - `NeuCodec (Distill)`
 #   - `NeuCodec ONNX (Fast CPU)`
-# - device: thiết bị chạy model; các giá trị đang dùng trong repo là `MPS`, `CPU`
+# - device: thiết bị chạy model; các giá trị đang dùng trong repo là `MPS`, `CPU`, `CUDA`
 # - base_model: tên model gốc đúng theo label mà Gradio server expose
 #
 # Các field tùy chọn:
@@ -27,6 +27,7 @@
 # Các profile hiện có:
 # - `macos`: ưu tiên chất lượng cao nhất cho Apple Silicon mạnh (ví dụ M2 Max / M3 Max)
 # - `cpu`: chạy bằng CPU / on-prem hoặc máy không có GPU phù hợp
+# - `gpu`: chạy bằng NVIDIA CUDA GPU; preset hiện tune cho Tesla T4 + máy host ít CPU
 macos:
   # Preset cho Mac Studio M2 Max 32 GB: ưu tiên chất lượng tối đa hơn tốc độ.
   backbone: "VieNeu-TTS-q8-gguf"
@@ -40,6 +41,16 @@ cpu:
   backbone: "VieNeu-TTS-q8-gguf"
   codec: "NeuCodec (Standard)"
   device: "CPU"
+  use_lmdeploy: false
+  custom_model_id: ""
+  base_model: "VieNeu-TTS (GPU)"
+  hf_token: ""
+gpu:
+  # Preset cho máy 4 vCPU + NVIDIA Tesla T4:
+  # dùng backend GPU native để tránh kéo tải sang CPU như GGUF/CPU.
+  backbone: "VieNeu-TTS (GPU)"
+  codec: "NeuCodec (Standard)"
+  device: "CUDA"
   use_lmdeploy: false
   custom_model_id: ""
   base_model: "VieNeu-TTS (GPU)"

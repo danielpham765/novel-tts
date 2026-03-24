@@ -136,3 +136,35 @@ def test_translate_chapter_skips_translation_but_runs_glossary_when_pending(
 
     payload = json.loads(marker_path.read_text(encoding="utf-8"))
     assert payload.get("status") == "done"
+
+
+def test_translate_chapter_folds_translated_title_inline_when_source_has_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    config.translation.auto_update_glossary = False
+    origin_path = _write_origin_ch1(config)
+
+    monkeypatch.setattr(
+        novel_translate,
+        "translate_unit",
+        lambda *_args, **_kwargs: "Chương 1:\n\nTát vào Mặt\nỪm?\n",
+    )
+
+    out_path = novel_translate.translate_chapter(config, origin_path, "1", force=True)
+
+    assert out_path.read_text(encoding="utf-8") == "Chương 1: Tát vào Mặt.\n\nỪm?\n"
+
+
+def test_rebuild_translated_file_folds_existing_split_title_when_source_has_title(tmp_path: Path) -> None:
+    config = _make_config(tmp_path)
+    config.translation.auto_update_glossary = False
+    origin_path = _write_origin_ch1(config)
+    part_path = novel_translate.chapter_part_path(config, origin_path, "1")
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path.write_text("Chương 1:\n\nTát vào Mặt\nỪm?\n", encoding="utf-8")
+
+    rebuilt = novel_translate.rebuild_translated_file(config, origin_path, require_complete=True)
+
+    assert rebuilt is not None
+    assert rebuilt.read_text(encoding="utf-8") == "Chương 1: Tát vào Mặt.\n\nỪm?\n"

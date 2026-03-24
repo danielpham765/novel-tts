@@ -17,6 +17,17 @@ from novel_tts.config.models import NovelConfig
 
 LOGGER = get_logger(__name__)
 
+_STANDARD_GENERATION_MODE = "Standard (Một lần)"
+_STREAMING_GENERATION_MODE = "Streaming (Real-time)"
+
+
+class TtsModelNotReadyError(RuntimeError):
+    """Raised when the TTS server says the model has not been loaded yet."""
+
+
+class TtsModelLoadError(RuntimeError):
+    """Raised when the TTS server fails to load the requested model."""
+
 
 @dataclass(frozen=True)
 class TtsModelConfig:
@@ -134,6 +145,28 @@ class GradioTtsProvider:
     def _normalized_model_payload(self) -> list[object]:
         return self.model_config.as_gradio_payload()
 
+    @staticmethod
+    def _normalize_generation_mode(value: object) -> str:
+        text = str(value or "").strip()
+        normalized = text.casefold()
+        if not normalized:
+            return _STANDARD_GENERATION_MODE
+        if normalized in {
+            _STANDARD_GENERATION_MODE.casefold(),
+            "standard",
+            "standard_once",
+            "preset_mode",
+        }:
+            return _STANDARD_GENERATION_MODE
+        if normalized in {
+            _STREAMING_GENERATION_MODE.casefold(),
+            "streaming",
+            "real-time",
+            "realtime",
+        }:
+            return _STREAMING_GENERATION_MODE
+        return text
+
     def connect(self):
         from gradio_client import Client
         import httpcore
@@ -173,7 +206,78 @@ class GradioTtsProvider:
         raise last_exc
 
     def load_model(self, client) -> None:
-        client.predict(*self._normalized_model_payload(), api_name="/load_model")
+        result = client.predict(*self._normalized_model_payload(), api_name="/load_model")
+        status_message = self._extract_load_model_status(result)
+        if status_message:
+            normalized = status_message.lower()
+            if ("✅ model đã tải thành công" in normalized) or ("backend:" in normalized and "codec:" in normalized):
+                LOGGER.info(
+                    "TTS load model response | server=%s model=%s status=%s",
+                    self.config.tts.server_name,
+                    self.config.tts.model_name,
+                    status_message.replace("\n", " | "),
+                )
+                return
+            if ("❌" in status_message) or ("lỗi" in normalized):
+                raise TtsModelLoadError(status_message)
+        LOGGER.warning(
+            "TTS load model returned unexpected response | server=%s model=%s result=%r",
+            self.config.tts.server_name,
+            self.config.tts.model_name,
+            result,
+        )
+
+    @staticmethod
+    def _extract_load_model_status(result: Any) -> str | None:
+        if isinstance(result, (list, tuple)) and result:
+            text = str(result[0] or "").strip()
+            return text or None
+        if isinstance(result, str):
+            text = result.strip()
+            return text or None
+        return None
+
+    def _load_model_with_retry(self, client, *, reason: str | None = None) -> None:
+        if reason:
+            LOGGER.info(
+                "TTS load model | server=%s model=%s reason=%s",
+                self.config.tts.server_name,
+                self.config.tts.model_name,
+                reason,
+            )
+        else:
+            LOGGER.info("TTS load model | server=%s model=%s", self.config.tts.server_name, self.config.tts.model_name)
+        self.load_model(client)
+
+    @staticmethod
+    def _extract_audio_path(result: Any) -> str:
+        if isinstance(result, dict):
+            path = result.get("path")
+            if path:
+                return str(path)
+        elif isinstance(result, (list, tuple)) and result:
+            path = result[0]
+            if path:
+                return str(path)
+        elif isinstance(result, str) and result.strip():
+            return result
+        raise RuntimeError(f"Invalid TTS result: {result}")
+
+    @staticmethod
+    def _extract_model_not_ready_message(result: Any) -> str | None:
+        values: list[Any]
+        if isinstance(result, dict):
+            values = list(result.values())
+        elif isinstance(result, (list, tuple)):
+            values = list(result)
+        else:
+            values = [result]
+        for value in values:
+            text = str(value or "").strip()
+            normalized = text.lower()
+            if ("tải model trước" in normalized) or ("load model" in normalized and "first" in normalized):
+                return text
+        return None
 
     def cleanup_output_audio(self, client, source_path: str) -> None:
         try:
@@ -238,36 +342,63 @@ class GradioTtsProvider:
                 LOGGER.info("TTS job update | %s", message)
 
     def synthesize(self, client, text: str, progress_callback: Callable[[str], None] | None = None) -> str:
-        job = client.submit(
-            text,
-            self.config.tts.voice,
-            None,
-            "",
-            self.config.tts.generation_mode,
-            self.config.tts.use_batch,
-            self.config.tts.max_batch_size_run,
-            self.config.tts.temperature,
-            self.config.tts.max_chars_chunk,
-            api_name="/synthesize_speech",
-        )
-        last_heartbeat = time.monotonic()
-        while not job.done():
+        max_attempts = 3
+        retry_delay_seconds = 2.0
+        generation_mode = self._normalize_generation_mode(self.config.tts.generation_mode)
+        for attempt in range(1, max_attempts + 1):
+            job = client.submit(
+                text,
+                self.config.tts.voice,
+                None,
+                "",
+                generation_mode,
+                self.config.tts.use_batch,
+                self.config.tts.max_batch_size_run,
+                self.config.tts.temperature,
+                self.config.tts.max_chars_chunk,
+                api_name="/synthesize_speech",
+            )
+            last_heartbeat = time.monotonic()
+            while not job.done():
+                self._drain_job_updates(job, progress_callback)
+                now = time.monotonic()
+                if (now - last_heartbeat) >= 60:
+                    status = job.status()
+                    code = getattr(getattr(status, "code", None), "value", None) or str(
+                        getattr(status, "code", "unknown")
+                    )
+                    if progress_callback is not None:
+                        progress_callback(f"WAITING | latest_status={code}")
+                    else:
+                        LOGGER.info("TTS job waiting | latest_status=%s", code)
+                    last_heartbeat = now
+                time.sleep(1)
+            result = job.result()
             self._drain_job_updates(job, progress_callback)
-            now = time.monotonic()
-            if (now - last_heartbeat) >= 60:
-                status = job.status()
-                code = getattr(getattr(status, "code", None), "value", None) or str(getattr(status, "code", "unknown"))
-                if progress_callback is not None:
-                    progress_callback(f"WAITING | latest_status={code}")
-                else:
-                    LOGGER.info("TTS job waiting | latest_status=%s", code)
-                last_heartbeat = now
-            time.sleep(1)
-        result = job.result()
-        self._drain_job_updates(job, progress_callback)
-        if not result or not result[0]:
-            raise RuntimeError(f"Invalid TTS result: {result}")
-        return result[0]
+            try:
+                return self._extract_audio_path(result)
+            except RuntimeError:
+                model_not_ready_message = self._extract_model_not_ready_message(result)
+                if model_not_ready_message is None:
+                    raise
+                if attempt >= max_attempts:
+                    raise TtsModelNotReadyError(
+                        f"TTS server still reported model not ready after {max_attempts} attempts: "
+                        f"{model_not_ready_message}"
+                    )
+                LOGGER.warning(
+                    "TTS synthesize requested before model became ready | server=%s model=%s attempt=%s/%s message=%s",
+                    self.config.tts.server_name,
+                    self.config.tts.model_name,
+                    attempt,
+                    max_attempts,
+                    model_not_ready_message,
+                )
+                self._load_model_with_retry(client, reason="server-reported-model-not-ready")
+                time.sleep(retry_delay_seconds)
+        raise TtsModelNotReadyError(
+            f"TTS server never became ready after {max_attempts} attempts for model {self.config.tts.model_name}"
+        )
 
 
 def get_tts_provider(config: NovelConfig) -> GradioTtsProvider:

@@ -182,6 +182,9 @@ uv run novel-tts translate polish <novel_id> --range 101-500
 uv run novel-tts translate polish <novel_id> --file chuong_1-10.txt
 ```
 
+`translate polish` loads exact-match replacements from `configs/polish_replacement/common.json`
+plus `configs/polish_replacement/<novel_id>.json`, with novel-specific entries overriding common keys.
+
 ### Queue (distributed translation via Redis)
 
 Queue translation produces the same on-disk artifacts as direct translation: `.parts` and rebuilt `translated` batch files.
@@ -375,6 +378,7 @@ uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-captio
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-translate
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-upload
 uv run novel-tts pipeline run <novel_id> --range 1-10 --upload-platform tiktok
+uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-translate --skip-captions --skip-tts
 ```
 
 ## Troubleshooting

@@ -91,6 +91,9 @@ class _DummyProvider:
         source_audio.write_bytes(f"wav:{self.calls}".encode("utf-8"))
         return {"path": str(source_audio)}
 
+    def cleanup_output_audio(self, _client, _path: str) -> None:
+        return None
+
 
 def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _make_config(tmp_path)
@@ -117,6 +120,7 @@ def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypa
     assert (audio_dir / ".parts" / "chapter_1.wav").exists()
     assert (audio_dir / ".parts" / "file-list.txt").exists()
     assert not (audio_dir / "file-list.txt").exists()
+    assert (config.storage.subtitle_dir / "chuong_1-1_menu.txt").read_text(encoding="utf-8") == "00:00:00 Chương 1 - A"
 
     # Cached (hash matches).
     tts_service.run_tts(config, 1, 1)

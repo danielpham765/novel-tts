@@ -26,7 +26,7 @@ def test_normalize_text_keeps_intentional_single_word_emphasis() -> None:
 
 def test_normalize_text_replaces_haizz() -> None:
     raw = "Haizz, đúng là mệt.\n"
-    out = normalize_text(raw, chapter_num="1")
+    out = normalize_text(raw, chapter_num="1", replacements={"Haizz": "Hầy"})
 
     assert "Hầy" in out
     assert "Haizz" not in out

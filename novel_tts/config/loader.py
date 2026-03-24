@@ -52,6 +52,42 @@ def _glossary_path(novel_id: str) -> Path:
     return _root_dir() / "configs" / "glossaries" / f"{novel_id}.json"
 
 
+def _polish_replacement_path(name: str) -> Path:
+    return _root_dir() / "configs" / "polish_replacement" / f"{name}.json"
+
+
+def _load_string_map(path: Path, *, allow_missing: bool = False, label: str = "config") -> dict[str, str]:
+    if not path.exists():
+        if allow_missing:
+            return {}
+        raise FileNotFoundError(f"{label} not found: {path}")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid {label} format: expected JSON object in {path}")
+
+    cleaned: dict[str, str] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(f"Invalid {label} entry: expected string-to-string map in {path}")
+        cleaned[key] = value
+    return cleaned
+
+
+def _load_polish_replacements(novel_id: str) -> dict[str, str]:
+    common = _load_string_map(
+        _polish_replacement_path("common"),
+        allow_missing=True,
+        label="polish replacement config",
+    )
+    by_novel = _load_string_map(
+        _polish_replacement_path(novel_id),
+        allow_missing=True,
+        label=f"polish replacement config for {novel_id}",
+    )
+    return {**common, **by_novel}
+
+
 def _clean_text(value) -> str:
     """
     Normalize config/env values that should be treated as optional strings.
@@ -405,6 +441,7 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     else:
         translation_raw.setdefault("glossary", {})
         translation_raw["glossary_file"] = glossary_file
+    translation_raw["polish_replacements"] = _load_polish_replacements(novel_id)
     if "REPAIR_MODE" in os.environ:
         translation_raw["repair_mode"] = os.environ["REPAIR_MODE"].strip().lower() in {"1", "true", "yes"}
 

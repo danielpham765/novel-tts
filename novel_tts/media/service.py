@@ -57,7 +57,7 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
     )
     filter_complex = (
         f"[0:v]{drawtext_filters}[base];"
-        f"[1:v]scale=-1:114[channel];"
+        f"[1:v]scale=-1:80[channel];"
         f"[base][channel]overlay=x=W-w-5:y=10[v]"
     )
     run_ffmpeg(

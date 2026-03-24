@@ -144,7 +144,7 @@ def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[di
         label = f"Chương {chapter['number']}"
         if chapter.get("title"):
             label += f" - {chapter['title']}"
-        lines.append(f"{timestamp} - {label}")
+        lines.append(f"{timestamp} {label}")
         current_time += duration
     menu_path.write_text("\n".join(lines), encoding="utf-8")
     return menu_path

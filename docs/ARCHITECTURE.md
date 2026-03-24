@@ -479,6 +479,9 @@ It does not share the full chapter translation repair stack.
 
 This is especially relevant for novels with persistent naming inconsistencies.
 
+Exact-match polish replacements are loaded from `configs/polish_replacement/common.json` and
+`configs/polish_replacement/<novel_id>.json`, then merged with novel-specific entries taking precedence.
+
 ### Repair (scan + requeue)
 
 `translate repair` is a queue-oriented operator command implemented in `novel_tts/translate/repair.py`.
