@@ -20,6 +20,7 @@ from novel_tts.config.models import (
     VisualConfig,
 )
 from novel_tts.tts import service as tts_service
+from novel_tts.tts.providers import TtsAudioResult
 
 
 def _make_config(tmp_path: Path) -> NovelConfig:
@@ -93,6 +94,9 @@ class _DummyProvider:
 
     def cleanup_output_audio(self, _client, _path: str) -> None:
         return None
+
+    def materialize_output_audio(self, _client, result) -> TtsAudioResult:
+        return TtsAudioResult(local_path=Path(result["path"]), cleanup_target=None)
 
 
 def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

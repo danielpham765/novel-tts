@@ -7,13 +7,31 @@ File-first Python CLI pipeline for crawling serialized web novels, translating t
 
 ## Table of contents
 
+- [What this repo does](#what-this-repo-does)
 - [Quick start](#quick-start)
-- [Prerequisites](#prerequisites)
+- [Requirements](#requirements)
 - [Configuration](#configuration)
-- [Storage layout (important invariants)](#storage-layout-important-invariants)
-- [Recommended workflow (queue translation)](#recommended-workflow-queue-translation)
+- [Storage contract and invariants](#storage-contract-and-invariants)
+- [Recommended workflows](#recommended-workflows)
 - [Command reference](#command-reference)
 - [Troubleshooting](#troubleshooting)
+
+## What this repo does
+
+At a high level, `novel-tts` supports this pipeline:
+
+1. Crawl source chapters into `input/<novel_id>/origin/*.txt`
+2. Translate chapters into canonical per-chapter outputs under `input/<novel_id>/.parts/`
+3. Rebuild merged translated files under `input/<novel_id>/translated/*.txt`
+4. Generate TTS audio under `output/<novel_id>/audio/`
+5. Generate visual assets under `output/<novel_id>/visual/`
+6. Mux final MP4s under `output/<novel_id>/video/`
+7. Upload outputs to supported platforms
+
+Important operational note:
+
+- translation policy should normally be queue-first
+- direct `translate novel` is mainly for debugging and small one-off runs
 
 ## Quick start
 
@@ -22,66 +40,114 @@ uv sync
 uv run novel-tts --help
 ```
 
-Tip: all commands support `--log-file /path/to/file.log` at the top level.
+Tip:
 
-## Prerequisites
+- all commands support top-level `--log-file /path/to/file.log`
 
-- Python: `3.10`
-- Package manager: `uv`
-- For crawl (when needed): Playwright + Chromium
-  - `uv run playwright install chromium`
-- For queue translation: Redis (defaults in `configs/app.yaml`: `127.0.0.1:6379`, db `1`, prefix `novel_tts`)
-- For media rendering: `ffmpeg` + `ffprobe`
-- For the current TTS path: a reachable Gradio TTS server (configured in your app/novel config)
+## Requirements
+
+Base requirements:
+
+- Python `3.10`
+- `uv`
+
+Optional / stage-specific requirements:
+
+- crawl:
+  - Playwright + Chromium
+  - install with `uv run playwright install chromium`
+- queue translation:
+  - Redis
+  - default config in `configs/app.yaml`: host `127.0.0.1`, port `6379`, db `1`, prefix `novel_tts`
+- media rendering:
+  - `ffmpeg`
+  - `ffprobe`
+- current TTS path:
+  - a reachable Gradio TTS server configured in app/novel config
 
 ## Configuration
 
-### Config files
+### Main config files
 
-- Novel configs: `configs/novels/*.json`
-- Source configs: `configs/sources/*.json`
-- Per-novel glossaries: `configs/glossaries/*.json`
-- App defaults (models/queue, etc.): `configs/app.yaml`
+- novel configs: `configs/novels/*.json`
+- source configs: `configs/sources/*.json`
+- per-novel glossaries: `configs/glossaries/*.json`
+- app defaults: `configs/app.yaml`
+- polish replacements:
+  - `configs/polish_replacement/common.json`
+  - `configs/polish_replacement/<novel_id>.json`
+- TTS provider catalogs:
+  - `configs/providers/tts_servers.yaml`
+  - `configs/providers/tts_models.yaml`
 
-### Secrets / API keys
+### Secrets and API keys
 
-Queue workers read Gemini API keys from `.secrets/gemini-keys.txt` (one key per line).
-For one-off direct translation runs, `GEMINI_API_KEY` from env still works. If it is unset, direct translate
-commands fall back to the first non-empty key in `.secrets/gemini-keys.txt`.
+Gemini:
 
-If you use OpenAI as a provider, set `OPENAI_API_KEY`.
+- queue workers read API keys from `.secrets/gemini-keys.txt`
+- use one key per line
+- direct translation can still use `GEMINI_API_KEY`
+- if `GEMINI_API_KEY` is unset, direct Gemini translation falls back to the first non-empty line in `.secrets/gemini-keys.txt`
 
-## Storage layout (important invariants)
+OpenAI:
 
-This repo is intentionally file-first: stages communicate via the filesystem under `input/<novel_id>/` and `output/<novel_id>/`.
+- set `OPENAI_API_KEY`
 
-**Translation truth is on disk:**
+YouTube:
 
-- Canonical per-chapter state: `input/<novel_id>/.parts/<batch>/*.txt`
-- Derived (rebuildable) merged outputs: `input/<novel_id>/translated/*.txt`
+- OAuth secrets and token live under `.secrets/youtube/`
 
-**Crawl outputs:**
+## Storage contract and invariants
 
-- Crawled source batches: `input/<novel_id>/origin/*.txt`
-- Resumable crawl/translation state: `input/<novel_id>/.progress/*`
+This repo is intentionally file-first: stages communicate through files under `input/<novel_id>/` and `output/<novel_id>/`.
 
-**Media outputs:**
+### Translation truth lives on disk
 
-- Audio: `output/<novel_id>/audio/<range>/*`
-- Visual layer: `output/<novel_id>/visual/*`
-- Final MP4: `output/<novel_id>/video/*`
+- canonical per-chapter state:
+  - `input/<novel_id>/.parts/<batch>/*.txt`
+- derived merged outputs:
+  - `input/<novel_id>/translated/*.txt`
 
-**Heading convention (do not casually change):**
+`translated/*.txt` is rebuildable from `.parts` and should not be treated as the primary source of truth.
 
-- Crawl/origin headings are typically ASCII: `Chuong <n> ...`
-- Translated/TTS headings are typically Vietnamese: `Chương <n> ...`
+### Crawl outputs
 
-Changing headings affects chapter splitting, translation rebuild, and downstream TTS/media assets.
+- crawled source batches:
+  - `input/<novel_id>/origin/*.txt`
+- resumable state:
+  - `input/<novel_id>/.progress/*`
 
-## Recommended workflow (queue translation)
+### Media outputs
 
-Translation policy: use the Redis-backed queue for translation for all novels.
-Avoid running direct `translate novel` except for debugging/small one-off experiments.
+- audio:
+  - `output/<novel_id>/audio/<range>/*`
+- visual:
+  - `output/<novel_id>/visual/*`
+- final video:
+  - `output/<novel_id>/video/*`
+
+### Heading convention
+
+Do not casually change heading formats:
+
+- crawl/origin headings are typically ASCII:
+  - `Chuong <n> ...`
+- translated/TTS headings are typically Vietnamese:
+  - `Chương <n> ...`
+
+Changing headings affects:
+
+- chapter splitting
+- translated file rebuild
+- TTS chapter detection
+- subtitle/menu generation
+- downstream media assets
+
+## Recommended workflows
+
+### Recommended queue-first workflow
+
+Use this as the default production workflow.
 
 ```bash
 # 1) Crawl
@@ -90,43 +156,60 @@ uv run novel-tts crawl run <novel_id> --range <start>-<end>
 # 2) Verify crawled files (does not recrawl)
 uv run novel-tts crawl verify <novel_id> --range <start>-<end>
 
-# 3) Start the global quota supervisor (required for waiting-quota to make progress)
+# 3) Start the global quota supervisor
 uv run novel-tts quota-supervisor
-# or: uv run novel-tts quota-supervisor -d
+# or:
+uv run novel-tts quota-supervisor -d
 
-# 4) Launch queue stack for a novel (supervisor + workers)
+# 4) Launch queue stack for a novel
 uv run novel-tts queue launch <novel_id>
 
-# 5) Enqueue chapters for translation (repeat as needed)
+# 5) Enqueue chapters for translation
 uv run novel-tts queue add <novel_id> --range <start>-<end>
+# or:
 uv run novel-tts queue add <novel_id> --all
 
-# 6) Monitor progress / inspect process state
+# 6) Monitor progress
 uv run novel-tts queue monitor <novel_id>
 uv run novel-tts queue ps <novel_id>
 
 # 7) TTS + media
 uv run novel-tts tts <novel_id> --range <start>-<end>
 uv run novel-tts visual <novel_id> --range <start>-<end>
-uv run novel-tts visual <novel_id> --chapter <chapter>
 uv run novel-tts video <novel_id> --range <start>-<end>
 
 # 8) Upload
 uv run novel-tts upload <novel_id> --platform youtube --range <start>-<end>
-
-# Optional: end-to-end pipeline
-uv run novel-tts pipeline run <novel_id> --range <start>-<end>
-
-# Process downstream media stage-by-stage across the whole range (default)
-uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-stage
-
-# Process each translated video batch end-to-end: tts -> visual -> video -> upload
-uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-video
 ```
 
-For YouTube uploads, the uploader can pace requests in batches using `upload.youtube.upload_batch_size`
-and `upload.youtube.upload_batch_sleep_seconds` in config. This is helpful because Google documents
-daily quota-unit costs clearly, but shorter burst limits are not published as a simple RPM/RP5M rule.
+Queue-first guidance:
+
+- prefer queue translation for normal work
+- avoid direct `translate novel` except for debugging or very small runs
+- `quota-supervisor` should be running whenever queue workers need quota progress
+
+### Optional end-to-end pipeline workflow
+
+`pipeline run` is useful for orchestration, but note:
+
+- its translation step uses direct `translate novel`
+- if you want queue-only translation, run queue translation separately and use `pipeline run --skip-translate`
+
+Examples:
+
+```bash
+# End-to-end range
+uv run novel-tts pipeline run <novel_id> --range <start>-<end>
+
+# Queue-first style: skip translate in pipeline
+uv run novel-tts pipeline run <novel_id> --range <start>-<end> --skip-translate
+
+# Downstream media stage-by-stage across a large range
+uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-stage
+
+# Process each translated batch end-to-end
+uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-video
+```
 
 ## Command reference
 
@@ -134,7 +217,11 @@ daily quota-unit costs clearly, but shorter burst limits are not published as a 
 
 Writes crawled batches to `input/<novel_id>/origin/*.txt` and resumable state under `input/<novel_id>/.progress/`.
 
-Backward compatible: `novel-tts crawl <novel_id> ...` is treated as `novel-tts crawl run <novel_id> ...`.
+Backward compatibility:
+
+- `novel-tts crawl <novel_id> ...` is treated as `novel-tts crawl run <novel_id> ...`
+
+#### `crawl run`
 
 ```bash
 # Crawl a chapter range
@@ -143,171 +230,152 @@ uv run novel-tts crawl run <novel_id> --range 1-10
 # Same, but with explicit bounds
 uv run novel-tts crawl run <novel_id> --from 1 --to 10
 
-# Optional: override directory URL (useful when source changes)
+# Override directory URL if needed
 uv run novel-tts crawl run <novel_id> --range 1-10 --dir-url 'https://...'
 ```
 
-### Crawl verify
+#### `crawl verify`
 
-Sanity-checks already-crawled origin files (does not recrawl). Useful before translation/TTS.
-`--file` is interpreted as a filename under `input/<novel_id>/origin/` and can be specified multiple times.
+Sanity-checks already-crawled origin files. It does not recrawl.
+
+`--file` is interpreted as a filename under `input/<novel_id>/origin/` and can be repeated.
 
 ```bash
-# Verify an entire range
 uv run novel-tts crawl verify <novel_id> --range 1-10
-
-# Verify a specific origin batch file (filename under input/<novel_id>/origin/)
 uv run novel-tts crawl verify <novel_id> --file chuong_1-10.txt
 ```
 
-### Translate (direct, debug only)
+### Translate
 
-Direct translation translates `input/<novel_id>/origin/*.txt` chapter-by-chapter, writes canonical per-chapter outputs
-under `input/<novel_id>/.parts/`, and rebuilds `input/<novel_id>/translated/*.txt`.
+#### Direct translation (`translate novel`) is debug-oriented
+
+Direct translation:
+
+- reads `input/<novel_id>/origin/*.txt`
+- writes canonical chapter outputs under `input/<novel_id>/.parts/`
+- rebuilds `input/<novel_id>/translated/*.txt`
 
 ```bash
 # Translate all discovered origin batches
 uv run novel-tts translate novel <novel_id>
 
-# Translate only one origin batch file (filename under input/<novel_id>/origin/)
+# Translate one origin batch file
 uv run novel-tts translate novel <novel_id> --file chuong_1-10.txt
 
-# Re-translate even if parts already exist (use with care)
+# Re-translate even if parts already exist
 uv run novel-tts translate novel <novel_id> --file chuong_1-10.txt --force
 ```
 
-Translate a single chapter (used by queue workers; also useful for debugging):
+#### `translate chapter`
+
+Used by queue workers, and also useful for debugging:
 
 ```bash
 uv run novel-tts translate chapter <novel_id> --file chuong_1-10.txt --chapter 7
 ```
 
-Translate captions (SRT) when they exist under `input/<novel_id>/captions/`:
+#### `translate captions`
+
+Translates captions when they exist under `input/<novel_id>/captions/`:
 
 ```bash
 uv run novel-tts translate captions <novel_id>
 ```
 
-Run a polish/cleanup pass on translated outputs:
+#### `translate polish`
+
+Runs a cleanup pass on translated outputs:
 
 ```bash
 uv run novel-tts translate polish <novel_id> --range 101-500
 uv run novel-tts translate polish <novel_id> --file chuong_1-10.txt
 ```
 
-`translate polish` loads exact-match replacements from `configs/polish_replacement/common.json`
-plus `configs/polish_replacement/<novel_id>.json`, with novel-specific entries overriding common keys.
+`translate polish` loads exact-match replacements from:
 
-### Queue (distributed translation via Redis)
+- `configs/polish_replacement/common.json`
+- `configs/polish_replacement/<novel_id>.json`
 
-Queue translation produces the same on-disk artifacts as direct translation: `.parts` and rebuilt `translated` batch files.
+Novel-specific entries override common keys.
 
-`queue launch` reads `.secrets/gemini-keys.txt` and spawns a supervisor + workers for the configured models.
+### Queue
 
-Queue workers use a centralized quota gate (central quota v2) to coordinate rate-limit / quota waits across processes.
+Queue translation produces the same on-disk artifacts as direct translation:
 
-### YouTube
+- `.parts`
+- rebuilt `translated` batch files
 
-Inspect accessible YouTube playlists using the configured OAuth credentials in `configs/app.yaml` / `.secrets/youtube/`.
+`queue launch` reads `.secrets/gemini-keys.txt` and spawns:
 
-```bash
-# List all accessible playlists with metadata
-uv run novel-tts youtube playlist
+- a supervisor
+- a status monitor
+- workers for configured models/keys
 
-# List only playlist ids and titles
-uv run novel-tts youtube playlist --title-only
-
-# Fetch one playlist by id or full playlist URL
-uv run novel-tts youtube playlist --id PLxxxxxxxx
-uv run novel-tts youtube playlist --id 'https://www.youtube.com/playlist?list=PLxxxxxxxx'
-
-# List all uploaded videos with metadata
-uv run novel-tts youtube video
-
-# List only video ids and titles
-uv run novel-tts youtube video --title-only
-
-# Fetch one video by id
-uv run novel-tts youtube video --id xxxxxxxx
-
-# Review current video metadata, preview changed fields, confirm y/n, then update
-uv run novel-tts youtube video update --id xxxxxxxx --title 'New title'
-uv run novel-tts youtube video update --id xxxxxxxx --description 'New description'
-uv run novel-tts youtube video update --id xxxxxxxx --privacy_status private
-uv run novel-tts youtube video update --id xxxxxxxx --made_for_kids true
-uv run novel-tts youtube video update --id xxxxxxxx --playlist_position 7
-
-# Touch the video without changing fields
-uv run novel-tts youtube video update --id xxxxxxxx
-
-# Rewrite the playlist link on uploaded YouTube video descriptions
-uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index
-uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index --range 1-150
-
-# Review current metadata, preview the update, confirm y/n, then update
-uv run novel-tts youtube playlist update --id PLxxxxxxxx --title 'New title'
-uv run novel-tts youtube playlist update --id PLxxxxxxxx --description 'New description'
-uv run novel-tts youtube playlist update --id PLxxxxxxxx --privacy-status private
-
-# Touch the playlist without changing fields (forces an update request/re-index attempt)
-uv run novel-tts youtube playlist update --id PLxxxxxxxx
-```
+Queue workers use the centralized quota gate (central quota v2) to coordinate rate-limit and quota waits across processes.
 
 #### Quota supervisor (global)
 
-`quota-supervisor` is a global helper process (not per-novel). It manages Redis-backed quota grants/ETAs that queue workers rely on.
+`quota-supervisor` is global, not per-novel.
 
-Run it in a separate terminal whenever you use queue mode. Without it, jobs can get stuck in `waiting-quota` and appear to “do nothing” even though the queue stack is running.
+Run it in a separate terminal whenever you use queue mode. Without it, jobs can remain in `waiting-quota` and appear stalled.
 
 ```bash
-# Foreground (recommended while debugging)
+# Foreground
 uv run novel-tts quota-supervisor
 
-# Background daemon (best-effort detach). Logs: .logs/quota-supervisor.log
+# Background daemon
 uv run novel-tts quota-supervisor -d
 
-# Stop / restart the background quota supervisor
+# Stop / restart the background daemon
 uv run novel-tts quota-supervisor --stop
 uv run novel-tts quota-supervisor --restart
 ```
 
-#### Command semantics
+#### Queue process control
 
-- Process control commands (`launch`, `ps`, `monitor`, `stop`, etc.) manage the running queue stack.
-- Scheduling commands (`add`, `repair`) only enqueue jobs into Redis. They do not start workers; if the queue stack is not running, nothing will change on disk.
+Process-control commands manage running queue processes.
 
 ```bash
-# One-shot: launch the whole queue stack for a novel
+# Launch queue stack
 uv run novel-tts queue launch <novel_id>
 uv run novel-tts queue launch <novel_id> --restart
-uv run novel-tts queue launch <novel_id> --add-queue   # also scans + enqueues all chapters that still need work
+uv run novel-tts queue launch <novel_id> --add-queue
 
 # Monitor/status
+uv run novel-tts queue monitor <novel_id>
 uv run novel-tts queue ps <novel_id>
 uv run novel-tts queue ps <novel_id> --all
 uv run novel-tts queue ps-all
 uv run novel-tts queue ps-all --all -f
-uv run novel-tts queue monitor <novel_id>
 
-# Stop queue processes for a novel (keeps Redis state)
+# Stop queue processes for a novel
 uv run novel-tts queue stop <novel_id>
 uv run novel-tts queue stop <novel_id> --role supervisor,worker
 uv run novel-tts queue stop <novel_id> --pid 1234
 ```
 
-#### Queue add (enqueue chapters)
+#### Queue scheduling commands
 
-Enqueue chapters for translation. You must pass exactly one of `--range` or `--all`. Use `--force` to re-translate.
+Scheduling commands enqueue work into Redis. They do not start workers.
+
+If the queue stack is not running, nothing will change on disk.
+
+#### `queue add`
+
+Enqueue chapters for translation. Pass exactly one of `--range`, `--chapters`, `--repair-report`, or `--all`.
+
+Use `--force` to re-translate.
 
 ```bash
 uv run novel-tts queue add <novel_id> --range 2001-2500
 uv run novel-tts queue add <novel_id> --range 2004-2016 --force
+uv run novel-tts queue add <novel_id> --chapters 1205,1214
 uv run novel-tts queue add <novel_id> --all
 ```
 
-#### Queue reset-key (clear stuck key state)
+#### `queue reset-key`
 
-Reset per-key Redis state (cooldown/quota/throttle) when a key gets stuck.
+Reset per-key Redis state when a key gets stuck in cooldown/quota/throttle state.
 
 ```bash
 uv run novel-tts queue reset-key <novel_id> --key k5
@@ -316,13 +384,18 @@ uv run novel-tts queue reset-key <novel_id> --key k5,k6 --model gemma-3-27b-it,g
 uv run novel-tts queue reset-key <novel_id> --all
 ```
 
-#### Queue repair (scan + requeue broken chapters)
+#### `queue repair`
 
-Scans a chapter range and enqueues only the broken chapters back into the queue (force re-translate).
-This is designed for cases where outputs contain placeholder tokens like `ZXQ1156QXZ`/`QZX...QXZ`, residual Han,
-missing/empty parts, or stale parts (origin is newer than the part).
+Scans a chapter range and enqueues only broken chapters back into the queue with force re-translate behavior.
 
-If you don’t see any changes on disk after running this, ensure the queue stack is running (e.g. `queue launch`) and watch progress via `queue monitor`.
+Typical reasons:
+
+- placeholder tokens like `ZXQ1156QXZ` / `QZX...QXZ`
+- residual Han text
+- missing or empty parts
+- stale parts where origin is newer
+
+If you do not see changes on disk after running this, ensure the queue stack is running and watch progress via `queue monitor`.
 
 ```bash
 uv run novel-tts queue repair <novel_id> --range 1401-1410
@@ -332,6 +405,7 @@ uv run novel-tts queue repair <novel_id> --all
 ### AI key telemetry
 
 Reads `.secrets/gemini-keys.txt` and inspects Redis metrics emitted by queue workers.
+
 Raw keys are never printed.
 
 ```bash
@@ -345,9 +419,11 @@ uv run novel-tts ai-key ps --filter-raw "$GEMINI_API_KEY"
 
 Reads `input/<novel_id>/translated/chuong_<start>-<end>.txt` and writes audio assets under `output/<novel_id>/audio/<range>/`.
 
-- Per-chapter WAVs are written under `output/<novel_id>/audio/<range>/.parts/` (the range folder stays clean, containing mostly the merged MP3).
-- TTS caches per-chapter text hashes under `output/<novel_id>/audio/<range>/.parts/.cache/` to avoid re-synthesizing when text is unchanged.
-- If the translated text changes, the chapter will be re-synthesized even without `--force`.
+Behavior notes:
+
+- per-chapter WAVs are written under `output/<novel_id>/audio/<range>/.parts/`
+- per-chapter text hashes are cached under `output/<novel_id>/audio/<range>/.parts/.cache/`
+- if translated text changes, the chapter will be re-synthesized even without `--force`
 
 ```bash
 uv run novel-tts tts <novel_id> --range 1-10
@@ -357,7 +433,7 @@ uv run novel-tts tts <novel_id> --range 701-800 --tts-server-name onPremise --tt
 
 ### Visual
 
-Generates the visual layer under `output/<novel_id>/visual/` (typically requires audio for the same range).
+Generates the visual layer under `output/<novel_id>/visual/`.
 
 ```bash
 uv run novel-tts visual <novel_id> --range 1-10
@@ -376,23 +452,40 @@ uv run novel-tts video <novel_id> --range 1-10
 
 Uploads rendered videos by range.
 
-- `youtube`: real upload via OAuth local token + YouTube Data API.
-- `tiktok`: dry-run payload/validation only (real API upload is not implemented yet).
+Platforms:
+
+- `youtube`: real upload via OAuth local token + YouTube Data API
+- `tiktok`: dry-run payload/validation only
 
 YouTube metadata convention:
 
-- `title`: `output/<novel_id>/title.txt`
-- `description`: `output/<novel_id>/description.txt` + `output/<novel_id>/subtitle/chuong_<start>-<end>_menu.txt`
-- `thumbnail`: `output/<novel_id>/visual/chuong_<start>-<end>.png`
-- `playlist`: `output/<novel_id>/playlist.txt`
-- audience: not made for kids
-- visibility: public
+- title:
+  - `output/<novel_id>/title.txt`
+- description:
+  - `output/<novel_id>/description.txt`
+  - plus `output/<novel_id>/subtitle/chuong_<start>-<end>_menu.txt`
+- thumbnail:
+  - `output/<novel_id>/visual/chuong_<start>-<end>.png`
+- playlist:
+  - `output/<novel_id>/playlist.txt`
+
+Default audience/visibility:
+
+- not made for kids
+- public
 
 ```bash
 uv run novel-tts upload <novel_id> --platform youtube --range 1-10
 uv run novel-tts upload <novel_id> --platform youtube --range 1-10 --dry-run
 uv run novel-tts upload <novel_id> --platform tiktok --range 1-10
 ```
+
+YouTube upload pacing can be tuned with:
+
+- `upload.youtube.upload_batch_size`
+- `upload.youtube.upload_batch_sleep_seconds`
+
+This helps smooth bursts even though Google mainly documents daily quota units rather than short-window limits.
 
 #### YouTube OAuth setup
 
@@ -401,7 +494,7 @@ Required files:
 - `.secrets/youtube/client_secrets.json`
 - `.secrets/youtube/token.json`
 
-Example templates are available at:
+Example templates:
 
 - `.secrets/youtube/client_secrets.example.json`
 - `.secrets/youtube/token.example.json`
@@ -409,28 +502,65 @@ Example templates are available at:
 How to get `client_secrets.json`:
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/).
-2. Create/select a project.
-3. Enable **YouTube Data API v3** in “APIs & Services > Library”.
-4. Configure OAuth consent screen (External/Internal as appropriate), add your account as test user if needed.
-5. Create OAuth client credentials: “APIs & Services > Credentials > Create Credentials > OAuth client ID”.
-6. Choose app type **Desktop app**, then download JSON and save as `.secrets/youtube/client_secrets.json`.
+2. Create or select a project.
+3. Enable `YouTube Data API v3`.
+4. Configure the OAuth consent screen.
+5. Create OAuth client credentials as a Desktop app.
+6. Download the JSON and save it as `.secrets/youtube/client_secrets.json`.
 
 How to get `token.json`:
 
 1. Ensure `upload.youtube.credentials_path` points to `.secrets/youtube/client_secrets.json`.
-2. Run first upload/dry-run command:
+2. Run a first upload or dry-run command:
    - `uv run novel-tts upload <novel_id> --platform youtube --range 1-10 --dry-run`
-3. Browser login/consent will open once; after consent, CLI auto-creates `.secrets/youtube/token.json`.
+3. Complete the browser login/consent flow once.
+4. The CLI will create `.secrets/youtube/token.json`.
 
-### Pipeline (end-to-end orchestration)
+### YouTube admin commands
+
+Inspect accessible YouTube playlists and videos using configured OAuth credentials.
+
+```bash
+# Playlists
+uv run novel-tts youtube playlist
+uv run novel-tts youtube playlist --title-only
+uv run novel-tts youtube playlist --id PLxxxxxxxx
+uv run novel-tts youtube playlist --id 'https://www.youtube.com/playlist?list=PLxxxxxxxx'
+
+# Playlist update
+uv run novel-tts youtube playlist update --id PLxxxxxxxx --title 'New title'
+uv run novel-tts youtube playlist update --id PLxxxxxxxx --description 'New description'
+uv run novel-tts youtube playlist update --id PLxxxxxxxx --privacy-status private
+uv run novel-tts youtube playlist update --id PLxxxxxxxx
+
+# Videos
+uv run novel-tts youtube video
+uv run novel-tts youtube video --title-only
+uv run novel-tts youtube video --id xxxxxxxx
+
+# Video update
+uv run novel-tts youtube video update --id xxxxxxxx --title 'New title'
+uv run novel-tts youtube video update --id xxxxxxxx --description 'New description'
+uv run novel-tts youtube video update --id xxxxxxxx --privacy_status private
+uv run novel-tts youtube video update --id xxxxxxxx --made_for_kids true
+uv run novel-tts youtube video update --id xxxxxxxx --playlist_position 7
+uv run novel-tts youtube video update --id xxxxxxxx
+
+# Rewrite playlist links in uploaded video descriptions
+uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index
+uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index --range 1-150
+```
+
+### Pipeline
 
 Runs multiple stages in order for a given range, with optional `--skip-*` flags for iteration.
 
-Note: the pipeline's translation step uses direct `translate novel`. With a queue-only translation policy, run pipeline
-with `--skip-translate`, translate via `novel-tts queue ...`, and resume the remaining stages.
+By default, pipeline runs upload at the end using `upload.default_platform` (default `youtube`).
 
-By default, pipeline now runs upload at the end (using `upload.default_platform`, default `youtube`).
-Use `--skip-upload` to disable or `--upload-platform` to override.
+Use:
+
+- `--skip-upload` to disable upload
+- `--upload-platform` to override platform
 
 ```bash
 uv run novel-tts pipeline run <novel_id> --range 1-10
@@ -445,21 +575,22 @@ uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-transl
 
 ### Crawl issues
 
-- If a source blocks plain HTTP, use Playwright fallback by installing the runtime:
+- if a source blocks plain HTTP, install Playwright runtime:
   - `uv run playwright install chromium`
 
 ### Queue issues
 
-- If `waiting-quota` never progresses, ensure the global quota supervisor is running:
-  - `uv run novel-tts quota-supervisor` (or `-d`)
-- If a specific key gets stuck in cooldown/quota state:
+- if `waiting-quota` never progresses, ensure the global quota supervisor is running:
+  - `uv run novel-tts quota-supervisor`
+  - or `uv run novel-tts quota-supervisor -d`
+- if a specific key gets stuck in cooldown/quota state:
   - `uv run novel-tts queue reset-key <novel_id> --key kN [--model ...]`
-- If translated outputs look poisoned (placeholders / residual Han / missing parts):
+- if translated outputs look poisoned:
   - `uv run novel-tts queue repair <novel_id> --range <start>-<end>`
 
-### Command help
+### Built-in help
 
-When in doubt, rely on the built-in CLI help (kept accurate by the codebase):
+When in doubt, rely on CLI help:
 
 ```bash
 uv run novel-tts --help

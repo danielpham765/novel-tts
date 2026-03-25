@@ -270,12 +270,16 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
             chunk,
             progress_callback=_throttled_progress,
         )
-        if isinstance(result, dict) and "path" in result:
-            source_audio = Path(result["path"])
-        else:
-            source_audio = Path(str(result))
-        shutil.copyfile(source_audio, output_path)
-        provider.cleanup_output_audio(client, str(source_audio))
+        audio_result = provider.materialize_output_audio(client, result)
+        try:
+            shutil.copyfile(audio_result.local_path, output_path)
+        finally:
+            try:
+                if audio_result.local_path.is_file() and audio_result.local_path.parent == (config.storage.tmp_dir / "tts_downloads"):
+                    audio_result.local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        provider.cleanup_output_audio(client, audio_result.cleanup_target)
         _write_cached_hash(parts_dir, chapter_number, expected_hash)
         elapsed = time.monotonic() - chapter_started_at
         LOGGER.info(

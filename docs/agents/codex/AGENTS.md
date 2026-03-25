@@ -102,6 +102,14 @@ Logs:
 
 - `.logs/<novel>/`
 
+## Codex Workflows
+
+Workflow docs live in `docs/agents/codex/workflows/`.
+
+Current workflows:
+
+- `update-project-docs.md`
+
 ## Main Modules
 
 ### CLI

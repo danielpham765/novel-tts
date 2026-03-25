@@ -4,12 +4,14 @@ import asyncio
 import os
 import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, cast
-from urllib.parse import urlparse
+from urllib.parse import quote, urljoin, urlparse
 
+import httpx
 import yaml
 
 from novel_tts.common.logging import get_logger
@@ -27,6 +29,12 @@ class TtsModelNotReadyError(RuntimeError):
 
 class TtsModelLoadError(RuntimeError):
     """Raised when the TTS server fails to load the requested model."""
+
+
+@dataclass(frozen=True)
+class TtsAudioResult:
+    local_path: Path
+    cleanup_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,14 +178,13 @@ class GradioTtsProvider:
     def connect(self):
         from gradio_client import Client
         import httpcore
-        import httpx
 
         attempts = 4
         delay_seconds = 1.0
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return Client(self.server_url, verbose=False)
+                return Client(self.server_url, verbose=False, download_files=False)
             except (httpx.ConnectError, httpcore.ConnectError, OSError) as exc:
                 last_exc = exc
                 debug_snapshot = _network_debug_snapshot(self.server_url)
@@ -250,18 +257,100 @@ class GradioTtsProvider:
         self.load_model(client)
 
     @staticmethod
-    def _extract_audio_path(result: Any) -> str:
+    def _extract_audio_reference(result: Any) -> dict[str, Any] | str:
         if isinstance(result, dict):
             path = result.get("path")
             if path:
-                return str(path)
+                return cast(dict[str, Any], result)
         elif isinstance(result, (list, tuple)) and result:
             path = result[0]
             if path:
+                if isinstance(path, dict):
+                    return cast(dict[str, Any], path)
                 return str(path)
         elif isinstance(result, str) and result.strip():
             return result
         raise RuntimeError(f"Invalid TTS result: {result}")
+
+    @staticmethod
+    def _resolve_output_audio_url(client, audio_ref: dict[str, Any] | str) -> str | None:
+        if isinstance(audio_ref, dict):
+            url = str(audio_ref.get("url") or "").strip()
+            if url:
+                if url.startswith(("http://", "https://")):
+                    return url
+                return urljoin(client.src_prefixed, url.lstrip("/"))
+            path = str(audio_ref.get("path") or "").strip()
+        else:
+            path = str(audio_ref).strip()
+        if not path or Path(path).exists():
+            return None
+        return urljoin(client.src_prefixed, f"file={quote(path)}")
+
+    def materialize_output_audio(self, client, audio_ref: dict[str, Any] | str) -> TtsAudioResult:
+        if isinstance(audio_ref, dict):
+            path = str(audio_ref.get("path") or "").strip()
+            cleanup_target = self._build_cleanup_target(path)
+            orig_name = str(audio_ref.get("orig_name") or "").strip()
+        else:
+            path = str(audio_ref).strip()
+            cleanup_target = self._build_cleanup_target(path)
+            orig_name = ""
+
+        source_path = Path(path) if path else None
+        if source_path is not None and source_path.exists():
+            return TtsAudioResult(local_path=source_path, cleanup_target=cleanup_target)
+
+        download_url = self._resolve_output_audio_url(client, audio_ref)
+        if not download_url:
+            raise RuntimeError(f"Unable to resolve output audio download URL from TTS result: {audio_ref!r}")
+
+        suffix = Path(orig_name or path or "audio.wav").suffix or ".wav"
+        temp_dir = self.config.storage.tmp_dir / "tts_downloads"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=temp_dir, prefix="tts_", suffix=suffix, delete=False) as handle:
+            temp_path = Path(handle.name)
+            with httpx.stream(
+                "GET",
+                download_url,
+                headers=client.headers,
+                cookies=client.cookies,
+                verify=client.ssl_verify,
+                follow_redirects=True,
+                **client.httpx_kwargs,
+            ) as response:
+                response.raise_for_status()
+                for chunk in response.iter_bytes():
+                    handle.write(chunk)
+        return TtsAudioResult(local_path=temp_path, cleanup_target=cleanup_target)
+
+    @staticmethod
+    def _build_cleanup_target(raw_path: str) -> str | None:
+        path = str(raw_path or "").strip()
+        if not path:
+            return None
+        if "file=" in path:
+            path = path.split("file=", 1)[1].strip()
+
+        normalized = path.replace("\\", "/").strip("/")
+        if not normalized:
+            return None
+
+        parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
+        if not parts:
+            return None
+
+        filename = parts[-1]
+        if not (filename.startswith("tts_output_") or filename.startswith("tts_stream_")):
+            return None
+
+        if len(parts) >= 3 and parts[-3] == "gradio":
+            return f"{parts[-2]}/{filename}"
+        if len(parts) >= 2 and parts[-2] == "output_audio":
+            return filename
+        if len(parts) >= 2:
+            return f"{parts[-2]}/{filename}"
+        return filename
 
     @staticmethod
     def _extract_model_not_ready_message(result: Any) -> str | None:
@@ -279,14 +368,16 @@ class GradioTtsProvider:
                 return text
         return None
 
-    def cleanup_output_audio(self, client, source_path: str) -> None:
+    def cleanup_output_audio(self, client, cleanup_target: str | None) -> None:
+        if not cleanup_target:
+            return
         try:
-            client.predict(source_path, api_name="/delete_output_audio")
+            client.predict(cleanup_target, api_name="/delete_output_audio")
         except Exception as exc:
             LOGGER.warning(
-                "TTS cleanup API unavailable or failed | server=%s path=%s error=%s",
+                "TTS cleanup API unavailable or failed | server=%s cleanup_target=%s error=%s",
                 self.server_url,
-                source_path,
+                cleanup_target,
                 exc,
             )
 
@@ -341,7 +432,9 @@ class GradioTtsProvider:
             else:
                 LOGGER.info("TTS job update | %s", message)
 
-    def synthesize(self, client, text: str, progress_callback: Callable[[str], None] | None = None) -> str:
+    def synthesize(
+        self, client, text: str, progress_callback: Callable[[str], None] | None = None
+    ) -> dict[str, Any] | str:
         max_attempts = 3
         retry_delay_seconds = 2.0
         generation_mode = self._normalize_generation_mode(self.config.tts.generation_mode)
@@ -376,7 +469,7 @@ class GradioTtsProvider:
             result = job.result()
             self._drain_job_updates(job, progress_callback)
             try:
-                return self._extract_audio_path(result)
+                return self._extract_audio_reference(result)
             except RuntimeError:
                 model_not_ready_message = self._extract_model_not_ready_message(result)
                 if model_not_ready_message is None:

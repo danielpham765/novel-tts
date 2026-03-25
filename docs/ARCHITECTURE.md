@@ -2,26 +2,42 @@
 
 ## Purpose
 
-`novel-tts` is a file-oriented CLI pipeline for turning serialized web novels into publishable audio/video assets.
+`novel-tts` is a file-first Python CLI for turning serialized web novels into Vietnamese audio and video deliverables.
 
-At a high level it does six things:
+Today the repo supports these major flows:
 
-1. Crawl chapter text from supported source sites into local batch files.
-2. Translate those source batches into Vietnamese, either directly or via a Redis-backed queue.
-3. Translate subtitle files separately when captions exist.
-4. Generate audio from translated chapter ranges.
-5. Render a visual layer and mux visual + audio into a final video.
-6. Upload final videos to distribution platforms (YouTube now; TikTok dry-run scaffold).
+1. Crawl source chapters from supported sites into local batch files.
+2. Translate crawled batches chapter-by-chapter into Vietnamese.
+3. Optionally translate captions (`.srt`) as a separate input stream.
+4. Coordinate distributed translation workers through Redis.
+5. Coordinate shared RPM/TPM/RPD limits through a global quota supervisor.
+6. Inspect per-key telemetry for Gemini usage.
+7. Generate TTS audio from translated chapter ranges.
+8. Render visual assets and mux final MP4 videos.
+9. Upload outputs to YouTube, plus TikTok dry-run scaffolding.
 
-The codebase is intentionally simple in shape:
+The architecture stays intentionally simple:
 
-- one Python package: `novel_tts`
-- one CLI entrypoint: `novel_tts.cli.main`
-- per-stage service modules instead of a large framework
-- filesystem as the primary state store
-- Redis only for queue + quota bookkeeping (translation truth still lives on disk)
+- One package: `novel_tts`
+- One CLI entrypoint: `novel_tts.cli.main`
+- Mostly service-style modules, not a framework
+- Filesystem as the source of truth
+- Redis only for queue/quota/telemetry/runtime bookkeeping
 
-## System Overview
+## Core Invariants
+
+These invariants shape most implementation choices:
+
+- Stages communicate through files under `input/<novel_id>/` and `output/<novel_id>/`.
+- `input/<novel_id>/.parts/...` is canonical translation truth.
+- `input/<novel_id>/translated/*.txt` is derived and rebuildable from `.parts`.
+- Queue state in Redis is disposable operational state, not business truth.
+- Crawl/origin headings are usually ASCII `Chuong <n> ...`.
+- Translated/TTS/media headings are usually Vietnamese `Chương <n> ...`.
+
+Changing heading formats can break chapter splitting, translation rebuild, TTS chapter detection, subtitle menu generation, and media packaging.
+
+## Top-Level Shape
 
 ```mermaid
 flowchart LR
@@ -29,37 +45,30 @@ flowchart LR
     CFG --> CRAWL["Crawl"]
     CFG --> TRANS["Translate Novel"]
     CFG --> CAP["Translate Captions"]
-    CFG --> QUEUE["Translation Queue"]
-    CFG --> QUOTA["Central Quota (Redis gate)"]
-    CFG --> QUOTASUP["Quota Supervisor (global)"]
+    CFG --> QUEUE["Queue / Workers"]
+    CFG --> QUOTA["Central Quota Client"]
+    CFG --> QSUP["Quota Supervisor"]
     CFG --> AIKEY["AI Key Telemetry"]
     CFG --> TTS["TTS"]
-    CFG --> VIS["Visual"]
-    CFG --> VID["Video"]
+    CFG --> MEDIA["Visual / Video"]
+    CFG --> UP["Upload / YouTube Admin"]
 
     CRAWL --> ORIGIN["input/<novel>/origin/*.txt"]
-    CRAWL --> PROGRESS["input/<novel>/.progress/*"]
+    CRAWL --> CPROG["input/<novel>/.progress/*"]
     TRANS --> PARTS["input/<novel>/.parts/<batch>/*.txt"]
-    TRANS --> TRANSLATED["input/<novel>/translated/*.txt"]
-    TRANS --> GLOSSARY["configs/glossaries/<novel>.json"]
-    CAP --> CAPTION["input/<novel>/captions/*.srt"]
+    TRANS --> TRANS_OUT["input/<novel>/translated/*.txt"]
+    CAP --> CAPTIONS["input/<novel>/captions/*.srt"]
     QUEUE --> PARTS
-    QUEUE --> TRANSLATED
-    QUOTA --> REDISQUOTA["Redis quota keys (per key/model)"]
-    QUOTASUP --> REDISQUOTA
-    AIKEY --> REDISMETRICS["Redis metrics (per key/model)"]
+    QUEUE --> TRANS_OUT
+    QUEUE --> REDISQ["Redis queue keys"]
+    QUOTA --> REDISQUOTA["Redis quota keys"]
+    QSUP --> REDISQUOTA
+    AIKEY --> REDISMETRICS["Redis telemetry keys"]
     TTS --> AUDIO["output/<novel>/audio/<range>/*"]
-    VIS --> VISUAL["output/<novel>/visual/*"]
-    VID --> VIDEO["output/<novel>/video/*"]
+    MEDIA --> VISUAL["output/<novel>/visual/*"]
+    MEDIA --> VIDEO["output/<novel>/video/*"]
+    UP --> YT["YouTube APIs"]
 ```
-
-## Design Principles
-
-- File-first processing: every stage reads files produced by the previous stage.
-- Narrow module boundaries: each subsystem has a small public surface.
-- Config composition over hardcoding: novel config + source config + app config are merged at runtime.
-- Restartability: translation progress and crawl failures are persisted to disk.
-- Operational pragmatism: browser fallback, retries, prompt repair, and glossary auto-update exist to recover from messy real-world inputs.
 
 ## Runtime Entry Points
 
@@ -67,157 +76,193 @@ Primary entrypoints:
 
 - `novel_tts/__main__.py`
 - `novel_tts/cli/main.py`
-- console script from `pyproject.toml`: `novel-tts = "novel_tts.cli.main:main"`
+- console script in `pyproject.toml`: `novel-tts = "novel_tts.cli.main:main"`
 
-Important command families:
+The CLI is intentionally thin:
+
+- parse args
+- resolve the novel config once
+- choose a log file
+- lazily import the stage module it needs
+- convert provider quota/rate-limit exceptions into special exit codes used by queue workers
+
+## Command Surface
+
+Current top-level command families:
 
 - `crawl`
 - `translate`
 - `queue`
-- `ai-key`
-- `quota-supervisor`
 - `tts`
 - `visual`
 - `video`
 - `upload`
+- `youtube`
 - `pipeline`
+- `quota-supervisor`
+- `ai-key`
 
-The CLI is thin by design. It parses arguments, resolves the novel config once, chooses a log target, and dispatches into a stage service.
+Important subcommands:
+
+- `crawl run`, `crawl verify`, `crawl repair`
+- `translate novel`, `translate chapter`, `translate polish`, `translate captions`
+- `queue launch`, `queue add`, `queue worker`, `queue supervisor`, `queue monitor`, `queue ps`, `queue ps-all`, `queue repair`, `queue reset-key`, `queue stop`
+- `youtube playlist`, `youtube playlist update`, `youtube video`, `youtube video update`
+- `pipeline run`
+
+Compatibility note:
+
+- `novel-tts crawl <novel> ...` is still rewritten into `crawl run <novel> ...`.
 
 ## Configuration Architecture
 
-### Sources of configuration
+Configuration is built by `novel_tts.config.loader.load_novel_config()`.
 
-Configuration is assembled by `novel_tts.config.loader.load_novel_config()` from:
+### Inputs
+
+The loader merges:
 
 - `configs/novels/<novel_id>.json`
 - `configs/sources/<source_id>.json`
 - `configs/app.yaml`
-- `configs/glossaries/<novel_id>.json` or explicit glossary file
+- `configs/glossaries/<novel_id>.json` or an explicit glossary file
+- `configs/polish_replacement/common.json`
+- `configs/polish_replacement/<novel_id>.json`
 - selected environment variables
 
-### Config schema notes (current)
+### Runtime Output
 
-The translation config schema is:
+The merged result is a `NovelConfig` dataclass graph from `novel_tts.config.models` with these main sections:
 
-- `translation`: common translation settings (provider, glossary_file, replacements, etc.)
-- `translation.chapter`: chapter translation settings (chapter_regex, base_rules, etc.)
-- `translation.captions`: caption translation settings (input/output file naming, etc.)
+- metadata: `novel_id`, `title`, `slug`, languages
+- source wiring: `source_id`, `source`
+- paths: `storage`
+- crawl: `crawl`, `browser_debug`
+- translation: `models`, `translation`, `captions`
+- queue/runtime: `queue`, `proxy_gateway`
+- downstream media: `tts`, `visual`, `video`
+- publishing: `upload`
 
-Legacy configs that embed chapter fields under `chapter` or older `translation` shapes are still supported,
-but `load_novel_config()` will warn and normalize them into the new shape.
+### Merge Rules
 
-For captions-only novels, `crawl.sources` may be omitted; the loader will still build a minimal runtime config
-so `translate captions` and queue management can run without a crawl source.
+Important current rules:
 
-Model pool config can live in `configs/app.yaml` under `models` and is shared by direct translation and queue mode:
+- novel config is the required root config
+- source config is selected by `crawl.sources[0].source_id`
+- source crawl defaults are overridden by the novel's crawl override for that source
+- app-level `queue`, `tts`, `upload`, and `translation` defaults merge into per-novel overrides
+- `models.*` is now the canonical shared model pool for both direct translation and queue mode
+- queue model configs inherit defaults from `models.*`
+- glossary JSON is sanitized before entering runtime config
+- polish replacements are merged as `common` then per-novel override
 
-- `models.provider`
-- `models.enabled_models` (also used as a default for `queue.enabled_models`)
-- `models.model_configs.<model>` (also used as a default for `queue.model_configs.<model>`)
-- `models.repair_model` (optional)
+### Current Translation Schema
 
-### Merge model
+The preferred config shape is:
 
-```mermaid
-flowchart TD
-    NOVEL["Novel config JSON"] --> MERGE
-    SOURCE["Source config JSON"] --> MERGE
-    APP["App config YAML"] --> MERGE
-    ENV["Environment overrides"] --> MERGE
-    GLOSS["Glossary JSON"] --> MERGE
-    MERGE --> FINAL["NovelConfig dataclass"]
-```
+- `translation`: common translation behavior
+- `translation.chapter`: chapter-specific translation behavior
+- `translation.captions`: caption translation behavior
+- `models`: shared provider/model pool and per-model limits
 
-Key merge behavior:
+Deprecated keys are actively rejected in several places, especially old translation model keys that now belong under `models`.
 
-- `crawl`: source defaults overridden by novel-specific crawl settings
-- `browser_debug`: source defaults overridden by novel-specific browser settings
-- `queue`: app defaults overridden by novel-specific queue settings
-- `tts`: app defaults overridden by novel-specific tts settings
-- glossary file content is sanitized before entering runtime config
-- translation model can be overridden by env
+### Environment Variables That Matter
 
-Environment variables that materially affect behavior:
+Commonly used runtime overrides:
 
-- Model selection:
-  - `NOVEL_TTS_TRANSLATION_MODEL` (or `GEMINI_MODEL`)
-  - captions translation uses the same model selection path
-- Provider auth:
+- model selection:
+  - `NOVEL_TTS_TRANSLATION_MODEL`
+  - `GEMINI_MODEL`
+- provider auth:
   - `GEMINI_API_KEY`
   - `OPENAI_API_KEY`
-  - direct Gemini translate commands fall back to the first non-empty key in `.secrets/gemini-keys.txt` when `GEMINI_API_KEY` is unset
-- Central quota (v2):
-  - `NOVEL_TTS_CENTRAL_QUOTA` (enable flag)
-  - `NOVEL_TTS_CENTRAL_QUOTA_WAIT_SECONDS` (blocking wait when acquiring a grant)
-  - `NOVEL_TTS_CENTRAL_QUOTA_REQUEST_TTL_SECONDS` (expiry for queued requests)
-  - `GEMINI_REDIS_HOST` / `GEMINI_REDIS_PORT` / `GEMINI_REDIS_DB` (Redis wiring for the quota client)
-- Translation chunking / repair switches:
+- direct translate fallback:
+  - if `GEMINI_API_KEY` is unset, direct Gemini translation falls back to the first non-empty line in `.secrets/gemini-keys.txt`
+- central quota:
+  - `NOVEL_TTS_CENTRAL_QUOTA`
+  - `NOVEL_TTS_CENTRAL_QUOTA_NONBLOCKING`
+  - `NOVEL_TTS_CENTRAL_QUOTA_WAIT_SECONDS`
+  - `NOVEL_TTS_CENTRAL_QUOTA_REQUEST_TTL_SECONDS`
+  - `GEMINI_REDIS_HOST`
+  - `GEMINI_REDIS_PORT`
+  - `GEMINI_REDIS_DB`
+- translate chunking/repair:
   - `CHUNK_MAX_LEN`
   - `CHUNK_SLEEP_SECONDS`
   - `REPAIR_MODE`
-  - `NOVEL_TTS_REPAIR_CHUNK_MAX_LEN`
+  - `REPAIR_MODEL`
+  - `GLOSSARY_MODEL`
   - `NOVEL_TTS_GLOSSARY_STRICT`
-- Crawl/session:
-  - `NOVEL_TTS_COOKIE_HEADER`
-- Quota/rate-limit behavior (direct translate and queue workers):
-  - `NOVEL_TTS_QUOTA_MODE` (`wait` or `raise`)
+- quota/rate-limit behavior:
+  - `NOVEL_TTS_QUOTA_MODE`
   - `NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS`
   - `NOVEL_TTS_RATE_LIMIT_MAX_ATTEMPTS`
   - `NOVEL_TTS_INLINE_QUOTA_WAIT_BUDGET_SECONDS`
   - `NOVEL_TTS_HOLD_QUOTA_WAIT_BUDGET_SECONDS`
-  - `NOVEL_TTS_GEMINI_TPM_CHARS_PER_TOKEN`
-  - `NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_RATIO`
-  - `NOVEL_TTS_GEMINI_TPM_OUTPUT_RESERVE_MIN`
-  - `NOVEL_TTS_GEMINI_TPM_SAFETY_MULTIPLIER`
-  - `NOVEL_TTS_UPSTREAM_TIMEOUT_SUGGESTED_WAIT_SECONDS`
-
-### Typed runtime config
-
-The merged output is a `NovelConfig` dataclass graph with these major sections:
-
-- `storage`
-- `crawl`
-- `browser_debug`
-- `translation`
-- `captions`
-- `queue`
-- `tts`
-- `visual`
-- `video`
-
-That dataclass graph is the main dependency passed across the system.
+- crawl/session:
+  - `NOVEL_TTS_COOKIE_HEADER`
 
 ## Storage Layout
 
 The project is organized around per-novel working directories.
 
-### Input-side layout
+### Input Contract
 
 Within `input/<novel_id>/`:
 
-- `origin/`: source-language crawl outputs, usually batched as `chuong_<start>-<end>.txt`
-- `translated/`: merged Vietnamese outputs per source batch
-- `captions/`: subtitle inputs and outputs
-- `.parts/`: per-chapter translated fragments, one file per chapter under each origin batch folder
-- `.progress/`: resumable work state such as chunk progress and crawl failure manifests
+- `origin/*.txt`
+  - crawled source-language batch files
+  - typically named `chuong_<start>-<end>.txt`
+- `translated/*.txt`
+  - merged Vietnamese files rebuilt from `.parts`
+- `captions/*.srt`
+  - caption input and translated caption output
+- `.parts/<origin_stem>/<chapter>.txt`
+  - canonical per-chapter translated output
+- `.parts/<origin_stem>/<chapter>.sha256`
+  - source hash tracking for staleness detection
+- `.parts/.../*.glossary*.json`
+  - glossary progress/marker artifacts
+- `.progress/*`
+  - resumable work state for translation and crawl
+  - includes crawl failure manifests and translation chunk checkpoints
+- `repair_config.yaml`
+  - optional crawl-repair instructions generated from research logs
 
-### Output-side layout
+### Output Contract
 
 Within `output/<novel_id>/`:
 
-- `audio/<range>/`: wav chunks, concat file list, merged mp3
-- `subtitle/`: chapter menu text files
-- `visual/`: rendered overlay video and thumbnail
-- `video/`: final muxed MP4
+- `audio/<range>/`
+  - final merged MP3 for the range
+  - per-chapter WAV parts under `audio/<range>/.parts/`
+  - per-part hash cache under `audio/<range>/.parts/.cache/`
+- `subtitle/`
+  - generated chapter menu text files
+- `visual/`
+  - rendered visual MP4 and thumbnail PNG
+- `video/`
+  - final muxed MP4 ready for upload
+- output-side metadata files referenced by upload config
+  - e.g. title, description, playlist id templates
 
-### Other operational directories
+### Other Operational Directories
 
-- `.logs/<novel_id>/`: per-command logs
-- `tmp/`: temporary browser profiles, request artifacts, debug files
-- `debug/img/`: crawl browser screenshots
+- `.logs/<novel_id>/...`
+  - per-command and per-worker logs
+- `.logs/quota-supervisor.log`
+  - shared global quota-supervisor log
+- `.logs/archived/...`
+  - rotated historical logs
+- `tmp/`
+  - prompt dumps, response dumps, browser temp artifacts
+- `debug/img/`
+  - crawl browser screenshots when relevant
+- `image/`
+  - visual background assets and channel overlays
 
-## End-to-End Data Flow
+## End-to-End Flow
 
 ```mermaid
 sequenceDiagram
@@ -225,352 +270,389 @@ sequenceDiagram
     participant CLI
     participant Crawl
     participant Translate
+    participant Queue
     participant TTS
     participant Media
+    participant Upload
 
-    User->>CLI: crawl / translate / tts / visual / video / pipeline
+    User->>CLI: command
     CLI->>CLI: load_novel_config()
-    CLI->>Crawl: crawl_range()
-    Crawl-->>CLI: origin batch files
-    CLI->>Translate: translate_novel() or queue workers
-    Translate-->>CLI: .parts + translated batch files
+    CLI->>Crawl: crawl run / verify / repair
+    Crawl-->>CLI: origin files + crawl state
+    CLI->>Translate: direct translate or caption translate
+    CLI->>Queue: queue add / launch / workers
+    Queue-->>Translate: translate chapter subprocesses
+    Translate-->>CLI: .parts + translated files
     CLI->>TTS: run_tts(range)
-    TTS-->>CLI: merged mp3 + menu
+    TTS-->>CLI: wav parts + mp3 + menu
     CLI->>Media: generate_visual(range)
-    Media-->>CLI: visual mp4 + thumbnail
     CLI->>Media: create_video(range)
-    Media-->>CLI: final mp4
+    Media-->>CLI: visual mp4/png + final mp4
+    CLI->>Upload: run_upload(s)
 ```
 
-## Subsystem Details
+## Subsystems
 
-## CLI Layer
+### CLI Layer
 
-File:
+Primary file:
 
 - `novel_tts/cli/main.py`
 
 Responsibilities:
 
-- parse commands and ranges
-- keep backward compatibility for `crawl <novel> ...` by rewriting argv into `crawl run ...`
-- choose per-command log file (under `.logs/<novel_id>/<family>/*.log`)
-- import subsystem only when needed
-- convert exceptions into a process exit code (including queue-consumable rate-limit exit codes)
+- define the full argparse tree
+- normalize backward-compatible CLI shapes
+- map commands to per-run log files under `.logs/`
+- support watch-mode terminal UIs for `queue ps`, `queue ps-all`, and `ai-key ps`
+- provide two pipeline execution modes:
+  - `per-stage`
+  - `per-video`
+- manage `quota-supervisor` foreground/daemon lifecycle
+- convert `RateLimitExceededError` into exit code `75` or `76` for queue workers
 
-Notable behavior:
+Special exit code semantics:
 
-- `crawl run` supports `--range` or `--from/--to`
-- `crawl verify` scans existing crawled files rather than fetching again
-- `queue ps` / `queue ps-all` surface queue process state and progress in a pm2-like table
-- `queue stop` can stop all, or a subset of, queue processes for a novel by `--pid` or `--role`
-- `pipeline run` is an orchestration wrapper, not a distinct engine
-- `ai-key ps` surfaces per-API-key throughput and rate-limit signals derived from Redis metrics
-- `quota-supervisor` runs a global Redis-backed quota gate and can be launched as a daemon via `-d`
-- `translate repair` scans a chapter range and enqueues only broken chapters back into Redis for queue workers to re-translate
+- `75`: HTTP 429 / backoff style rate limit
+- `76`: quota gate or upstream wait condition
 
-## Crawl Subsystem
+### Config Layer
 
-Files:
+Primary files:
+
+- `novel_tts/config/loader.py`
+- `novel_tts/config/models.py`
+
+Responsibilities:
+
+- parse and validate config files
+- reject deprecated config shapes
+- merge app/source/novel config
+- normalize shared model-pool settings
+- build `StorageConfig` path helpers
+- sanitize glossary content before use
+- resolve upload, queue, proxy-gateway, and TTS settings into typed dataclasses
+
+The loader also supports captions-only setups where no crawl source is configured.
+
+### Crawl
+
+Primary files:
 
 - `novel_tts/crawl/service.py`
 - `novel_tts/crawl/strategies.py`
 - `novel_tts/crawl/challenge.py`
-- `novel_tts/crawl/base.py`
 - `novel_tts/crawl/registry.py`
+- `novel_tts/crawl/base.py`
 - `novel_tts/crawl/resolvers/*.py`
+- `novel_tts/crawl/repair_config.py`
 
-### Responsibilities
+### Resolver Model
 
-- fetch directory pages and chapter pages
-- resolve site-specific HTML structures
-- detect anti-bot and rate-limit pages
-- retry and switch fetch strategy when needed
-- write batch source files
-- track crawl failures in manifest files
-- verify already-crawled content
+Resolvers are source-specific parsers registered through `ResolverRegistry`.
 
-### Crawl architecture
+They handle:
 
-```mermaid
-flowchart TD
-    SERVICE["crawl_range()"] --> REG["ResolverRegistry"]
-    SERVICE --> CHAIN["StrategyChain"]
-    CHAIN --> HTTP["HttpFetchStrategy"]
-    CHAIN --> BOOT["BootstrapHttpFetchStrategy"]
-    CHAIN --> BROWSER["BrowserFetchStrategy"]
-    CHAIN --> POLICY["ChallengePolicy"]
-    REG --> RES["SourceResolver"]
-    RES --> DIR["parse_directory()"]
-    RES --> CH["parse_chapter()"]
-    SERVICE --> OUT["origin/*.txt + crawl_failures.json"]
-```
+- parsing directory pages into `ChapterEntry` records
+- finding additional paginated directory URLs
+- parsing chapter pages into normalized chapter title/content
 
-### Resolver model
+Current extension path:
 
-Each supported site implements a resolver with four site-aware methods:
+1. add a resolver module under `novel_tts/crawl/resolvers/`
+2. register it in `build_default_registry()`
+3. add a source config under `configs/sources/`
 
-- `parse_directory`
-- `find_directory_page_urls`
-- `parse_chapter`
-- `find_next_part_url`
+### Fetch Strategy Chain
 
-Current resolvers:
+`build_strategy_chain()` assembles a layered fetch approach:
 
-- `SpudNovelResolver`
-- `Shuba69Resolver`
-- `Novel543Resolver`
-- `HjwzwResolver`
+- plain HTTP fetch
+- bootstrap/browser-assisted HTTP fetch
+- Playwright browser fallback
 
-This is the main extension point for adding a new source site.
+The crawler uses this chain for both directory pages and chapter pages.
 
-### Fetch strategy model
+### Crawl Run
 
-`build_strategy_chain()` creates a strategy list based on config:
+`crawl_range()`:
 
-- plain HTTP first in most cases
-- browser-bootstrapped HTTP when cookies from an attached Chrome session are needed
-- Playwright browser fallback when challenge detection says HTTP is insufficient
+- loads the resolver and strategy chain
+- fetches the directory page
+- optionally follows extra directory pages until the requested range is covered
+- falls back to `chapter_url_pattern` when directory parsing yields no entries
+- fetches each chapter with retries and per-chapter delay
+- validates content against:
+  - challenge/rate-limit markers
+  - very short content
+  - watermark patterns
+  - metadata-noise patterns
+  - duplicated-content heuristics
+- writes merged origin batch files into `input/<novel>/origin/`
+- records failures in `input/<novel>/.progress/crawl_failures.json`
 
-`ChallengePolicy` classifies HTML/title into:
+### Crawl Verify
 
-- normal
-- `challenge`
-- `rate_limited`
+`verify_crawled_content()` inspects saved origin files only. It does not recrawl.
 
-### Output semantics
+It checks for issues such as:
 
-`crawl_range()` writes one or more batch files into `origin/`.
-Each file is named from the first and last successfully fetched chapter in that batch, not necessarily the requested range if some chapters fail.
-
-Failure state is stored in:
-
-- `input/<novel>/.progress/crawl_failures.json`
-
-### Verification
-
-`verify_crawled_content()` inspects existing origin files and reports:
-
-- missing chapters in a file range
+- missing chapters
+- malformed headings
 - duplicate chapters
-- empty or suspicious content
-- header mismatches
-- active or stale manifest entries
+- watermark lines
+- metadata noise
+- stale crawl failure manifest entries
 
-This command is useful because crawl correctness depends heavily on unstable external websites.
+It can also sync `repair_config.yaml` from research-derived inputs.
 
-## Translation Subsystem
+### Crawl Repair
 
-Files:
+`repair_crawled_content()` applies targeted repairs to existing origin files.
+
+Repair support includes:
+
+- generating `input/<novel>/repair_config.yaml` from research logs
+- inserting placeholder chapters for gaps
+- replacing individual chapters from alternate sources
+- removing watermark and metadata-noise lines
+- deduplicating adjacent or repeated chapter content
+- rewriting placeholders when chapter continuity changes
+
+This subsystem is intentionally file-rewrite based: it repairs the batch artifacts on disk, then downstream translation can re-enqueue just the changed chapters.
+
+### Translation
+
+Primary files:
 
 - `novel_tts/translate/novel.py`
 - `novel_tts/translate/providers.py`
+- `novel_tts/translate/model.py`
 - `novel_tts/translate/glossary.py`
-- `novel_tts/translate/polish.py`
 - `novel_tts/translate/captions.py`
+- `novel_tts/translate/polish.py`
 - `novel_tts/translate/repair.py`
 
-### Responsibilities
+### Chapter Translation Model
 
-- split source batches into chapters
-- translate per chapter
-- checkpoint chunk progress
-- repair residual Han characters aggressively
-- auto-update glossary entries
-- rebuild merged translated files
-- post-polish style and formatting
-- translate caption SRT files separately
-- scan outputs and enqueue repair jobs (queue-backed)
+Translation is chapter-granular even when crawl inputs are batch-granular.
 
-### Translation data model
+The core flow is:
 
-The source of truth for chapter splitting is `config.translation.chapter_regex`.
+1. split source batches into chapters
+2. translate one chapter at a time
+3. write each chapter into `.parts`
+4. track source hash per chapter
+5. optionally update glossary
+6. rebuild merged `translated/*.txt`
 
-This matters because:
+Canonical public functions:
 
-- crawl output may differ by source
-- queue job discovery depends on source chapter splitting
-- rebuild logic assumes the same regex as chapter extraction
+- `translate_novel()`
+- `translate_file()`
+- `translate_chapter()`
+- `rebuild_translated_file()`
 
-### Novel translation pipeline
+### Why `.parts` Is Canonical
 
-```mermaid
-flowchart TD
-    SRC["origin/*.txt"] --> SPLIT["split_source_chapters()"]
-    SPLIT --> PART["translate_chapter()"]
-    PART --> UNIT["translate_unit()"]
-    UNIT --> CHUNK["split_chunks() + provider.generate()"]
-    CHUNK --> CLEAN["post_process + Han cleanup + repair passes"]
-    CLEAN --> PARTFILE[".parts/<batch>/<chapter>.txt"]
-    PARTFILE --> REBUILD["rebuild_translated_file()"]
-    REBUILD --> OUT["translated/*.txt"]
-    CLEAN --> GLOSS["update_glossary_from_chapter()"]
-```
+`translate_chapter()` decides staleness chapter-by-chapter using source hashes.
 
-### Why `.parts` exists
+That lets the system:
 
-The translation stage is chapter-granular even when crawl files are batch-granular.
+- skip unchanged chapters
+- force-refresh a single chapter cleanly
+- re-run glossary extraction without redoing every batch
+- rebuild merged translated outputs deterministically
 
-That gives:
+### Translation Pipeline Internals
 
-- resumability
-- queue distribution by chapter
-- selective retranslation
-- later rebuild of full translated batch files
+`translate_unit()` in `novel.py` is the heavy-lifting path.
 
-### Translation provider abstraction
+It handles:
 
-Supported providers:
+- placeholder masking for glossary/protected terms
+- chunking by configured max length
+- prompt generation
+- provider calls
+- repair passes for residual Han text
+- cleanup passes
+- placeholder restoration
+- optional glossary extraction from source + translated text
+- checkpoint/progress files under `.progress`
+
+This module contains a lot of operational recovery logic because real model outputs are noisy.
+
+### Providers
+
+Current provider implementations:
 
 - `gemini_http`
 - `openai_chat`
 
-`GeminiHttpProvider` is the more operationally important path today. It includes:
+Provider code also contains:
 
-- retries
-- explicit handling of 429
-- prompt block detection via `promptFeedback.blockReason`
+- API key resolution
+- per-request token estimation
+- local/shared quota gating hooks
+- Redis metrics emission for queue/telemetry views
 
-### Repair-heavy translation design
+### Glossary System
 
-`translate_unit()` is intentionally defensive. After initial translation, it applies:
+Glossary support is both static and dynamic.
 
-- placeholder restoration
-- post replacements
-- rule-based Han cleanup
-- model-based final cleanup
-- line-level patching
-- source-vs-translation repair pass
-- aggressive segmentation repair
-- final forced stripping for small remaining Han residue
-- a final placeholder restoration + hard fail if any `ZXQ...QXZ`/`QZX...QXZ` survive (to avoid writing poisoned `.parts`)
+It provides:
 
-This is not a pure “translate once” pipeline. It is a multi-pass cleanup pipeline optimized for noisy long-form outputs.
+- sanitization of persisted glossary entries
+- prompt-time glossary text generation
+- glossary extraction from translated chapters
+- merge-back into the on-disk glossary file
+- marker/progress files to detect pending glossary work
 
-### Glossary management
+### Caption Translation
 
-Glossary flow:
-
-1. load and sanitize glossary at config load
-2. replace glossary terms with placeholders before translation
-3. restore placeholders after translation
-4. optionally extract new glossary candidates from source/translation pairs
-5. merge into glossary JSON under file lock
-
-The sanitizer intentionally rejects generic terms and suspicious targets, so the glossary is biased toward reusable proper nouns and domain terms.
-
-### Caption translation
-
-Caption translation is separate from novel translation.
+`translate_captions()` handles SRT translation separately from chapter translation.
 
 It:
 
-- parses SRT blocks
-- only translates text lines
-- sends JSON-shaped prompts to the provider
-- writes translated SRT back
-- builds a chapter menu file if title lines exist
+- reads the configured input/output file names from `config.captions`
+- extracts only subtitle text lines
+- sends chunked JSON prompts to the translation provider
+- writes translated SRT output
+- generates a chapter menu text file from `Chương <n>` lines in the SRT
+- optionally updates the glossary when not running inside a queue worker
 
-It does not share the full chapter translation repair stack.
+### Polish Pass
 
-### Polishing
+`polish_translations()` performs deterministic text cleanup on translated outputs.
 
-`polish_translations()` is a post-step that rewrites already translated chapter parts using rule-based formatting and replacement heuristics.
+It handles:
 
-This is especially relevant for novels with persistent naming inconsistencies.
+- immediate repetition cleanup
+- heading normalization
+- title folding
+- paragraph rebalance/merge logic
+- exact-match replacements from `configs/polish_replacement/*.json`
 
-Exact-match polish replacements are loaded from `configs/polish_replacement/common.json` and
-`configs/polish_replacement/<novel_id>.json`, then merged with novel-specific entries taking precedence.
+### Translation Repair Queueing
 
-### Repair (scan + requeue)
+`translate/repair.py` scans translated chapters for suspicious outputs and enqueues only the broken ones back into the queue.
 
-`translate repair` is a queue-oriented operator command implemented in `novel_tts/translate/repair.py`.
+This is a higher-level repair loop on top of crawl repair.
 
-It:
+### Queue
 
-- scans a chapter range and identifies broken chapters (missing/empty parts, residual Han, placeholder tokens, stale parts)
-- enqueues only those chapters back into Redis for re-translation (force mode)
-
-Important: `translate repair` does **not** translate anything by itself. It only enqueues work; you need a running queue stack for jobs to be processed.
-
-## Queue Subsystem
-
-File:
+Primary file:
 
 - `novel_tts/queue/translation_queue.py`
 
-### Responsibilities
+The queue is chapter-based and Redis-backed, but file-truth remains on disk.
 
-- discover which chapter parts still need translation
-- enqueue jobs in Redis
-- spawn workers per API key and model
-- requeue stale inflight work
-- monitor throughput and ETA
+### Job Model
 
-### Queue architecture
+Current job types:
 
-```mermaid
-flowchart LR
-    SUP["Supervisor"] --> REDIS["Redis keys"]
-    REDIS --> WORKER1["Worker (key/model)"]
-    REDIS --> WORKER2["Worker (key/model)"]
-    REDIS --> MON["Status monitor"]
-    WORKER1 --> PARTS[".parts/*.txt"]
-    WORKER2 --> PARTS
-    PARTS --> TRANS["translated/*.txt"]
-```
+- chapter job: `<file_name>::<chapter_num>`
+- captions job: `captions`
 
-Redis keys are namespaced as:
-
-- `<prefix>:<novel_id>:pending`
-- `<prefix>:<novel_id>:queued`
-- `<prefix>:<novel_id>:inflight`
-- `<prefix>:<novel_id>:retries`
-- `<prefix>:<novel_id>:done`
-
-### Job model
-
-A single queue job maps to one chapter in one origin file:
-
-- job id format: `<file_name>::<chapter_num>`
-
-Additionally, the queue may enqueue a special captions job:
-
-- job id: `captions`
-- worker executes: `python -m novel_tts translate captions <novel_id>`
-
-Workers do not call translation logic directly in-process.
-Instead, they spawn:
+Workers ultimately run CLI subprocesses:
 
 - `python -m novel_tts translate chapter ...`
+- `python -m novel_tts translate captions ...`
 
-That keeps worker logic simple and reuses the regular CLI path.
+### What Redis Stores
 
-### Process model
+Redis is used for:
 
-`queue launch` starts:
+- pending queue lists
+- delayed jobs
+- queued set
+- inflight map
+- retries
+- done map
+- force flags
+- per-model counters
+- cooldown and quota-related worker state
 
-- 1 supervisor
-- 1 status monitor
-- N workers per key/model, based on config
+Redis does not store completed translated text.
 
-Worker count is derived from:
+### Enqueue Behavior
 
-- `len(.secrets/gemini-keys.txt) * sum(queue.model_configs[model].worker_count for model in queue.enabled_models)`
+Queue add commands operate on chapter numbers, not batch file boundaries.
 
-### Operational caveats
+Current enqueue variants:
 
-- queue state lives in Redis, but translation truth still lives on disk
-- worker success is determined by subprocess exit code
-- the launch helper currently discards child stdout/stderr to `/dev/null`, while subsystem logs go through normal logger wiring when those processes run
-- process restart uses `pkill -f`, so command naming consistency matters
-- the supervisor reconciles worker processes against the current keys/models config (spawns missing workers; stops out-of-range key indices and excess workers if worker_count is reduced)
-- queue workers enable the central quota gate by setting env (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`) for their translate subprocesses
-- `queue ps-all` can surface `waiting-quota` countdowns when `quota-supervisor` is running (it publishes ETA hints in Redis)
+- `queue add --range`
+- `queue add --chapters`
+- `queue add --repair-report`
+- `queue add --all`
+- `queue repair --range`
+- `queue repair --all`
 
-## Central Quota Subsystem (v2)
+The queue checks whether a chapter still needs work by combining:
 
-Files:
+- missing `.parts` output
+- changed source hash
+- pending glossary work
+- retry budget state
+
+### Worker Behavior
+
+`run_worker()`:
+
+- selects an API key by key index
+- optionally maps keys to proxy-gateway proxies
+- respects shared cooldown and quota state
+- pulls a job from Redis
+- sets queue-specific env vars
+- runs a translate subprocess
+- reacts to special exit codes:
+  - `75`: rate-limit handling and requeue cooldown logic
+  - `76`: quota-gate handling and requeue or hold logic
+- updates retry and done bookkeeping
+
+Workers contain a lot of operational logic around:
+
+- IP-ban suspicion after repeated 429s
+- short inline waits for quota windows
+- holding an inflight job when no idle workers exist
+- delayed requeue when another key is more likely to succeed
+- startup ramping to avoid burst storms
+
+### Supervisor / Monitor
+
+`run_supervisor()`:
+
+- ensures the desired worker process set exists
+- drains delayed jobs back to pending
+- requeues stale inflight work
+
+`run_status_monitor()`:
+
+- writes queue state snapshots
+- stays quiet while the queue is idle to reduce noise
+
+`launch_queue_stack()`:
+
+- optionally kills old queue processes
+- clears runtime Redis state on restart
+- rotates logs through the shared logrotate mechanism
+- launches supervisor and monitor processes
+- can optionally enqueue all pending work immediately
+
+### Operator Views
+
+The queue subsystem also provides operator-focused process inspection:
+
+- `queue ps`
+- `queue ps-all`
+- `queue stop`
+- `queue reset-key`
+
+These commands inspect the local process table plus Redis queue state to present a pm2-like operational view.
+
+### Central Quota
+
+Primary files:
 
 - `novel_tts/quota/client.py`
 - `novel_tts/quota/supervisor.py`
@@ -578,237 +660,276 @@ Files:
 - `novel_tts/quota/keys.py`
 - `novel_tts/quota/lua_scripts.py`
 
+This is the quota v2 coordination layer for multi-worker Gemini usage.
+
 ### Purpose
 
-The central quota subsystem provides a **global**, Redis-backed gate for RPM/TPM/RPD enforcement across
-multiple worker processes (and potentially multiple novels), with better coordination than per-process sleeps.
+Without a central quota gate, many workers can hit the same model/key limits at once and all independently sleep or fail.
 
-This is the system behind:
+The central quota layer coordinates:
 
-- queue workers pausing as `waiting-quota` without spamming the upstream provider
-- stable, operator-visible countdowns in `queue ps-all` (ETA cache)
+- RPM
+- TPM
+- RPD
 
-### How it works
+across worker processes sharing the same Redis instance.
 
-1. A translation subprocess (typically spawned by a queue worker) requests a quota grant via `CentralQuotaClient.acquire()`.
-2. The request is appended to a Redis list: `{prefix}:{novel_id}:k{idx}:{model}:quota:alloc:queue`.
-3. A long-running `quota-supervisor` process scans alloc queues, runs the Lua grant script, and replies to each request via a per-request Redis key.
-4. After the provider call completes, the subprocess commits the outcome via `CentralQuotaClient.commit()` so the quota window state stays accurate.
+### Client
 
-### Enablement and wiring
+`CentralQuotaClient` reads Redis wiring from env and is enabled by `NOVEL_TTS_CENTRAL_QUOTA`.
 
-- Enable flag: `NOVEL_TTS_CENTRAL_QUOTA=1`
-- Redis wiring for the quota client comes from env:
-  - `GEMINI_REDIS_HOST`
-  - `GEMINI_REDIS_PORT`
-  - `GEMINI_REDIS_DB`
-- Queue workers set these env vars automatically for their translation subprocesses based on `configs/app.yaml` (`queue.redis.*`).
+It can:
 
-The `quota-supervisor` CLI command reads Redis settings from `configs/app.yaml` (`queue.redis.*`) and should be run once globally.
+- estimate wait time before enqueueing a request
+- enqueue quota requests
+- receive grants
+- raise a structured `RateLimitExceededError` when work should be retried later
 
-### Operator UX (ETA cache)
+### Supervisor
 
-`quota-supervisor` periodically computes estimated grant times for requests currently waiting in alloc queues and writes
-short-lived ETA hashes:
+`run_quota_supervisor()` is a separate global process.
 
-- `{prefix}:{novel_id}:k{idx}:{model}:quota:alloc:eta` (hash: request_id -> unix timestamp)
+It:
 
-`queue ps-all` uses these ETA hints to show `waiting-quota` countdowns for translate-chapter subprocesses (and to propagate
-that state up to their parent worker row).
+- watches quota allocation queues in Redis
+- loads model limits from live novel configs
+- runs Lua-based grant logic
+- publishes ETA hints for queued requests
+- refreshes proxy-gateway discovery state
+- processes shared logrotate requests
 
-## AI Key Telemetry Subsystem
+Operationally, there should usually be one global `quota-supervisor` for the workspace, not one per novel.
 
-Files:
+### Proxy Gateway
+
+Primary file:
+
+- `novel_tts/net/proxy_gateway.py`
+
+The proxy-gateway layer is optional and is mainly used by queue workers.
+
+It supports:
+
+- direct or socket mode
+- proxy auto-discovery through a gateway service
+- Redis-cached healthy proxy snapshots
+- deterministic key-index to proxy assignment
+
+Worker `k1` currently stays direct by design; higher keys can be mapped onto discovered healthy proxies.
+
+### AI Key Telemetry
+
+Primary file:
 
 - `novel_tts/ai_key/service.py`
 
-### Purpose
+`ai-key ps` is a read-only operational view over Redis counters and configured key files.
 
-`ai-key ps` is an operator tool for inspecting **per-API-key health** (Gemini keys today) while the queue is running.
+It:
 
-It is intentionally separate from queue process inspection:
+- loads `.secrets/gemini-keys.txt`
+- never prints raw keys
+- reads enabled models and limits from config
+- reads 1-minute usage counters from Redis
+- can follow live updates in a watch UI
+- can filter by key index, last-4, or exact raw key input
 
-- queue commands focus on *processes and job progress*
-- `ai-key` focuses on *key-level throughput, rate-limit signals, and quota waits*
+### TTS
 
-### Data sources
-
-It reads:
-
-- `.secrets/gemini-keys.txt` (to know how many keys exist, but raw keys are never printed)
-- Redis connection settings from `configs/app.yaml` (`queue.redis.*`)
-- Redis time (`TIME`) when available, so 1-minute windows line up with Redis
-
-It scans Redis keys that workers/supervisor emit (ZSETs for 1-minute windows), such as:
-
-- `...:llm:reqs` (attempts, including retries)
-- `...:api:reqs` / `...:api:calls` (fallback for older emitters)
-- `...:api:429` (rate limit events)
-- `...:quota:reqs` (quota-wait events)
-
-### Filters
-
-`ai-key ps` supports selecting a subset of keys without ever printing the raw API keys:
-
-- `--filter`: select by `kN` / `N` (1-based key index) or by `last4` of the raw key
-- `--filter-raw`: select by exact raw key(s) (still never printed; only used for matching)
-
-## TTS Subsystem
-
-Files:
+Primary files:
 
 - `novel_tts/tts/service.py`
 - `novel_tts/tts/providers.py`
 
-### Responsibilities
+### Input Contract
 
-- load translated batch text for a chapter range
-- split it into chapter chunks
-- synthesize audio chunk-by-chunk
-- merge chunks into a single MP3
-- generate a timecoded menu text file
+TTS expects a translated batch file matching the requested range key:
 
-### TTS architecture
+- `input/<novel>/translated/chuong_<start>-<end>.txt`
 
-```mermaid
-flowchart TD
-    TXT["translated/chuong_<start>-<end>.txt"] --> SPLIT["split_text_into_chunks()"]
-    SPLIT --> TTSP["TTS provider"]
-    TTSP --> WAV["audio/<range>/*.wav"]
-    WAV --> CONCAT["ffmpeg concat + atempo"]
-    CONCAT --> MP3["audio/<range>/<range>.mp3"]
-    WAV --> MENU["subtitle/<range>_menu.txt"]
-```
+The current splitting logic looks for `Chương <n>` headings in translated text.
 
-Current provider support:
+### Processing
+
+`run_tts()`:
+
+- loads the translated range file
+- splits it into chapter chunks
+- filters those chunks to the requested range
+- connects to the configured Gradio server/model
+- reuses cached per-chapter WAV output when the chunk hash matches
+- writes per-chapter WAV files under `output/<novel>/audio/<range>/.parts/`
+- writes a merged MP3 for the range
+- writes a chapter-menu text file under `output/<novel>/subtitle/`
+
+Current provider path:
 
 - `gradio_vie_tts`
 
-Provider runtime dependencies:
+Provider config is further resolved through:
 
-- a reachable Gradio server URL from `configs/providers/tts_servers.yaml`
-- model payload in `configs/providers/tts_models.yaml`
+- `configs/providers/tts_servers.yaml`
+- `configs/providers/tts_models.yaml`
 
-`tts_models.yaml` uses an explicit mapping per model. Each entry must define:
+### Media
 
-- `backbone`
-- `codec`
-- `device`
-- `base_model`
-
-Optional fields:
-
-- `use_lmdeploy`
-- `custom_model_id`
-- `hf_token`
-
-## Media Subsystem
-
-File:
+Primary file:
 
 - `novel_tts/media/service.py`
 
-### Responsibilities
+Current media generation is ffmpeg-driven.
 
-- render overlay text on top of a background video
-- extract a thumbnail
-- loop the visual track to match audio duration
-- mux visual + audio into final MP4
+### Visual Generation
 
-### Visual/video flow
+Two visual paths exist:
 
-```mermaid
-flowchart LR
-    BG["image/<novel>/<background>.mp4"] --> VIS["generate_visual()"]
-    VIS --> VISM["visual/<range>.mp4"]
-    VISM --> MUX["create_video()"]
-    AUD["audio/<range>/<range>.mp3"] --> MUX
-    MUX --> FINAL["video/<range>.mp4"]
-```
+- `generate_visual(start, end)`
+  - range-based visual from a background video
+- `generate_visual_for_chapter(chapter)`
+  - single-chapter visual from a background cover image
 
-This layer is intentionally lightweight:
+The visual stage requires ffmpeg `drawtext` support and overlays:
 
-- FFmpeg is the rendering engine
-- there is no scene graph or timeline abstraction
-- all overlay text comes from `config.visual`
+- chapter/range labels
+- configured marketing lines
+- `image/channel-name.png`
+
+Outputs:
+
+- `output/<novel>/visual/chuong_<start>-<end>.mp4`
+- `output/<novel>/visual/chuong_<start>-<end>.png`
+
+### Final Video Mux
+
+`create_video()`:
+
+- reads the visual MP4
+- reads the range MP3 from TTS
+- loops the visual stream to the audio duration
+- muxes both into `output/<novel>/video/chuong_<start>-<end>.mp4`
+
+### Upload and YouTube Admin
+
+Primary file:
+
+- `novel_tts/upload/service.py`
+
+### Upload Flow
+
+`run_upload()` and `run_uploads()` are the publish-stage entrypoints.
+
+Supported platforms:
+
+- `youtube`
+- `tiktok`
+
+Current platform behavior:
+
+- YouTube real upload is implemented
+- TikTok is dry-run only; real upload is intentionally not implemented yet
+
+### YouTube Upload
+
+The YouTube path:
+
+- loads OAuth credentials and cached token
+- builds upload metadata from output-side title/description/playlist files
+- uploads thumbnail + video
+- inserts the uploaded video into the configured playlist
+- retries rate-limited API operations with exponential backoff
+- supports batched upload pacing between groups of uploads
+
+### YouTube Admin Commands
+
+The same module also backs read/update admin commands:
+
+- list/get playlists
+- update playlist metadata
+- list/get videos from the authenticated channel uploads playlist
+- update video metadata
+- rewrite playlist-index lines in descriptions for already uploaded videos
+
+## Pipeline Orchestration
+
+The `pipeline run` command is intentionally light orchestration, not a separate subsystem.
+
+It can:
+
+- crawl a range
+- run direct novel translation
+- translate captions if the caption input exists
+- discover translated batch ranges overlapping the request
+- execute downstream media in one of two modes:
+  - `per-stage`
+  - `per-video`
+
+This is convenience orchestration over existing services, not a distinct persistence model.
+
+## Logging and Log Rotation
+
+Primary files:
+
+- `novel_tts/common/logging.py`
+- `novel_tts/common/logrotate.py`
+
+Current logging design:
+
+- every CLI run chooses a log target automatically unless `--log-file` is provided
+- novel-scoped commands log under `.logs/<novel_id>/...`
+- shared commands like `youtube` and `quota-supervisor` log under `.logs/...`
+- file logging uses `WatchedFileHandler` when possible so external rotation remains safe
+
+The logrotate helper manages:
+
+- `.logs/archived/today/`
+- date-stamped archive folders
+- zip archives
+- background-safe rotation through file locking
+
+Queue launch and the quota supervisor both interact with this rotation flow to keep operator logs readable.
 
 ## Common Utilities
 
-Files:
+Small shared modules in `novel_tts/common/` provide:
 
-- `novel_tts/common/logging.py`
-- `novel_tts/common/ffmpeg.py`
-- `novel_tts/common/text.py`
-- `novel_tts/common/subprocesses.py`
+- `errors.py`
+  - shared exceptions such as `RateLimitExceededError`
+- `text.py`
+  - range parsing and whitespace normalization helpers
+- `ffmpeg.py`
+  - ffmpeg/ffprobe wrappers
+- `subprocesses.py`
+  - subprocess helpers
+- `logging.py` and `logrotate.py`
 
-These are thin wrappers, not a framework layer.
-
-Key responsibilities:
-
-- logging setup and per-novel log file location
-- FFmpeg / FFprobe execution
-- whitespace normalization and range parsing
-- generic subprocess helper
-
-## Important Invariants
-
-These assumptions show up across the codebase:
-
-- `origin/*.txt` is the source of truth for chapter discovery
-- `translation.chapter_regex` must correctly match origin chapter headings
-- `.parts/<batch>/<chapter>.txt` is the source of truth for per-chapter translation completion
-- `translated/<batch>.txt` is a rebuild artifact, not the primary translation state
-- TTS expects translated text headings to start with `Chương <n>`
-- media generation expects a translated file for the exact requested range
-- queue-mode translation expects a running `quota-supervisor` when central quota is enabled (default for workers)
-
-Breaking any of these tends to create downstream failures that look unrelated.
+These utilities are deliberately small and reused across multiple stages.
 
 ## Extension Points
 
-### Add a new crawl source
+The main places where the architecture expects customization are:
 
-1. add `configs/sources/<source>.json`
-2. implement a resolver in `novel_tts/crawl/resolvers/`
-3. register it in `novel_tts/crawl/registry.py`
-4. create or update novel configs to use the new source
+- new crawl source:
+  - add resolver + source config
+- new translation provider:
+  - implement provider class and register it in `get_translation_provider()`
+- new TTS backend:
+  - extend `novel_tts/tts/providers.py` and provider config YAML
+- new upload platform:
+  - extend `novel_tts/upload/service.py` and upload config models
 
-### Add a new translation provider
+When extending the system, preserve the file contracts first. Most of the repo assumes the on-disk layout stays stable even when runtime internals evolve.
 
-1. implement provider class in `novel_tts/translate/providers.py`
-2. update provider factory
-3. ensure prompt/response contract matches current call sites
+## Practical Reading Guide
 
-### Add a new TTS provider
+If you are onboarding to the codebase, the fastest useful read order is:
 
-1. implement provider in `novel_tts/tts/providers.py`
-2. update factory logic
-3. ensure return shape is compatible with `run_tts()`
-
-### Add a new pipeline stage
-
-If a stage is user-facing:
-
-1. expose it from a service module
-2. dispatch it from CLI
-3. decide which directory becomes its persistent artifact boundary
-
-## Operational Notes
-
-- Crawl is the least deterministic subsystem because it depends on third-party sites and anti-bot behavior.
-- Translation is the heaviest logic subsystem because it combines provider calls, resumability, glossary evolution, and aggressive cleanup.
-- Queue is operational glue rather than a separate translation engine.
-- TTS and media are straightforward wrappers around external tools and services.
-- The project currently has little visible automated test coverage; architecture understanding matters because many failures are integration failures rather than unit-level bugs.
-
-## Practical Debugging Guide
-
-When something goes wrong, start from the artifact boundary nearest the failure:
-
-- crawl issue: inspect `origin/`, `.progress/crawl_failures.json`, and browser screenshots in `debug/img/`
-- translation issue: inspect `.parts/`, `.progress/*.json`, glossary file, and translated batch rebuild
-- queue issue: inspect Redis key counts, `.logs/<novel>/queue/*.log`, and missing part files
-- TTS issue: inspect translated range file, generated wavs, and concat list
-- media issue: inspect background asset, generated visual mp4, and ffmpeg availability
-
-That debugging style matches how the system is built.
+1. `README.md`
+2. `docs/ARCHITECTURE.md`
+3. `novel_tts/cli/main.py`
+4. `novel_tts/config/loader.py`
+5. one stage service you care about:
+   - crawl: `novel_tts/crawl/service.py`
+   - translation: `novel_tts/translate/novel.py`
+   - queue: `novel_tts/queue/translation_queue.py`
+   - quota: `novel_tts/quota/supervisor.py`
+   - media/upload: `novel_tts/tts/service.py`, `novel_tts/media/service.py`, `novel_tts/upload/service.py`

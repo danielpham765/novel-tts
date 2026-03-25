@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from novel_tts.config.models import TtsConfig
+from novel_tts.config.models import StorageConfig, TtsConfig
 from novel_tts.tts.providers import GradioTtsProvider, TtsModelConfig, TtsModelLoadError, TtsModelNotReadyError
 
 
@@ -46,7 +47,15 @@ def _make_provider() -> GradioTtsProvider:
             voice="Doan",
             server_name="ttsCloud",
             model_name="gpu",
-        )
+        ),
+        storage=StorageConfig(
+            root=Path("/tmp"),
+            input_dir=Path("/tmp/input"),
+            output_dir=Path("/tmp/output"),
+            image_dir=Path("/tmp/image"),
+            logs_dir=Path("/tmp/logs"),
+            tmp_dir=Path("/tmp/tmp"),
+        ),
     )
     provider.server_url = "http://127.0.0.1:17860"
     provider.model_config = TtsModelConfig(
@@ -142,3 +151,77 @@ def test_load_model_raises_when_server_reports_error() -> None:
         "",
         "",
     )
+
+
+def test_materialize_output_audio_downloads_remote_file_and_preserves_cleanup_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _make_provider()
+    provider.config.storage.tmp_dir = tmp_path
+    client = SimpleNamespace(
+        src_prefixed="http://127.0.0.1:17860/",
+        headers={"x-test": "1"},
+        cookies={"session": "abc"},
+        ssl_verify=True,
+        httpx_kwargs={"timeout": 10},
+    )
+    streamed_requests: list[tuple[str, dict, dict]] = []
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_bytes(self):
+            yield b"remote-wav"
+
+    def _fake_stream(method: str, url: str, **kwargs):
+        streamed_requests.append((url, kwargs.get("headers", {}), kwargs.get("cookies", {})))
+        assert method == "GET"
+        return _FakeResponse()
+
+    monkeypatch.setattr("novel_tts.tts.providers.httpx.stream", _fake_stream)
+
+    result = provider.materialize_output_audio(
+        client,
+        {
+            "path": "gradio/2e8d2263419bf34863d2dbdb673b06ada0b832be7faa021408bc5a85813e7544/tts_output_20260326_011430.wav",
+            "url": "/gradio_api/file=/home/aquafox/workspace/VieNeu-TTS/output_audio/tts_output_20260326_011430.wav",
+            "orig_name": "tts_output_20260326_011430.wav",
+            "meta": {"_type": "gradio.FileData"},
+        },
+    )
+
+    assert (
+        result.cleanup_target
+        == "2e8d2263419bf34863d2dbdb673b06ada0b832be7faa021408bc5a85813e7544/tts_output_20260326_011430.wav"
+    )
+    assert result.local_path.exists()
+    assert result.local_path.read_bytes() == b"remote-wav"
+    assert streamed_requests == [
+        (
+            "http://127.0.0.1:17860/gradio_api/file=/home/aquafox/workspace/VieNeu-TTS/output_audio/tts_output_20260326_011430.wav",
+            {"x-test": "1"},
+            {"session": "abc"},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "expected"),
+    [
+        ("gradio/hash123/tts_output_20260326_011430.wav", "hash123/tts_output_20260326_011430.wav"),
+        ("/tmp/gradio/hash123/tts_output_20260326_011430.wav", "hash123/tts_output_20260326_011430.wav"),
+        ("output_audio/tts_output_20260326_011430.wav", "tts_output_20260326_011430.wav"),
+        ("/workspace/output_audio/tts_stream_20260326_011430.wav", "tts_stream_20260326_011430.wav"),
+    ],
+)
+def test_build_cleanup_target_supports_gradio_tmp_and_output_audio(raw_path: str, expected: str) -> None:
+    provider = _make_provider()
+
+    assert provider._build_cleanup_target(raw_path) == expected
