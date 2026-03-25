@@ -113,7 +113,20 @@ uv run novel-tts video <novel_id> --range <start>-<end>
 
 # 8) Upload
 uv run novel-tts upload <novel_id> --platform youtube --range <start>-<end>
+
+# Optional: end-to-end pipeline
+uv run novel-tts pipeline run <novel_id> --range <start>-<end>
+
+# Process downstream media stage-by-stage across the whole range (default)
+uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-stage
+
+# Process each translated video batch end-to-end: tts -> visual -> video -> upload
+uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-video
 ```
+
+For YouTube uploads, the uploader can pace requests in batches using `upload.youtube.upload_batch_size`
+and `upload.youtube.upload_batch_sleep_seconds` in config. This is helpful because Google documents
+daily quota-unit costs clearly, but shorter burst limits are not published as a simple RPM/RP5M rule.
 
 ## Command reference
 
@@ -192,6 +205,53 @@ Queue translation produces the same on-disk artifacts as direct translation: `.p
 `queue launch` reads `.secrets/gemini-keys.txt` and spawns a supervisor + workers for the configured models.
 
 Queue workers use a centralized quota gate (central quota v2) to coordinate rate-limit / quota waits across processes.
+
+### YouTube
+
+Inspect accessible YouTube playlists using the configured OAuth credentials in `configs/app.yaml` / `.secrets/youtube/`.
+
+```bash
+# List all accessible playlists with metadata
+uv run novel-tts youtube playlist
+
+# List only playlist ids and titles
+uv run novel-tts youtube playlist --title-only
+
+# Fetch one playlist by id or full playlist URL
+uv run novel-tts youtube playlist --id PLxxxxxxxx
+uv run novel-tts youtube playlist --id 'https://www.youtube.com/playlist?list=PLxxxxxxxx'
+
+# List all uploaded videos with metadata
+uv run novel-tts youtube video
+
+# List only video ids and titles
+uv run novel-tts youtube video --title-only
+
+# Fetch one video by id
+uv run novel-tts youtube video --id xxxxxxxx
+
+# Review current video metadata, preview changed fields, confirm y/n, then update
+uv run novel-tts youtube video update --id xxxxxxxx --title 'New title'
+uv run novel-tts youtube video update --id xxxxxxxx --description 'New description'
+uv run novel-tts youtube video update --id xxxxxxxx --privacy_status private
+uv run novel-tts youtube video update --id xxxxxxxx --made_for_kids true
+uv run novel-tts youtube video update --id xxxxxxxx --playlist_position 7
+
+# Touch the video without changing fields
+uv run novel-tts youtube video update --id xxxxxxxx
+
+# Rewrite the playlist link on uploaded YouTube video descriptions
+uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index
+uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index --range 1-150
+
+# Review current metadata, preview the update, confirm y/n, then update
+uv run novel-tts youtube playlist update --id PLxxxxxxxx --title 'New title'
+uv run novel-tts youtube playlist update --id PLxxxxxxxx --description 'New description'
+uv run novel-tts youtube playlist update --id PLxxxxxxxx --privacy-status private
+
+# Touch the playlist without changing fields (forces an update request/re-index attempt)
+uv run novel-tts youtube playlist update --id PLxxxxxxxx
+```
 
 #### Quota supervisor (global)
 

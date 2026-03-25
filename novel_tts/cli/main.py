@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import logging
 import os
 import re
@@ -19,6 +20,7 @@ from pathlib import Path
 from novel_tts.common.logging import (
     configure_logging,
     get_logger,
+    get_novel_log_dir,
     get_novel_log_path,
     install_exception_logging,
 )
@@ -55,6 +57,14 @@ def _format_click_path(path: Path | None) -> str:
         return str(path)
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _shared_logs_root() -> Path:
+    return _repo_root() / ".logs"
+
+
 def _apply_tts_cli_overrides(config: NovelConfig, args: argparse.Namespace) -> NovelConfig:
     server_name = getattr(args, "tts_server_name", None)
     model_name = getattr(args, "tts_model_name", None)
@@ -63,6 +73,15 @@ def _apply_tts_cli_overrides(config: NovelConfig, args: argparse.Namespace) -> N
     if model_name:
         config.tts.model_name = str(model_name)
     return config
+
+
+def _parse_bool_arg(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value!r}")
 
 
 @contextlib.contextmanager
@@ -188,6 +207,59 @@ def get_translated_ranges(config: NovelConfig, search_start: int, search_end: in
         
     ranges.sort(key=lambda x: x[0])
     return ranges
+
+
+def _run_pipeline_per_stage(
+    config: NovelConfig,
+    *,
+    translated_ranges: list[tuple[int, int, str]],
+    skip_tts: bool,
+    skip_visual: bool,
+    skip_video: bool,
+    skip_upload: bool,
+    upload_platform: str,
+) -> None:
+    from novel_tts.media import create_video, generate_visual
+    from novel_tts.tts import run_tts
+    from novel_tts.upload import run_uploads
+
+    if not skip_tts:
+        for c_start, c_end, range_key in translated_ranges:
+            run_tts(config, c_start, c_end, range_key)
+    if not skip_visual:
+        for c_start, c_end, _ in translated_ranges:
+            generate_visual(config, c_start, c_end)
+    if not skip_video:
+        for c_start, c_end, _ in translated_ranges:
+            create_video(config, c_start, c_end)
+    if not skip_upload:
+        upload_ranges = [(c_start, c_end) for c_start, c_end, _ in translated_ranges]
+        run_uploads(config, upload_ranges, platform=upload_platform, dry_run=False)
+
+
+def _run_pipeline_per_video(
+    config: NovelConfig,
+    *,
+    translated_ranges: list[tuple[int, int, str]],
+    skip_tts: bool,
+    skip_visual: bool,
+    skip_video: bool,
+    skip_upload: bool,
+    upload_platform: str,
+) -> None:
+    from novel_tts.media import create_video, generate_visual
+    from novel_tts.tts import run_tts
+    from novel_tts.upload import run_uploads
+
+    for c_start, c_end, range_key in translated_ranges:
+        if not skip_tts:
+            run_tts(config, c_start, c_end, range_key)
+        if not skip_visual:
+            generate_visual(config, c_start, c_end)
+        if not skip_video:
+            create_video(config, c_start, c_end)
+        if not skip_upload:
+            run_uploads(config, [(c_start, c_end)], platform=upload_platform, dry_run=False)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -436,11 +508,81 @@ def _build_parser() -> argparse.ArgumentParser:
     upload_parser = subparsers.add_parser("upload")
     upload_parser.add_argument("novel_id")
     upload_parser.add_argument("--platform", choices=["youtube", "tiktok"], required=True)
-    upload_parser.add_argument("--range", required=True)
+    upload_parser.add_argument("--range")
     upload_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate/build payload and log upload plan without publishing.",
+    )
+    upload_parser.add_argument(
+        "--update-playlist-index",
+        action="store_true",
+        help="Rewrite uploaded YouTube video descriptions so the playlist line uses each video's own id.",
+    )
+
+    youtube_parser = subparsers.add_parser("youtube")
+    youtube_sub = youtube_parser.add_subparsers(dest="youtube_command", required=True)
+    youtube_playlist_parser = youtube_sub.add_parser("playlist")
+    youtube_playlist_parser.add_argument(
+        "playlist_action",
+        nargs="?",
+        choices=["update"],
+        help='Optional subcommand. Use "update" to update playlist metadata.',
+    )
+    youtube_playlist_parser.add_argument(
+        "--id",
+        help="Playlist id or full YouTube playlist URL. If omitted, list all accessible playlists.",
+    )
+    youtube_playlist_parser.add_argument(
+        "--title-only",
+        action="store_true",
+        help="List only playlist id and title.",
+    )
+    youtube_playlist_parser.add_argument("--title", help="Updated playlist title.")
+    youtube_playlist_parser.add_argument("--description", help="Updated playlist description.")
+    youtube_playlist_parser.add_argument(
+        "--privacy-status",
+        choices=["private", "public", "unlisted"],
+        help="Updated playlist privacy status.",
+    )
+    youtube_video_parser = youtube_sub.add_parser("video")
+    youtube_video_parser.add_argument(
+        "video_action",
+        nargs="?",
+        choices=["update"],
+        help='Optional subcommand. Use "update" to update video metadata.',
+    )
+    youtube_video_parser.add_argument(
+        "--id",
+        help="Video id. If omitted, list all videos from the authenticated channel uploads playlist.",
+    )
+    youtube_video_parser.add_argument(
+        "--title-only",
+        action="store_true",
+        help="List only video id and title.",
+    )
+    youtube_video_parser.add_argument("--title", help="Updated video title.")
+    youtube_video_parser.add_argument("--description", help="Updated video description.")
+    youtube_video_parser.add_argument(
+        "--privacy_status",
+        "--privacy-status",
+        dest="privacy_status",
+        choices=["private", "public", "unlisted"],
+        help="Updated video privacy status.",
+    )
+    youtube_video_parser.add_argument(
+        "--made_for_kids",
+        "--made-for-kids",
+        dest="made_for_kids",
+        type=_parse_bool_arg,
+        help="Updated made-for-kids flag (true/false).",
+    )
+    youtube_video_parser.add_argument(
+        "--playlist_position",
+        "--playlist-position",
+        dest="playlist_position",
+        type=int,
+        help="Updated position in the authenticated channel uploads playlist.",
     )
 
     pipeline_parser = subparsers.add_parser("pipeline")
@@ -457,6 +599,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run.add_argument("--skip-visual", action="store_true")
     pipeline_run.add_argument("--skip-video", action="store_true")
     pipeline_run.add_argument("--skip-upload", action="store_true")
+    pipeline_run.add_argument(
+        "--mode",
+        choices=["per-stage", "per-video"],
+        default="per-stage",
+        help="Pipeline execution order for media stages. 'per-stage' runs one stage across all ranges before the next; 'per-video' runs TTS -> visual -> video -> upload for each range in order.",
+    )
     pipeline_run.add_argument(
         "--upload-platform",
         choices=["youtube", "tiktok"],
@@ -517,14 +665,18 @@ def _default_log_path(args) -> Path | None:
         return Path(args.log_file).expanduser().resolve()
 
     novel_id = getattr(args, "novel_id", None)
-    if not novel_id:
+    if not novel_id and args.command != "youtube":
         return None
 
-    config = load_novel_config(novel_id)
-
-    # Organize logs into per-command subdirectories under .logs/<novel_id>/...
     command = args.command
     log_name: str
+    logs_root: Path
+
+    if command != "youtube":
+        config = load_novel_config(novel_id)
+        logs_root = get_novel_log_dir(config.storage.logs_dir, novel_id)
+    else:
+        logs_root = _shared_logs_root()
 
     if command == "crawl":
         crawl_command = getattr(args, "crawl_command", None) or "run"
@@ -548,13 +700,34 @@ def _default_log_path(args) -> Path | None:
     elif command == "upload":
         upload_platform = getattr(args, "platform", None) or "unknown"
         log_name = f"upload/{upload_platform}.log"
+    elif command == "youtube":
+        youtube_command = getattr(args, "youtube_command", None) or "youtube"
+        log_name = f"upload/youtube/{youtube_command}.log"
     elif command == "pipeline":
         pipeline_command = getattr(args, "pipeline_command", None) or "run"
         log_name = f"pipeline/{pipeline_command}.log"
     else:
         log_name = f"{command}.log"
 
-    return get_novel_log_path(config.storage.logs_dir, novel_id, log_name)
+    return logs_root / log_name
+
+
+def _rotate_log_if_new_day(log_path: Path | None) -> None:
+    if log_path is None or not log_path.exists():
+        return
+    try:
+        st = log_path.stat()
+    except FileNotFoundError:
+        return
+    if st.st_size <= 0:
+        return
+    today = datetime.now().astimezone().date()
+    file_day = datetime.fromtimestamp(st.st_mtime, tz=datetime.now().astimezone().tzinfo).date()
+    if file_day == today:
+        return
+    from novel_tts.common import logrotate
+
+    logrotate.rotate_log_file_to_today(logs_root=log_path.parents[2], src=log_path)
 
 
 def _rate_limit_exit_code(message: str) -> int:
@@ -621,6 +794,11 @@ def main(argv: list[str] | None = None) -> int:
             logrotate.rotate_log_file_to_today(logs_root=logs_root, src=log_path)
         except Exception:
             # Best-effort: rotation should never block the verify command itself.
+            pass
+    if log_path is not None and args.command == "youtube" and not bool(getattr(args, "log_file", None)):
+        try:
+            _rotate_log_if_new_day(log_path)
+        except Exception:
             pass
     install_exception_logging(LOGGER)
     if log_path is not None:
@@ -1039,27 +1217,149 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "upload":
-            from novel_tts.upload import run_upload
+            from novel_tts.upload import run_uploads, update_uploaded_youtube_playlist_index_descriptions
 
             config = load_novel_config(args.novel_id)
-            start, end = parse_range(args.range)
-            for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                result = run_upload(
+            if bool(getattr(args, "update_playlist_index", False)):
+                if str(args.platform) != "youtube":
+                    parser.error("--update-playlist-index is only supported with --platform youtube")
+                start = end = None
+                if getattr(args, "range", None):
+                    start, end = parse_range(args.range)
+                results = update_uploaded_youtube_playlist_index_descriptions(
                     config,
-                    c_start,
-                    c_end,
-                    platform=str(args.platform),
-                    dry_run=bool(getattr(args, "dry_run", False)),
+                    from_chapter=start,
+                    to_chapter=end,
                 )
+                LOGGER.info("Upload playlist-index update result: %s", json.dumps(results, ensure_ascii=False))
+                print(json.dumps(results, ensure_ascii=False, indent=2))
+                return 0
+
+            if not getattr(args, "range", None):
+                parser.error("upload requires --range unless --update-playlist-index is used")
+
+            start, end = parse_range(args.range)
+            upload_ranges = [(c_start, c_end) for c_start, c_end, _ in get_translated_ranges(config, start, end)]
+            for result in run_uploads(
+                config,
+                upload_ranges,
+                platform=str(args.platform),
+                dry_run=bool(getattr(args, "dry_run", False)),
+            ):
                 LOGGER.info("Upload result: %s", result)
+            return 0
+
+        if args.command == "youtube":
+            from novel_tts.upload import (
+                get_youtube_playlist,
+                get_youtube_video,
+                list_youtube_playlists,
+                list_youtube_videos,
+                update_youtube_playlist,
+                update_youtube_video,
+            )
+
+            if args.youtube_command == "playlist" and getattr(args, "playlist_action", None) == "update":
+                playlist_id = str(getattr(args, "id", "") or "").strip()
+                if not playlist_id:
+                    parser.error("youtube playlist update requires --id")
+
+                current = get_youtube_playlist(playlist_id)
+                update_fields = {
+                    "title": getattr(args, "title", None),
+                    "description": getattr(args, "description", None),
+                    "privacy_status": getattr(args, "privacy_status", None),
+                }
+                changed_fields = {
+                    key: value
+                    for key, value in update_fields.items()
+                    if value is not None and value != current.get(key)
+                }
+
+                print("Current playlist metadata:")
+                print(json.dumps(current, ensure_ascii=False, indent=2))
+                print("Update playlist metadata:")
+                if changed_fields:
+                    print(json.dumps(changed_fields, ensure_ascii=False, indent=2))
+                else:
+                    print("Nothing changes.")
+
+                confirm = input("Execute update? [y/N]: ").strip().lower()
+                if confirm not in {"y", "yes"}:
+                    print("Update cancelled.")
+                    return 0
+
+                result = update_youtube_playlist(
+                    playlist_id,
+                    title=getattr(args, "title", None),
+                    description=getattr(args, "description", None),
+                    privacy_status=getattr(args, "privacy_status", None),
+                )
+            elif args.youtube_command == "playlist":
+                if getattr(args, "id", None):
+                    result = get_youtube_playlist(str(args.id))
+                else:
+                    result = list_youtube_playlists()
+                    if getattr(args, "title_only", False):
+                        result = [{"id": item.get("id", ""), "title": item.get("title", "")} for item in result]
+            elif args.youtube_command == "video" and getattr(args, "video_action", None) == "update":
+                video_id = str(getattr(args, "id", "") or "").strip()
+                if not video_id:
+                    parser.error("youtube video update requires --id")
+
+                current = get_youtube_video(video_id)
+                update_fields = {
+                    "title": getattr(args, "title", None),
+                    "description": getattr(args, "description", None),
+                    "privacy_status": getattr(args, "privacy_status", None),
+                    "made_for_kids": getattr(args, "made_for_kids", None),
+                    "playlist_position": getattr(args, "playlist_position", None),
+                }
+                changed_fields = {
+                    key: value
+                    for key, value in update_fields.items()
+                    if value is not None and value != current.get(key)
+                }
+
+                LOGGER.info("Current video metadata: %s", json.dumps(current, ensure_ascii=False))
+                LOGGER.info("Updated video fields: %s", json.dumps(changed_fields, ensure_ascii=False))
+                print("Current video metadata:")
+                print(json.dumps(current, ensure_ascii=False, indent=2))
+                print("Update video metadata:")
+                if changed_fields:
+                    print(json.dumps(changed_fields, ensure_ascii=False, indent=2))
+                else:
+                    print("Nothing changes.")
+
+                confirm = input("Execute update? [y/N]: ").strip().lower()
+                if confirm not in {"y", "yes"}:
+                    print("Update cancelled.")
+                    return 0
+
+                result = update_youtube_video(
+                    video_id,
+                    title=getattr(args, "title", None),
+                    description=getattr(args, "description", None),
+                    privacy_status=getattr(args, "privacy_status", None),
+                    made_for_kids=getattr(args, "made_for_kids", None),
+                    playlist_position=getattr(args, "playlist_position", None),
+                )
+            elif args.youtube_command == "video":
+                if getattr(args, "id", None):
+                    result = get_youtube_video(str(args.id))
+                else:
+                    result = list_youtube_videos()
+                    if getattr(args, "title_only", False):
+                        result = [{"id": item.get("id", ""), "title": item.get("title", "")} for item in result]
+            else:
+                parser.error("youtube: unsupported subcommand")
+            LOGGER.info("YouTube %s result: %s", args.youtube_command, json.dumps(result, ensure_ascii=False))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
 
         if args.command == "pipeline":
             from novel_tts.crawl import crawl_range
-            from novel_tts.media import create_video, generate_visual
             from novel_tts.translate import translate_captions, translate_novel
-            from novel_tts.tts import run_tts
-            from novel_tts.upload import run_upload
 
             config = load_novel_config(args.novel_id)
             if args.range:
@@ -1077,21 +1377,31 @@ def main(argv: list[str] | None = None) -> int:
                     translate_captions(config)
                 except FileNotFoundError:
                     LOGGER.warning("Caption source missing, skipping caption translation")
-            if not args.skip_tts:
-                for c_start, c_end, r_key in get_translated_ranges(config, start, end):
-                    run_tts(config, c_start, c_end, r_key)
-            if not args.skip_visual:
-                for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                    generate_visual(config, c_start, c_end)
-            if not args.skip_video:
-                for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                    create_video(config, c_start, c_end)
-            if not args.skip_upload:
-                upload_platform = str(
-                    getattr(args, "upload_platform", None) or getattr(config.upload, "default_platform", "youtube")
+            translated_ranges = get_translated_ranges(config, start, end)
+            upload_platform = str(
+                getattr(args, "upload_platform", None) or getattr(config.upload, "default_platform", "youtube")
+            )
+            pipeline_mode = str(getattr(args, "mode", "per-stage") or "per-stage")
+            if pipeline_mode == "per-video":
+                _run_pipeline_per_video(
+                    config,
+                    translated_ranges=translated_ranges,
+                    skip_tts=bool(args.skip_tts),
+                    skip_visual=bool(args.skip_visual),
+                    skip_video=bool(args.skip_video),
+                    skip_upload=bool(args.skip_upload),
+                    upload_platform=upload_platform,
                 )
-                for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                    run_upload(config, c_start, c_end, platform=upload_platform, dry_run=False)
+            else:
+                _run_pipeline_per_stage(
+                    config,
+                    translated_ranges=translated_ranges,
+                    skip_tts=bool(args.skip_tts),
+                    skip_visual=bool(args.skip_visual),
+                    skip_video=bool(args.skip_video),
+                    skip_upload=bool(args.skip_upload),
+                    upload_platform=upload_platform,
+                )
             return 0
 
         if args.command == "ai-key":

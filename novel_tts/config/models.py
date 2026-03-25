@@ -212,6 +212,11 @@ class UploadYouTubeConfig:
     title_file: str = "title.txt"
     description_file: str = "description.txt"
     playlist_file: str = "playlist.txt"
+    upload_batch_size: int = 1
+    upload_batch_sleep_seconds: float = 30.0
+    upload_retry_max_attempts: int = 5
+    upload_retry_base_sleep_seconds: float = 15.0
+    upload_retry_max_sleep_seconds: float = 300.0
 
 
 @dataclass
