@@ -74,8 +74,13 @@ upload:
   default_platform: youtube
   youtube:
     enabled: true
-    credentials_path: .secrets/youtube/client_secrets.json
-    token_path: .secrets/youtube/token.json
+    project: 2
+    credentials_path:
+      - .secrets/youtube/client_secrets.json
+      - .secrets/youtube/client_secrets-2.json
+    token_path:
+      - .secrets/youtube/token.json
+      - .secrets/youtube/token-2.json
     category_id: "22"
     privacy_status: public
     self_declared_made_for_kids: false

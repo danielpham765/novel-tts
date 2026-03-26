@@ -37,6 +37,16 @@ from novel_tts.upload.service import (
 )
 
 
+def _patch_default_youtube_client(monkeypatch: pytest.MonkeyPatch, client) -> None:
+    accounts = [type("Account", (), {"index": 1, "label": "account-1"})()]
+    monkeypatch.setattr(
+        "novel_tts.upload.service._youtube_accounts_from_defaults",
+        lambda: accounts,
+    )
+    monkeypatch.setattr("novel_tts.upload.service._selected_youtube_accounts_from_defaults", lambda: accounts)
+    monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda _account: client)
+
+
 def _make_config(tmp_path: Path) -> NovelConfig:
     root = tmp_path
     storage = StorageConfig(
@@ -253,6 +263,189 @@ class ExceptionWithHttpError(Exception):
         self.resp = type("Resp", (), {"status": status})()
 
 
+def test_run_upload_youtube_rotates_account_on_quota_exceeded_before_video_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    config.upload.youtube.credentials_path = ["a_client.json", "b_client.json"]
+    config.upload.youtube.token_path = ["a_token.json", "b_token.json"]
+    _prepare_output_files(config)
+
+    class _MediaFileUpload:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "googleapiclient.http",
+        type("_M", (), {"MediaFileUpload": _MediaFileUpload}),
+    )
+
+    call_order: list[str] = []
+
+    class _Request:
+        def __init__(self, payload=None, *, exc: Exception | None = None):
+            self._payload = payload or {}
+            self._exc = exc
+
+        def execute(self):
+            if self._exc is not None:
+                raise self._exc
+            return self._payload
+
+    class _VideosResource:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def insert(self, **_kwargs):
+            call_order.append(f"{self.account_name}:videos.insert")
+            if self.account_name == "account-1":
+                return _Request(exc=ExceptionWithHttpError(403, b'{"error":{"errors":[{"reason":"quotaExceeded"}]}}'))
+            return _Request({"id": "vid123"})
+
+    class _ThumbnailsResource:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def set(self, **_kwargs):
+            call_order.append(f"{self.account_name}:thumbnails.set")
+            return _Request({})
+
+    class _PlaylistItemsResource:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def insert(self, **_kwargs):
+            call_order.append(f"{self.account_name}:playlistItems.insert")
+            return _Request({})
+
+    class _YoutubeClient:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def videos(self):
+            return _VideosResource(self.account_name)
+
+        def thumbnails(self):
+            return _ThumbnailsResource(self.account_name)
+
+        def playlistItems(self):
+            return _PlaylistItemsResource(self.account_name)
+
+    accounts = [
+        type("Account", (), {"index": 1, "label": "account-1"})(),
+        type("Account", (), {"index": 2, "label": "account-2"})(),
+    ]
+    clients = {
+        "account-1": _YoutubeClient("account-1"),
+        "account-2": _YoutubeClient("account-2"),
+    }
+    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda account: clients[account.label])
+
+    result = run_upload(config, 1, 10, platform="youtube", dry_run=False)
+
+    assert result["status"] == "uploaded"
+    assert result["video_id"] == "vid123"
+    assert call_order == [
+        "account-1:videos.insert",
+        "account-2:videos.insert",
+        "account-2:thumbnails.set",
+        "account-2:playlistItems.insert",
+    ]
+
+
+def test_run_upload_youtube_uses_selected_fixed_account_and_logs_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    config.upload.youtube.project = "2"
+    config.upload.youtube.credentials_path = ["a_client.json", "b_client.json"]
+    config.upload.youtube.token_path = ["a_token.json", "b_token.json"]
+    _prepare_output_files(config)
+    log_path = tmp_path / "upload.log"
+    configure_logging(log_path)
+
+    class _MediaFileUpload:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "googleapiclient.http",
+        type("_M", (), {"MediaFileUpload": _MediaFileUpload}),
+    )
+
+    call_order: list[str] = []
+
+    class _Request:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def execute(self):
+            return self._payload
+
+    class _VideosResource:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def insert(self, **_kwargs):
+            call_order.append(f"{self.account_name}:videos.insert")
+            return _Request({"id": "vid123"})
+
+    class _ThumbnailsResource:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def set(self, **_kwargs):
+            call_order.append(f"{self.account_name}:thumbnails.set")
+            return _Request({})
+
+    class _PlaylistItemsResource:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def insert(self, **_kwargs):
+            call_order.append(f"{self.account_name}:playlistItems.insert")
+            return _Request({})
+
+    class _YoutubeClient:
+        def __init__(self, account_name: str) -> None:
+            self.account_name = account_name
+
+        def videos(self):
+            return _VideosResource(self.account_name)
+
+        def thumbnails(self):
+            return _ThumbnailsResource(self.account_name)
+
+        def playlistItems(self):
+            return _PlaylistItemsResource(self.account_name)
+
+    accounts = [
+        type("Account", (), {"index": 1, "label": "account-1"})(),
+        type("Account", (), {"index": 2, "label": "account-2"})(),
+    ]
+    clients = {
+        "account-1": _YoutubeClient("account-1"),
+        "account-2": _YoutubeClient("account-2"),
+    }
+    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda account: clients[account.label])
+
+    result = run_upload(config, 1, 10, platform="youtube", dry_run=False)
+
+    assert result["status"] == "uploaded"
+    assert call_order == [
+        "account-2:videos.insert",
+        "account-2:thumbnails.set",
+        "account-2:playlistItems.insert",
+    ]
+    content = log_path.read_text(encoding="utf-8")
+    assert "Uploading chuong_1-10 with YouTube project account-2" in content
+    assert "mode=2" in content
+
+
 def test_list_youtube_playlists_collects_all_pages(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Request:
         def __init__(self, payload):
@@ -309,7 +502,7 @@ def test_list_youtube_playlists_collects_all_pages(monkeypatch: pytest.MonkeyPat
             return self.resource
 
     client = _YoutubeClient()
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: client)
+    _patch_default_youtube_client(monkeypatch, client)
 
     result = list_youtube_playlists()
 
@@ -352,7 +545,7 @@ def test_get_youtube_playlist_accepts_full_url(monkeypatch: pytest.MonkeyPatch) 
             return self.resource
 
     client = _YoutubeClient()
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: client)
+    _patch_default_youtube_client(monkeypatch, client)
 
     result = get_youtube_playlist("https://www.youtube.com/playlist?list=PL123")
 
@@ -471,7 +664,7 @@ def test_update_youtube_playlist_preserves_current_fields_when_not_overridden(
             return self.resource
 
     client = _YoutubeClient()
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: client)
+    _patch_default_youtube_client(monkeypatch, client)
 
     result = update_youtube_playlist("PL123")
 
@@ -589,7 +782,7 @@ def test_list_youtube_videos_collects_uploads_playlist_with_batched_video_reques
             return self._videos
 
     client = _YoutubeClient()
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: client)
+    _patch_default_youtube_client(monkeypatch, client)
 
     result = list_youtube_videos()
 
@@ -632,7 +825,7 @@ def test_get_youtube_video_returns_metadata(monkeypatch: pytest.MonkeyPatch) -> 
             return self.resource
 
     client = _YoutubeClient()
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: client)
+    _patch_default_youtube_client(monkeypatch, client)
 
     result = get_youtube_video("vid1")
 
@@ -715,7 +908,7 @@ def test_update_youtube_video_preserves_current_fields_when_not_overridden(
             return self._channels
 
     client = _YoutubeClient()
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: client)
+    _patch_default_youtube_client(monkeypatch, client)
     monkeypatch.setattr(
         "novel_tts.upload.service.get_youtube_video",
         lambda _video_id: {
@@ -842,7 +1035,7 @@ def test_update_uploaded_youtube_playlist_index_descriptions_updates_first_line(
         def videos(self):
             return _VideosResource()
 
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: _YoutubeClient())
+    _patch_default_youtube_client(monkeypatch, _YoutubeClient())
 
     result = update_uploaded_youtube_playlist_index_descriptions(config)
 
@@ -928,7 +1121,7 @@ def test_update_uploaded_youtube_playlist_index_descriptions_sleeps_between_batc
         def videos(self):
             return _VideosResource()
 
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: _YoutubeClient())
+    _patch_default_youtube_client(monkeypatch, _YoutubeClient())
     monkeypatch.setattr("novel_tts.upload.service.time.sleep", lambda seconds: sleeps.append(seconds))
 
     result = update_uploaded_youtube_playlist_index_descriptions(config)
@@ -978,7 +1171,7 @@ def test_update_uploaded_youtube_playlist_index_descriptions_skips_non_uploaded_
         def videos(self):
             return _VideosResource()
 
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: _YoutubeClient())
+    _patch_default_youtube_client(monkeypatch, _YoutubeClient())
 
     result = update_uploaded_youtube_playlist_index_descriptions(config)
 
@@ -1041,7 +1234,7 @@ def test_update_uploaded_youtube_playlist_index_descriptions_summary_counts_only
         def videos(self):
             return _VideosResource()
 
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: _YoutubeClient())
+    _patch_default_youtube_client(monkeypatch, _YoutubeClient())
 
     result = update_uploaded_youtube_playlist_index_descriptions(config)
 
@@ -1056,6 +1249,112 @@ def test_update_uploaded_youtube_playlist_index_descriptions_summary_counts_only
     assert "Uploaded Video count: 1" in content
     assert "Correct description - video count: 1" in content
     assert "Update description - video count: 0" in content
+
+
+def test_update_uploaded_youtube_playlist_index_descriptions_reads_target_playlist_instead_of_uploads_playlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    _prepare_output_files(config, range_key="chuong_1-10")
+    _prepare_translated_file(config, range_key="chuong_1-10")
+    (config.storage.output_dir / "title.txt").write_text(
+        "Tập 1 | Thanh Niên Giả Câm 18 Năm | Thái Hư Chí Tôn | FULL",
+        encoding="utf-8",
+    )
+
+    requested_playlist_ids: list[str] = []
+
+    class _Request:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def execute(self):
+            return self._payload
+
+    class _ChannelsResource:
+        def list(self, **_kwargs):
+            return _Request({"items": [{"contentDetails": {"relatedPlaylists": {"uploads": "UU123"}}}]})
+
+    class _PlaylistItemsResource:
+        def list(self, **kwargs):
+            requested_playlist_ids.append(str(kwargs["playlistId"]))
+            playlist_id = str(kwargs["playlistId"])
+            if playlist_id == "PL1234567890":
+                return _Request(
+                    {
+                        "items": [
+                            {"id": "PLI-target-1", "snippet": {"playlistId": "PL1234567890", "position": 0}, "contentDetails": {"videoId": "vid-target-1"}},
+                        ]
+                    }
+                )
+            if playlist_id == "UU123":
+                return _Request(
+                    {
+                        "items": [
+                            {"id": "PLI-upload-1", "snippet": {"playlistId": "UU123", "position": 0}, "contentDetails": {"videoId": "vid-upload-1"}},
+                        ]
+                    }
+                )
+            return _Request({"items": []})
+
+    class _VideosResource:
+        def list(self, **kwargs):
+            ids = str(kwargs["id"]).split(",")
+            items = []
+            if "vid-target-1" in ids:
+                items.append(
+                    {
+                        "id": "vid-target-1",
+                        "snippet": {
+                            "title": "Tập 1 | Thanh Niên Giả Câm 18 Năm | Thái Hư Chí Tôn | FULL",
+                            "description": "Danh sách phát: https://www.youtube.com/watch?v=vid-target-1&list=PL1234567890\nRest",
+                            "thumbnails": {},
+                            "categoryId": "22",
+                        },
+                        "contentDetails": {},
+                        "status": {"privacyStatus": "public"},
+                        "statistics": {},
+                    }
+                )
+            if "vid-upload-1" in ids:
+                items.append(
+                    {
+                        "id": "vid-upload-1",
+                        "snippet": {
+                            "title": "Some other uploaded video",
+                            "description": "Other description",
+                            "thumbnails": {},
+                            "categoryId": "22",
+                        },
+                        "contentDetails": {},
+                        "status": {"privacyStatus": "public"},
+                        "statistics": {},
+                    }
+                )
+            return _Request({"items": items})
+
+    class _YoutubeClient:
+        def channels(self):
+            return _ChannelsResource()
+
+        def playlistItems(self):
+            return _PlaylistItemsResource()
+
+        def videos(self):
+            return _VideosResource()
+
+    _patch_default_youtube_client(monkeypatch, _YoutubeClient())
+
+    result = update_uploaded_youtube_playlist_index_descriptions(config)
+
+    assert result == [
+        {
+            "title": "Tập 1 | Thanh Niên Giả Câm 18 Năm | Thái Hư Chí Tôn | FULL",
+            "video_id": "vid-target-1",
+            "status": "unchanged",
+        }
+    ]
+    assert requested_playlist_ids == ["PL1234567890"]
 
 
 def test_update_uploaded_youtube_playlist_index_descriptions_without_range_filters_by_novel_title(
@@ -1118,7 +1417,7 @@ def test_update_uploaded_youtube_playlist_index_descriptions_without_range_filte
         def videos(self):
             return _VideosResource()
 
-    monkeypatch.setattr("novel_tts.upload.service._load_youtube_client_from_defaults", lambda: _YoutubeClient())
+    _patch_default_youtube_client(monkeypatch, _YoutubeClient())
 
     result = update_uploaded_youtube_playlist_index_descriptions(config)
 

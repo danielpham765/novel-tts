@@ -1230,9 +1230,16 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                     from_chapter=start,
                     to_chapter=end,
+                    log_summary=False,
                 )
-                LOGGER.info("Upload playlist-index update result: %s", json.dumps(results, ensure_ascii=False))
-                print(json.dumps(results, ensure_ascii=False, indent=2))
+                pretty_results = json.dumps(results, ensure_ascii=False, indent=2)
+                LOGGER.info("Upload playlist-index update result: %s", pretty_results)
+                unchanged_count = sum(1 for item in results if str(item.get("status", "")) == "unchanged")
+                updated_count = sum(1 for item in results if str(item.get("status", "")) == "updated")
+                LOGGER.info("Uploaded Video count: %s", len(results))
+                LOGGER.info("Correct description - video count: %s", unchanged_count)
+                LOGGER.info("Update description - video count: %s", updated_count)
+                print(pretty_results)
                 return 0
 
             if not getattr(args, "range", None):

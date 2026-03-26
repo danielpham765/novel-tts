@@ -204,8 +204,9 @@ class VideoConfig:
 @dataclass
 class UploadYouTubeConfig:
     enabled: bool = False
-    credentials_path: str = ".secrets/youtube/client_secrets.json"
-    token_path: str = ".secrets/youtube/token.json"
+    project: str = "rotate"
+    credentials_path: list[str] = field(default_factory=lambda: [".secrets/youtube/client_secrets.json"])
+    token_path: list[str] = field(default_factory=lambda: [".secrets/youtube/token.json"])
     category_id: str = "22"
     privacy_status: str = "public"
     self_declared_made_for_kids: bool = False

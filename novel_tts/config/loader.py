@@ -178,6 +178,54 @@ def _clean_bool(value) -> bool:
     return text in {"1", "true", "yes", "on", "y"}
 
 
+def _clean_string_list(value, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f'Invalid "{field_name}" config (expected list)')
+    items: list[str] = []
+    for index, item in enumerate(value):
+        text = _clean_text(item)
+        if not text:
+            raise ValueError(f'Invalid "{field_name}[{index}]" config (expected non-empty string)')
+        items.append(text)
+    return items
+
+
+def _normalize_upload_youtube_config(youtube_raw: dict) -> dict:
+    normalized = dict(youtube_raw)
+    project_raw = normalized.get("project", "rotate")
+    project_text = _clean_text(project_raw) or "rotate"
+    if project_text.lower() == "rotate":
+        normalized["project"] = "rotate"
+    else:
+        try:
+            project_index = int(project_text)
+        except Exception as exc:
+            raise ValueError('Invalid "upload.youtube.project" (expected "rotate" or positive integer)') from exc
+        if project_index < 1:
+            raise ValueError('Invalid "upload.youtube.project" (expected "rotate" or positive integer)')
+        normalized["project"] = str(project_index)
+    normalized["credentials_path"] = _clean_string_list(
+        normalized.get("credentials_path", [".secrets/youtube/client_secrets.json"]),
+        field_name="upload.youtube.credentials_path",
+    )
+    normalized["token_path"] = _clean_string_list(
+        normalized.get("token_path", [".secrets/youtube/token.json"]),
+        field_name="upload.youtube.token_path",
+    )
+    if not normalized["credentials_path"]:
+        raise ValueError('Missing "upload.youtube.credentials_path" (non-empty list required)')
+    if not normalized["token_path"]:
+        raise ValueError('Missing "upload.youtube.token_path" (non-empty list required)')
+    if len(normalized["credentials_path"]) != len(normalized["token_path"]):
+        raise ValueError(
+            'Invalid YouTube account config: "upload.youtube.credentials_path" and '
+            '"upload.youtube.token_path" must have the same number of entries'
+        )
+    return normalized
+
+
 def _normalize_proxy_gateway_config(proxy_raw: dict) -> ProxyGatewayConfig:
     if proxy_raw is None:
         proxy_raw = {}
@@ -490,6 +538,7 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         raise ValueError('Invalid "upload.youtube" config (expected object)')
     if not isinstance(tiktok_raw, dict):
         raise ValueError('Invalid "upload.tiktok" config (expected object)')
+    youtube_raw = _normalize_upload_youtube_config(youtube_raw)
     default_platform = _clean_text(upload_raw.get("default_platform")) or "youtube"
     if default_platform not in {"youtube", "tiktok"}:
         raise ValueError('Invalid "upload.default_platform" (expected "youtube" or "tiktok")')

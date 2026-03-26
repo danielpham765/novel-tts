@@ -491,8 +491,8 @@ This helps smooth bursts even though Google mainly documents daily quota units r
 
 Required files:
 
-- `.secrets/youtube/client_secrets.json`
-- `.secrets/youtube/token.json`
+- one `client_secrets.json` per account
+- one `token.json` per account
 
 Example templates:
 
@@ -510,11 +510,21 @@ How to get `client_secrets.json`:
 
 How to get `token.json`:
 
-1. Ensure `upload.youtube.credentials_path` points to `.secrets/youtube/client_secrets.json`.
-2. Run a first upload or dry-run command:
+1. Ensure `upload.youtube.credentials_path` contains the OAuth client JSON path for each account.
+2. Ensure `upload.youtube.token_path` contains the matching token JSON path list in the same order.
+3. Run a first upload or dry-run command:
    - `uv run novel-tts upload <novel_id> --platform youtube --range 1-10 --dry-run`
-3. Complete the browser login/consent flow once.
-4. The CLI will create `.secrets/youtube/token.json`.
+4. Complete the browser login/consent flow once.
+5. The CLI will create the matching `token.json` for the account being used.
+
+Multi-account note:
+
+- `upload.youtube.project` supports `rotate`, `1`, `2`, `3`, ...
+- `rotate` tries account 1, then 2, then 3 when a request hits `quotaExceeded`.
+- `1`, `2`, `3`, ... force a specific configured account instead of rotating.
+- `upload.youtube.credentials_path` and `upload.youtube.token_path` are parallel arrays.
+- Entry `0` in `credentials_path` is paired with entry `0` in `token_path`, and so on.
+- When a YouTube request fails with `quotaExceeded`, upload rotates to the next configured account automatically.
 
 ### YouTube admin commands
 

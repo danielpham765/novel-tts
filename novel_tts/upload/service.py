@@ -6,6 +6,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, TypeVar
 from urllib.parse import parse_qs, urlparse
 
 from novel_tts.common.logging import get_logger
@@ -17,10 +18,12 @@ LOGGER = get_logger(__name__)
 YOUTUBE_BULK_UPDATE_BATCH_SIZE = 5
 YOUTUBE_BULK_UPDATE_SLEEP_SECONDS = 2.0
 YOUTUBE_RATE_LIMIT_REASONS = {
-    "quotaExceeded",
     "rateLimitExceeded",
     "uploadRateLimitExceeded",
     "userRateLimitExceeded",
+}
+YOUTUBE_ROTATE_ACCOUNT_REASONS = {
+    "quotaExceeded",
 }
 
 YOUTUBE_UPLOAD_SCOPES = [
@@ -97,6 +100,14 @@ def _normalize_search_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _extract_episode_number(value: str) -> int | None:
+    normalized = _normalize_search_text(value)
+    match = re.search(r"\btap\s+(\d+)\b", normalized)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def _read_title_template(config: NovelConfig) -> str:
     title_path = _resolve_output_file(config, config.upload.youtube.title_file, field_name="upload.youtube.title_file")
     return _read_required_text(title_path, field_name="title")
@@ -120,29 +131,112 @@ class PlaylistIndexTarget:
     playlist_id: str
 
 
+@dataclass(frozen=True)
+class YouTubeAccountPaths:
+    index: int
+    credentials_path: Path
+    token_path: Path
+
+    @property
+    def label(self) -> str:
+        return self.token_path.name or f"account-{self.index}"
+
+
+T = TypeVar("T")
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _youtube_paths_from_defaults() -> tuple[Path, Path]:
+def _resolve_repo_relative_path(root: Path, raw_path: str) -> Path:
+    path = Path(str(raw_path or "").strip()).expanduser()
+    if not str(path):
+        raise ValueError("Path value is empty")
+    if not path.is_absolute():
+        path = root / path
+    return path
+
+
+def _youtube_accounts_from_raw(youtube_raw: dict[str, object], *, root: Path) -> list[YouTubeAccountPaths]:
+    credentials_raw = youtube_raw.get("credentials_path", [".secrets/youtube/client_secrets.json"])
+    token_raw = youtube_raw.get("token_path", [".secrets/youtube/token.json"])
+    if not isinstance(credentials_raw, list) or not credentials_raw:
+        raise ValueError('Missing "upload.youtube.credentials_path" in configs/app.yaml (non-empty list required)')
+    if not isinstance(token_raw, list) or not token_raw:
+        raise ValueError('Missing "upload.youtube.token_path" in configs/app.yaml (non-empty list required)')
+    if len(credentials_raw) != len(token_raw):
+        raise ValueError(
+            'Invalid YouTube account config: "upload.youtube.credentials_path" and '
+            '"upload.youtube.token_path" must have the same number of entries'
+        )
+
+    accounts: list[YouTubeAccountPaths] = []
+    for index, (credentials_value, token_value) in enumerate(zip(credentials_raw, token_raw), start=1):
+        credentials_text = str(credentials_value or "").strip()
+        token_text = str(token_value or "").strip()
+        if not credentials_text:
+            raise ValueError(f'Invalid "upload.youtube.credentials_path[{index - 1}]" in configs/app.yaml')
+        if not token_text:
+            raise ValueError(f'Invalid "upload.youtube.token_path[{index - 1}]" in configs/app.yaml')
+        accounts.append(
+            YouTubeAccountPaths(
+                index=index,
+                credentials_path=_resolve_repo_relative_path(root, credentials_text),
+                token_path=_resolve_repo_relative_path(root, token_text),
+            )
+        )
+    return accounts
+
+
+def _youtube_accounts_from_defaults() -> list[YouTubeAccountPaths]:
     app_raw = _load_app_config()
     upload_raw = app_raw.get("upload", {}) or {}
     youtube_raw = upload_raw.get("youtube", {}) or {}
-    credentials_raw = str(youtube_raw.get("credentials_path", ".secrets/youtube/client_secrets.json") or "").strip()
-    token_raw = str(youtube_raw.get("token_path", ".secrets/youtube/token.json") or "").strip()
-    if not credentials_raw:
-        raise ValueError('Missing "upload.youtube.credentials_path" in configs/app.yaml')
-    if not token_raw:
-        raise ValueError('Missing "upload.youtube.token_path" in configs/app.yaml')
+    return _youtube_accounts_from_raw(youtube_raw, root=_repo_root())
 
-    root = _repo_root()
-    credentials_path = Path(credentials_raw).expanduser()
-    if not credentials_path.is_absolute():
-        credentials_path = root / credentials_path
-    token_path = Path(token_raw).expanduser()
-    if not token_path.is_absolute():
-        token_path = root / token_path
-    return credentials_path, token_path
+
+def _youtube_project_selector_from_defaults() -> str:
+    app_raw = _load_app_config()
+    upload_raw = app_raw.get("upload", {}) or {}
+    youtube_raw = upload_raw.get("youtube", {}) or {}
+    return str(youtube_raw.get("project", "rotate") or "rotate")
+
+
+def _selected_youtube_accounts_from_defaults() -> list[YouTubeAccountPaths]:
+    return _select_youtube_accounts(
+        _youtube_accounts_from_defaults(),
+        project_selector=_youtube_project_selector_from_defaults(),
+    )
+
+
+def _youtube_accounts_from_config(config: NovelConfig) -> list[YouTubeAccountPaths]:
+    return _youtube_accounts_from_raw(
+        {
+            "credentials_path": list(config.upload.youtube.credentials_path),
+            "token_path": list(config.upload.youtube.token_path),
+        },
+        root=config.storage.root,
+    )
+
+
+def _select_youtube_accounts(accounts: list[YouTubeAccountPaths], *, project_selector: str) -> list[YouTubeAccountPaths]:
+    if not accounts:
+        raise ValueError("No YouTube accounts configured")
+    selector = str(project_selector or "rotate").strip().lower()
+    if selector in {"", "rotate"}:
+        return accounts
+    try:
+        account_index = int(selector)
+    except Exception as exc:
+        raise ValueError('Invalid "upload.youtube.project" (expected "rotate" or positive integer)') from exc
+    if account_index < 1:
+        raise ValueError('Invalid "upload.youtube.project" (expected "rotate" or positive integer)')
+    if account_index > len(accounts):
+        raise ValueError(
+            f'Invalid "upload.youtube.project": {account_index} (configured projects: 1-{len(accounts)})'
+        )
+    return [accounts[account_index - 1]]
 
 
 def _build_youtube_client_from_paths(credentials_path: Path, token_path: Path):
@@ -220,6 +314,13 @@ def _extract_error_status(exc: Exception) -> int | None:
         return None
 
 
+def _is_youtube_quota_rotation_error(exc: Exception) -> bool:
+    status = _extract_error_status(exc)
+    if status != 403:
+        return False
+    return any(reason in YOUTUBE_ROTATE_ACCOUNT_REASONS for reason in _extract_error_reasons(exc))
+
+
 def _is_youtube_rate_limit_error(exc: Exception) -> bool:
     status = _extract_error_status(exc)
     if status == 429:
@@ -254,6 +355,42 @@ def _execute_youtube_request(request, cfg, *, operation_name: str):
             )
             time.sleep(delay)
             attempt += 1
+
+
+def _build_youtube_client_for_account(account: YouTubeAccountPaths):
+    return _build_youtube_client_from_paths(account.credentials_path, account.token_path)
+
+
+def _run_with_youtube_accounts(
+    accounts: list[YouTubeAccountPaths],
+    cfg,
+    *,
+    operation_name: str,
+    action: Callable[[object, YouTubeAccountPaths], T],
+) -> T:
+    if not accounts:
+        raise ValueError("No YouTube accounts configured")
+
+    last_error: Exception | None = None
+    for offset, account in enumerate(accounts):
+        youtube = _build_youtube_client_for_account(account)
+        try:
+            return action(youtube, account)
+        except Exception as exc:
+            last_error = exc
+            if (not _is_youtube_quota_rotation_error(exc)) or offset >= len(accounts) - 1:
+                raise
+            reasons = ", ".join(_extract_error_reasons(exc)) or f"http {(_extract_error_status(exc) or 'unknown')}"
+            LOGGER.warning(
+                "YouTube %s exhausted quota on account %s. Rotating to the next account (%s/%s). Reason: %s",
+                operation_name,
+                account.label,
+                offset + 2,
+                len(accounts),
+                reasons,
+            )
+    assert last_error is not None
+    raise last_error
 
 
 def _build_upload_spec(config: NovelConfig, start: int, end: int, *, require_media_files: bool = True) -> UploadSpec:
@@ -462,18 +599,12 @@ def _update_youtube_video_description_only(youtube, current_video: dict[str, obj
 
 
 def _load_youtube_client(config: NovelConfig):
-    credentials_path = Path(config.upload.youtube.credentials_path).expanduser()
-    if not credentials_path.is_absolute():
-        credentials_path = config.storage.root / credentials_path
-    token_path = Path(config.upload.youtube.token_path).expanduser()
-    if not token_path.is_absolute():
-        token_path = config.storage.root / token_path
-    return _build_youtube_client_from_paths(credentials_path, token_path)
+    account = _select_youtube_accounts(_youtube_accounts_from_config(config), project_selector=config.upload.youtube.project)[0]
+    return _build_youtube_client_for_account(account)
 
 
 def _load_youtube_client_from_defaults():
-    credentials_path, token_path = _youtube_paths_from_defaults()
-    return _build_youtube_client_from_paths(credentials_path, token_path)
+    return _build_youtube_client_for_account(_selected_youtube_accounts_from_defaults()[0])
 
 
 def _playlist_to_metadata(item: dict) -> dict[str, object]:
@@ -586,16 +717,15 @@ def _find_uploads_playlist_item_for_video(youtube, video_id: str) -> tuple[str, 
     return uploads_playlist_id, None
 
 
-def list_youtube_videos() -> list[dict[str, object]]:
-    youtube = _load_youtube_client_from_defaults()
-    uploads_playlist_id = _get_uploads_playlist_id(youtube)
+def _list_playlist_videos(youtube, playlist_id: str) -> list[dict[str, object]]:
+    normalized_playlist_id = _parse_playlist_id(playlist_id)
     playlist_items: list[dict] = []
     page_token = None
 
     while True:
         response = youtube.playlistItems().list(
             part="snippet,contentDetails,status",
-            playlistId=uploads_playlist_id,
+            playlistId=normalized_playlist_id,
             maxResults=50,
             pageToken=page_token,
         ).execute()
@@ -637,25 +767,46 @@ def list_youtube_videos() -> list[dict[str, object]]:
     ]
 
 
+def list_youtube_videos() -> list[dict[str, object]]:
+    def _action(youtube, _account: YouTubeAccountPaths) -> list[dict[str, object]]:
+        uploads_playlist_id = _get_uploads_playlist_id(youtube)
+        return _list_playlist_videos(youtube, uploads_playlist_id)
+
+    return _run_with_youtube_accounts(
+        _selected_youtube_accounts_from_defaults(),
+        None,
+        operation_name="videos.list",
+        action=_action,
+    )
+
+
 def get_youtube_video(video_id: str) -> dict[str, object]:
-    youtube = _load_youtube_client_from_defaults()
     normalized_id = str(video_id or "").strip()
     if not normalized_id:
         raise ValueError("Video id is empty")
-    response = youtube.videos().list(
-        part="snippet,contentDetails,status,statistics",
-        id=normalized_id,
-        maxResults=1,
-    ).execute()
-    items = response.get("items", []) or []
-    if not items:
-        raise ValueError(f"YouTube video not found: {normalized_id}")
-    playlist_item = None
-    try:
-        _uploads_playlist_id, playlist_item = _find_uploads_playlist_item_for_video(youtube, normalized_id)
-    except Exception:
+
+    def _action(youtube, _account: YouTubeAccountPaths) -> dict[str, object]:
+        response = youtube.videos().list(
+            part="snippet,contentDetails,status,statistics",
+            id=normalized_id,
+            maxResults=1,
+        ).execute()
+        items = response.get("items", []) or []
+        if not items:
+            raise ValueError(f"YouTube video not found: {normalized_id}")
         playlist_item = None
-    return _video_to_metadata(items[0], playlist_item=playlist_item)
+        try:
+            _uploads_playlist_id, playlist_item = _find_uploads_playlist_item_for_video(youtube, normalized_id)
+        except Exception:
+            playlist_item = None
+        return _video_to_metadata(items[0], playlist_item=playlist_item)
+
+    return _run_with_youtube_accounts(
+        _selected_youtube_accounts_from_defaults(),
+        None,
+        operation_name=f"videos.get {normalized_id}",
+        action=_action,
+    )
 
 
 def update_youtube_video(
@@ -766,78 +917,89 @@ def update_uploaded_youtube_playlist_index_descriptions(
     *,
     from_chapter: int | None = None,
     to_chapter: int | None = None,
+    log_summary: bool = True,
 ) -> list[dict[str, object]]:
-    youtube = _load_youtube_client_from_defaults()
-    uploads_playlist_id = _get_uploads_playlist_id(youtube)
-    playlist_items: list[dict] = []
-    page_token = None
-    while True:
-        response = youtube.playlistItems().list(
-            part="snippet,contentDetails,status",
-            playlistId=uploads_playlist_id,
-            maxResults=50,
-            pageToken=page_token,
-        ).execute()
-        playlist_items.extend(response.get("items", []) or [])
-        page_token = str(response.get("nextPageToken", "")).strip() or None
-        if page_token is None:
-            break
+    def _action(youtube, _account: YouTubeAccountPaths) -> list[dict[str, object]]:
+        target_playlist_id = _read_playlist_id(config)
+        remote_videos = _list_playlist_videos(youtube, target_playlist_id)
+        results: list[dict[str, object]] = []
+        updated_in_batch = 0
+        matched_uploaded_count = 0
+        unchanged_count = 0
+        updated_count = 0
+        if from_chapter is None and to_chapter is None:
+            playlist_id = target_playlist_id
+            matched_videos = [video for video in remote_videos if _video_matches_novel(config, str(video.get("title", "")))]
+            for idx, remote_video in enumerate(matched_videos):
+                matched_uploaded_count += 1
+                remote_video_id = str(remote_video.get("id", "")).strip()
+                current_title = str(remote_video.get("title", "") or "")
+                current_description = str(remote_video.get("description", "") or "")
+                updated_description = _update_playlist_line(
+                    current_description,
+                    video_id=remote_video_id,
+                    playlist_id=playlist_id,
+                )
+                if updated_description == current_description:
+                    results.append({"title": current_title, "video_id": remote_video_id, "status": "unchanged"})
+                    unchanged_count += 1
+                else:
+                    _update_youtube_video_description_only(youtube, remote_video, updated_description)
+                    results.append({"title": current_title, "video_id": remote_video_id, "status": "updated"})
+                    updated_count += 1
+                    updated_in_batch += 1
+                    if updated_in_batch >= YOUTUBE_BULK_UPDATE_BATCH_SIZE and idx < len(matched_videos) - 1:
+                        LOGGER.info(
+                            "YouTube bulk description update cooldown: sleeping %.1fs after %s updates",
+                            YOUTUBE_BULK_UPDATE_SLEEP_SECONDS,
+                            updated_in_batch,
+                        )
+                        time.sleep(YOUTUBE_BULK_UPDATE_SLEEP_SECONDS)
+                        updated_in_batch = 0
+        else:
+            remote_by_title: dict[str, dict[str, object]] = {}
+            for video in remote_videos:
+                key = _normalize_title(str(video.get("title", "")))
+                if key and key not in remote_by_title:
+                    remote_by_title[key] = video
 
-    playlist_by_video_id: dict[str, dict] = {}
-    ordered_ids: list[str] = []
-    for item in playlist_items:
-        video_id = str((item.get("contentDetails", {}) or {}).get("videoId", "")).strip()
-        if not video_id:
-            continue
-        if video_id not in playlist_by_video_id:
-            ordered_ids.append(video_id)
-            playlist_by_video_id[video_id] = item
+            specs = _iter_translated_playlist_index_targets(config, from_chapter=from_chapter, to_chapter=to_chapter)
+            for idx, spec in enumerate(specs):
+                title_key = _normalize_title(spec.title)
+                remote_video = remote_by_title.get(title_key)
+                if remote_video is None:
+                    continue
+                matched_uploaded_count += 1
 
-    videos_by_id: dict[str, dict] = {}
-    for idx in range(0, len(ordered_ids), 50):
-        batch_ids = ordered_ids[idx : idx + 50]
-        response = youtube.videos().list(
-            part="snippet,contentDetails,status,statistics",
-            id=",".join(batch_ids),
-            maxResults=50,
-        ).execute()
-        for item in response.get("items", []) or []:
-            video_id = str(item.get("id", "")).strip()
-            if video_id:
-                videos_by_id[video_id] = item
+                remote_video_id = str(remote_video.get("id", "")).strip()
+                current_description = str(remote_video.get("description", "") or "")
+                updated_description = _update_playlist_line(
+                    current_description,
+                    video_id=remote_video_id,
+                    playlist_id=spec.playlist_id,
+                )
+                if updated_description == current_description:
+                    results.append(
+                        {
+                            "title": spec.title,
+                            "video_id": remote_video_id,
+                            "status": "unchanged",
+                        }
+                    )
+                    unchanged_count += 1
+                    continue
 
-    remote_videos = [
-        _video_to_metadata(videos_by_id[video_id], playlist_item=playlist_by_video_id.get(video_id))
-        for video_id in ordered_ids
-        if video_id in videos_by_id
-    ]
-    results: list[dict[str, object]] = []
-    updated_in_batch = 0
-    matched_uploaded_count = 0
-    unchanged_count = 0
-    updated_count = 0
-    if from_chapter is None and to_chapter is None:
-        playlist_id = _read_playlist_id(config)
-        matched_videos = [video for video in remote_videos if _video_matches_novel(config, str(video.get("title", "")))]
-        for idx, remote_video in enumerate(matched_videos):
-            matched_uploaded_count += 1
-            remote_video_id = str(remote_video.get("id", "")).strip()
-            current_title = str(remote_video.get("title", "") or "")
-            current_description = str(remote_video.get("description", "") or "")
-            updated_description = _update_playlist_line(
-                current_description,
-                video_id=remote_video_id,
-                playlist_id=playlist_id,
-            )
-            if updated_description == current_description:
-                results.append({"title": current_title, "video_id": remote_video_id, "status": "unchanged"})
-                unchanged_count += 1
-            else:
                 _update_youtube_video_description_only(youtube, remote_video, updated_description)
-                results.append({"title": current_title, "video_id": remote_video_id, "status": "updated"})
+                results.append(
+                    {
+                        "title": spec.title,
+                        "video_id": remote_video_id,
+                        "status": "updated",
+                    }
+                )
                 updated_count += 1
                 updated_in_batch += 1
-                if updated_in_batch >= YOUTUBE_BULK_UPDATE_BATCH_SIZE and idx < len(matched_videos) - 1:
+                if updated_in_batch >= YOUTUBE_BULK_UPDATE_BATCH_SIZE and idx < len(specs) - 1:
                     LOGGER.info(
                         "YouTube bulk description update cooldown: sleeping %.1fs after %s updates",
                         YOUTUBE_BULK_UPDATE_SLEEP_SECONDS,
@@ -845,98 +1007,67 @@ def update_uploaded_youtube_playlist_index_descriptions(
                     )
                     time.sleep(YOUTUBE_BULK_UPDATE_SLEEP_SECONDS)
                     updated_in_batch = 0
-    else:
-        remote_by_title: dict[str, dict[str, object]] = {}
-        for video in remote_videos:
-            key = _normalize_title(str(video.get("title", "")))
-            if key and key not in remote_by_title:
-                remote_by_title[key] = video
 
-        specs = _iter_translated_playlist_index_targets(config, from_chapter=from_chapter, to_chapter=to_chapter)
-        for idx, spec in enumerate(specs):
-            title_key = _normalize_title(spec.title)
-            remote_video = remote_by_title.get(title_key)
-            if remote_video is None:
-                continue
-            matched_uploaded_count += 1
+        if log_summary:
+            LOGGER.info("Uploaded Video count: %s", matched_uploaded_count)
+            LOGGER.info("Correct description - video count: %s", unchanged_count)
+            LOGGER.info("Update description - video count: %s", updated_count)
+        return results
 
-            remote_video_id = str(remote_video.get("id", "")).strip()
-            current_description = str(remote_video.get("description", "") or "")
-            updated_description = _update_playlist_line(
-                current_description,
-                video_id=remote_video_id,
-                playlist_id=spec.playlist_id,
-            )
-            if updated_description == current_description:
-                results.append(
-                    {
-                        "title": spec.title,
-                        "video_id": remote_video_id,
-                        "status": "unchanged",
-                    }
-                )
-                unchanged_count += 1
-                continue
-
-            _update_youtube_video_description_only(youtube, remote_video, updated_description)
-            results.append(
-                {
-                    "title": spec.title,
-                    "video_id": remote_video_id,
-                    "status": "updated",
-                }
-            )
-            updated_count += 1
-            updated_in_batch += 1
-            if updated_in_batch >= YOUTUBE_BULK_UPDATE_BATCH_SIZE and idx < len(specs) - 1:
-                LOGGER.info(
-                    "YouTube bulk description update cooldown: sleeping %.1fs after %s updates",
-                    YOUTUBE_BULK_UPDATE_SLEEP_SECONDS,
-                    updated_in_batch,
-                )
-                time.sleep(YOUTUBE_BULK_UPDATE_SLEEP_SECONDS)
-                updated_in_batch = 0
-
-    LOGGER.info("Uploaded Video count: %s", matched_uploaded_count)
-    LOGGER.info("Correct description - video count: %s", unchanged_count)
-    LOGGER.info("Update description - video count: %s", updated_count)
-
-    return results
+    return _run_with_youtube_accounts(
+        _selected_youtube_accounts_from_defaults(),
+        None,
+        operation_name="videos.bulk-update-description",
+        action=_action,
+    )
 
 
 def list_youtube_playlists() -> list[dict[str, object]]:
-    youtube = _load_youtube_client_from_defaults()
-    playlists: list[dict[str, object]] = []
-    page_token = None
+    def _action(youtube, _account: YouTubeAccountPaths) -> list[dict[str, object]]:
+        playlists: list[dict[str, object]] = []
+        page_token = None
 
-    while True:
-        response = youtube.playlists().list(
-            part="snippet,contentDetails,status",
-            mine=True,
-            maxResults=50,
-            pageToken=page_token,
-        ).execute()
-        for item in response.get("items", []) or []:
-            playlists.append(_playlist_to_metadata(item))
-        page_token = str(response.get("nextPageToken", "")).strip() or None
-        if page_token is None:
-            break
+        while True:
+            response = youtube.playlists().list(
+                part="snippet,contentDetails,status",
+                mine=True,
+                maxResults=50,
+                pageToken=page_token,
+            ).execute()
+            for item in response.get("items", []) or []:
+                playlists.append(_playlist_to_metadata(item))
+            page_token = str(response.get("nextPageToken", "")).strip() or None
+            if page_token is None:
+                break
+        return playlists
 
-    return playlists
+    return _run_with_youtube_accounts(
+        _selected_youtube_accounts_from_defaults(),
+        None,
+        operation_name="playlists.list",
+        action=_action,
+    )
 
 
 def get_youtube_playlist(playlist_id: str) -> dict[str, object]:
-    youtube = _load_youtube_client_from_defaults()
     normalized_id = _parse_playlist_id(playlist_id)
-    response = youtube.playlists().list(
-        part="snippet,contentDetails,status",
-        id=normalized_id,
-        maxResults=1,
-    ).execute()
-    items = response.get("items", []) or []
-    if not items:
-        raise ValueError(f"YouTube playlist not found: {normalized_id}")
-    return _playlist_to_metadata(items[0])
+    def _action(youtube, _account: YouTubeAccountPaths) -> dict[str, object]:
+        response = youtube.playlists().list(
+            part="snippet,contentDetails,status",
+            id=normalized_id,
+            maxResults=1,
+        ).execute()
+        items = response.get("items", []) or []
+        if not items:
+            raise ValueError(f"YouTube playlist not found: {normalized_id}")
+        return _playlist_to_metadata(items[0])
+
+    return _run_with_youtube_accounts(
+        _youtube_accounts_from_defaults(),
+        None,
+        operation_name=f"playlists.get {normalized_id}",
+        action=_action,
+    )
 
 
 def update_youtube_playlist(
@@ -992,6 +1123,7 @@ def _upload_youtube(config: NovelConfig, spec: UploadSpec, *, dry_run: bool) -> 
     preview = {
         "platform": "youtube",
         "range_key": spec.range_key,
+        "project": cfg.project,
         "video_path": str(spec.video_path),
         "thumbnail_path": str(spec.thumbnail_path),
         "title": spec.title,
@@ -1005,7 +1137,6 @@ def _upload_youtube(config: NovelConfig, spec: UploadSpec, *, dry_run: bool) -> 
     if dry_run:
         return {"platform": "youtube", "range_key": spec.range_key, "status": "dry-run"}
 
-    youtube = _load_youtube_client(config)
     from googleapiclient.http import MediaFileUpload
 
     body = {
@@ -1019,44 +1150,79 @@ def _upload_youtube(config: NovelConfig, spec: UploadSpec, *, dry_run: bool) -> 
             "selfDeclaredMadeForKids": bool(cfg.self_declared_made_for_kids),
         },
     }
-    insert_request = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=MediaFileUpload(str(spec.video_path), chunksize=-1, resumable=True),
-    )
-    response = _execute_youtube_request(insert_request, cfg, operation_name=f"videos.insert {spec.range_key}")
-    video_id = str(response.get("id", "")).strip()
-    if not video_id:
-        raise RuntimeError("YouTube upload completed but no video id was returned")
+    accounts = _select_youtube_accounts(_youtube_accounts_from_config(config), project_selector=cfg.project)
+    last_error: Exception | None = None
+    for offset, account in enumerate(accounts):
+        LOGGER.info(
+            "Uploading %s with YouTube project %s (%s/%s, mode=%s)",
+            spec.range_key,
+            account.label,
+            offset + 1,
+            len(accounts),
+            cfg.project,
+        )
+        youtube = _build_youtube_client_for_account(account)
+        video_id = ""
+        try:
+            insert_request = youtube.videos().insert(
+                part="snippet,status",
+                body=body,
+                media_body=MediaFileUpload(str(spec.video_path), chunksize=-1, resumable=True),
+            )
+            response = _execute_youtube_request(insert_request, cfg, operation_name=f"videos.insert {spec.range_key}")
+            video_id = str(response.get("id", "")).strip()
+            if not video_id:
+                raise RuntimeError("YouTube upload completed but no video id was returned")
 
-    _execute_youtube_request(
-        youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(str(spec.thumbnail_path))),
-        cfg,
-        operation_name=f"thumbnails.set {video_id}",
-    )
-    _execute_youtube_request(
-        youtube.playlistItems().insert(
-            part="snippet",
-            body={
-                "snippet": {
-                    "playlistId": spec.playlist_id,
-                    "resourceId": {
-                        "kind": "youtube#video",
-                        "videoId": video_id,
+            _execute_youtube_request(
+                youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(str(spec.thumbnail_path))),
+                cfg,
+                operation_name=f"thumbnails.set {video_id}",
+            )
+            _execute_youtube_request(
+                youtube.playlistItems().insert(
+                    part="snippet",
+                    body={
+                        "snippet": {
+                            "playlistId": spec.playlist_id,
+                            "resourceId": {
+                                "kind": "youtube#video",
+                                "videoId": video_id,
+                            },
+                        }
                     },
-                }
-            },
-        ),
-        cfg,
-        operation_name=f"playlistItems.insert {video_id}",
-    )
-    return {
-        "platform": "youtube",
-        "range_key": spec.range_key,
-        "status": "uploaded",
-        "video_id": video_id,
-        "video_url": f"https://www.youtube.com/watch?v={video_id}",
-    }
+                ),
+                cfg,
+                operation_name=f"playlistItems.insert {video_id}",
+            )
+            return {
+                "platform": "youtube",
+                "range_key": spec.range_key,
+                "status": "uploaded",
+                "video_id": video_id,
+                "video_url": f"https://www.youtube.com/watch?v={video_id}",
+            }
+        except Exception as exc:
+            last_error = exc
+            if video_id and _is_youtube_quota_rotation_error(exc):
+                raise RuntimeError(
+                    f"YouTube account {account.label} hit quota after uploading video {video_id}. "
+                    "Automatic rotation was skipped to avoid cross-account ownership issues; "
+                    "complete thumbnail/playlist steps manually or retry later with the same account."
+                ) from exc
+            if (not _is_youtube_quota_rotation_error(exc)) or offset >= len(accounts) - 1:
+                raise
+            reasons = ", ".join(_extract_error_reasons(exc)) or f"http {(_extract_error_status(exc) or 'unknown')}"
+            LOGGER.warning(
+                "YouTube videos.insert %s exhausted quota on account %s. Rotating to the next account (%s/%s). Reason: %s",
+                spec.range_key,
+                account.label,
+                offset + 2,
+                len(accounts),
+                reasons,
+            )
+    assert last_error is not None
+    raise last_error
 
 
 def _run_tiktok_dry_run(config: NovelConfig, start: int, end: int, *, dry_run: bool) -> dict[str, str]:

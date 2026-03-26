@@ -148,8 +148,13 @@
     "default_platform": "youtube",
     "youtube": {
       "enabled": false,
-      "credentials_path": ".secrets/youtube/client_secrets.json",
-      "token_path": ".secrets/youtube/token.json",
+      "project": "rotate",
+      "credentials_path": [
+        ".secrets/youtube/client_secrets.json"
+      ],
+      "token_path": [
+        ".secrets/youtube/token.json"
+      ],
       "category_id": "22",
       "privacy_status": "public",
       "self_declared_made_for_kids": false,
