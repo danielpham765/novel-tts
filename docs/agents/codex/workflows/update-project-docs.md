@@ -14,6 +14,7 @@ Use this workflow when the user asks to refresh project documentation so it matc
 
 Default docs to consider:
 
+- `AGENTS.md`
 - `README.md`
 - `docs/ARCHITECTURE.md`
 - `docs/agents/codex/AGENTS.md`
@@ -24,15 +25,16 @@ Update only the docs actually affected by the current code changes or drift you 
 
 ## Read Order
 
-1. `README.md`
-2. `docs/ARCHITECTURE.md`
-3. `docs/agents/codex/AGENTS.md`
-4. `docs/agents/cursor/AGENTS.md`
-5. any existing workflow docs under `docs/agents/codex/workflows/`
-6. `novel_tts/cli/main.py`
-7. `novel_tts/config/loader.py`
-8. `novel_tts/config/models.py`
-9. stage service roots:
+1. `AGENTS.md`
+2. `README.md`
+3. `docs/ARCHITECTURE.md`
+4. `docs/agents/codex/AGENTS.md`
+5. `docs/agents/cursor/AGENTS.md`
+6. any existing workflow docs under `docs/agents/codex/workflows/`
+7. `novel_tts/cli/main.py`
+8. `novel_tts/config/loader.py`
+9. `novel_tts/config/models.py`
+10. stage service roots:
    - `novel_tts/crawl/service.py`
    - `novel_tts/translate/novel.py`
    - `novel_tts/translate/captions.py`
@@ -73,13 +75,14 @@ Across the affected docs, make sure the current docs set covers:
 - do not infer features from old docs alone
 - do not bulk-describe generated artifacts from `input/` or `output/`
 - do not update one doc in a way that contradicts another
-- do not leave architecture, README, and agent docs half-migrated
+- do not leave root `AGENTS.md`, architecture docs, README, and agent docs half-migrated
 
 ## Definition Of Done
 
 - all affected docs match current CLI/config/module structure
 - references to commands, files, and modules use current names
 - workflow docs and agent docs point to the right locations
+- root `AGENTS.md` and agent docs stay aligned on shared repo rules
 - storage/invariant sections align with current code contracts
 - `README.md` stays task-oriented, while `docs/ARCHITECTURE.md` stays deeper and more structural
 - `docs/ARCHITECTURE.md` is detailed enough to explain the current architecture, module boundaries, and storage/runtime contracts

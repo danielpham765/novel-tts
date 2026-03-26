@@ -41,6 +41,10 @@ Do **not** read these folders (or files under them) unless the task explicitly r
 - `./output`
 - `./image`
 - `./tmp`
+- `./.logs`
+- `./.secrets`
+- `./.venv`
+- `./tests`
 
 If you must inspect artifacts, do it surgically (one file, small excerpts).
 

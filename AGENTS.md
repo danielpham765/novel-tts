@@ -25,6 +25,10 @@ To keep context small and avoid accidentally ingesting large/generated assets, *
 - `./output`
 - `./image`
 - `./tmp`
+- `./.logs`
+- `./.secrets`
+- `./.venv`
+- `./tests`
 
 When you must inspect artifacts, prefer **targeted, minimal reads** (specific file paths and small excerpts) instead of directory-wide scans.
 

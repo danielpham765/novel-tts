@@ -41,7 +41,7 @@ If you are trying to understand or modify behavior, **load these files in roughl
    - `docs/agents/codex/AGENTS.md` – concise rules and module map (still valid for Cursor).
 3. **Repo hygiene**
    - Avoid loading large/generated artifacts into context.
-   - Do **not** read these folders (or files under them) unless the task explicitly requires it: `./input`, `./output`, `./image`, `./tmp`.
+   - Do **not** read these folders (or files under them) unless the task explicitly requires it: `./input`, `./output`, `./image`, `./tmp`, `./.logs`, `./.secrets`, `./.venv`, `./tests`.
    - When you must inspect artifacts, prefer targeted, minimal reads (one file, small excerpts).
 4. **Refactor/architecture rule**
    - When doing refactor/architecture/strategy changes, avoid keeping aliases/backward-compatible code paths by default.
