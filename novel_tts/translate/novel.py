@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from novel_tts.common.logging import get_logger
+from novel_tts.common.text import normalize_ellipsis
 from novel_tts.common.errors import RateLimitExceededError
 from novel_tts.config.models import NovelConfig
 
@@ -1477,7 +1478,7 @@ def repair_obvious_errors(text: str) -> str:
     text = re.sub(r"^(Chương\s+\d+[^\n]*?)([A-ZÀ-Ỵ\"“])", r"\1\n\n\2", text, flags=re.MULTILINE)
     text = re.sub(r"(Chương\s+\d+)\s*\n(?!\n)", r"\1\n\n", text)
     text = re.sub(r"([.!?…])([A-ZÀ-Ỵ\"“])", r"\1 \2", text)
-    return text
+    return normalize_ellipsis(text)
 
 
 def post_process(text: str, replacements: dict[str, str]) -> str:
@@ -1487,7 +1488,7 @@ def post_process(text: str, replacements: dict[str, str]) -> str:
     text = re.sub(r"(?m)^[ \t]+", "", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip() + "\n"
+    return normalize_ellipsis(text).strip() + "\n"
 
 
 def progress_path(config: NovelConfig, key: str) -> Path:

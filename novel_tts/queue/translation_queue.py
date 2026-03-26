@@ -1649,6 +1649,68 @@ def add_jobs_to_queue(config: NovelConfig, from_chapter: int, to_chapter: int, *
     return 0
 
 
+def wait_for_range_completion(
+    config: NovelConfig,
+    from_chapter: int,
+    to_chapter: int,
+    *,
+    poll_interval_seconds: float = 2.0,
+) -> int:
+    """
+    Block until every chapter in the requested range no longer needs queue work.
+
+    This is intended for orchestration flows like `pipeline run`, where we want
+    to use queue-first translation but still wait until the requested chapter
+    range is complete before starting downstream media stages.
+    """
+    if from_chapter > to_chapter:
+        from_chapter, to_chapter = to_chapter, from_chapter
+
+    client = _client(config)
+    logged_waiting = False
+
+    while True:
+        pending = _pending_total_len(config, client)
+        queued = int(client.scard(_key(config, "queued")) or 0)
+        inflight = int(client.hlen(_key(config, "inflight")) or 0)
+        remaining = 0
+
+        for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
+            for chapter_num, chapter_text in load_source_chapters(config, source_path):
+                try:
+                    chap = int(str(chapter_num))
+                except Exception:
+                    continue
+                if chap < from_chapter or chap > to_chapter:
+                    continue
+                if _chapter_needs_work(config, source_path, str(chap), chapter_text=chapter_text):
+                    remaining += 1
+
+        if remaining == 0 and pending == 0 and queued == 0 and inflight == 0:
+            LOGGER.info(
+                "Queue range completed | novel=%s range=%s-%s",
+                config.novel_id,
+                from_chapter,
+                to_chapter,
+            )
+            return 0
+
+        if not logged_waiting:
+            LOGGER.info(
+                "Waiting for queue range completion | novel=%s range=%s-%s remaining=%s pending=%s queued=%s inflight=%s",
+                config.novel_id,
+                from_chapter,
+                to_chapter,
+                remaining,
+                pending,
+                queued,
+                inflight,
+            )
+            logged_waiting = True
+
+        time.sleep(max(0.5, float(poll_interval_seconds)))
+
+
 def add_chapters_to_queue(config: NovelConfig, chapters: list[int], *, force: bool = False) -> int:
     """Enqueue an explicit list of chapters for translation.
 
@@ -3055,6 +3117,23 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False, *, add_queue:
             except Exception:
                 LOGGER.warning("Failed to remove status artifact on restart: %s", path)
         time.sleep(1)
+    else:
+        rc, ps_stdout = _run_ps_ax(cwd=config.storage.root)
+        if rc == 0:
+            rows, _ppid_by_pid, _worker_meta_by_pid = _collect_queue_rows_from_ps(ps_stdout)
+            has_supervisor = any(
+                row.get("novel_id") == config.novel_id and row.get("role") == "supervisor"
+                for row in rows
+            )
+            has_monitor = any(
+                row.get("novel_id") == config.novel_id and row.get("role") == "monitor"
+                for row in rows
+            )
+            if has_supervisor and has_monitor:
+                LOGGER.info("Queue stack already running | novel=%s", config.novel_id)
+                if add_queue:
+                    add_all_jobs_to_queue(config)
+                return 0
 
     # Before launching fresh queue processes, ask the global quota-supervisor to rotate this novel's logs
     # into .logs/archived/today so operators can follow logs from a clean slate.

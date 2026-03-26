@@ -158,3 +158,67 @@ def test_generate_visual_for_chapter_requires_valid_cover_extension(
 
     with pytest.raises(ValueError, match=r"\.jpg, \.jpeg, or \.png"):
         media_service.generate_visual_for_chapter(config, 1)
+
+
+def test_generate_visual_uses_cached_final_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _make_config(tmp_path)
+    config.storage.image_dir.mkdir(parents=True, exist_ok=True)
+    (config.storage.image_dir / config.visual.background_video).write_bytes(b"background")
+    (config.storage.root / "image").mkdir(parents=True, exist_ok=True)
+    (config.storage.root / "image" / "channel-name.png").write_bytes(b"channel")
+
+    ffmpeg_calls: list[list[str]] = []
+
+    def _fake_run_ffmpeg(args: list[str]) -> None:
+        ffmpeg_calls.append(args)
+        Path(args[-1]).write_bytes(b"rendered")
+
+    monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
+    monkeypatch.setattr(media_service, "run_ffmpeg", _fake_run_ffmpeg)
+
+    media_service.generate_visual(config, 1, 10)
+    assert len(ffmpeg_calls) == 2
+    cache_path = config.storage.visual_dir / ".cache" / "chuong_1-10.sha256"
+    assert cache_path.exists()
+
+    media_service.generate_visual(config, 1, 10)
+    assert len(ffmpeg_calls) == 2
+
+    media_service.generate_visual(config, 1, 10, force=True)
+    assert len(ffmpeg_calls) == 4
+
+
+def test_create_video_uses_cached_final_output_and_invalidates_on_input_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    visual_path = config.storage.visual_dir / "chuong_1-10.mp4"
+    audio_path = config.storage.audio_dir / "chuong_1-10" / "chuong_1-10.mp3"
+    visual_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    visual_path.write_bytes(b"visual-v1")
+    audio_path.write_bytes(b"audio-v1")
+
+    ffmpeg_calls: list[list[str]] = []
+
+    def _fake_run_ffmpeg(args: list[str]) -> None:
+        ffmpeg_calls.append(args)
+        Path(args[-1]).write_bytes(b"video")
+
+    monkeypatch.setattr(media_service, "run_ffmpeg", _fake_run_ffmpeg)
+    monkeypatch.setattr(media_service, "ffprobe_duration", lambda _path: 12.5)
+
+    media_service.create_video(config, 1, 10)
+    assert len(ffmpeg_calls) == 1
+    cache_path = config.storage.video_dir / ".cache" / "chuong_1-10.sha256"
+    assert cache_path.exists()
+
+    media_service.create_video(config, 1, 10)
+    assert len(ffmpeg_calls) == 1
+
+    audio_path.write_bytes(b"audio-v2")
+    media_service.create_video(config, 1, 10)
+    assert len(ffmpeg_calls) == 2
+
+    media_service.create_video(config, 1, 10, force=True)
+    assert len(ffmpeg_calls) == 3

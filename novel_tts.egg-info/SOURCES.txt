@@ -38,6 +38,8 @@ novel_tts/crawl/resolvers/shuba69.py
 novel_tts/crawl/resolvers/spudnovel.py
 novel_tts/crawl/resolvers/ttkan.py
 novel_tts/crawl/resolvers/wa01.py
+novel_tts/dev/__init__.py
+novel_tts/dev/context_map.py
 novel_tts/media/__init__.py
 novel_tts/media/service.py
 novel_tts/net/__init__.py
@@ -67,6 +69,7 @@ tests/test_ai_key_counts.py
 tests/test_ai_key_ps.py
 tests/test_cli_rate_limit_exit_code.py
 tests/test_config_tts_merge.py
+tests/test_context_map.py
 tests/test_crawl_batch_merge.py
 tests/test_crawl_repair_inline_replace.py
 tests/test_crawl_repair_report.py
@@ -109,12 +112,17 @@ tests/test_translate_captions.py
 tests/test_translate_force_clears_progress.py
 tests/test_translate_model_selection.py
 tests/test_translate_placeholder_restore.py
+tests/test_translate_polish_config.py
 tests/test_translate_polish_dedup.py
+tests/test_translate_polish_titles.py
 tests/test_translation_prompt_glossary_budget.py
 tests/test_ttkan_resolver.py
 tests/test_tts_cache_invalidation_and_force.py
 tests/test_tts_provider_config_jsonc.py
+tests/test_tts_provider_model_autoload.py
 tests/test_upload_config_loader.py
 tests/test_upload_flags.py
 tests/test_upload_service.py
 tests/test_visual_flags.py
+tests/test_youtube_cli_integration.py
+tests/test_youtube_logging.py

@@ -1,18 +1,86 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 from novel_tts.common.text import normalize_whitespace
 
 from ..base import BaseResolver, parse_chapter_number
-from ..types import ParsedChapter
+from ..types import ChapterEntry, ParsedChapter
 
 
 class OneQxsResolver(BaseResolver):
     source_id = "1qxs"
+    _TITLE_PAGE_SUFFIX_RE = re.compile(
+        r"^(?P<title>.+?)\s*[（(](?P<page>(?:第)?\d+/\d+(?:页|頁)?)[）)]\s*$"
+    )
+    _NOISE_LINE_PATTERN = re.compile(
+        r"("
+        r"上一页|下一页|上一章|下一章|返回目录|加入书签|加入收藏|本章完|手机阅读"
+        r"|本章未完"
+        r"|点击.*继续阅读"
+        r"|加\|载\|更\|多"
+        r"|阅\|读\|模\|式"
+        r"|畅\|读\|模\|式"
+        r"|无\|法\|显\|示\|本\|章\|节\|全\|部\|内\|容"
+        r"|请\|返\|回\|原\|网\|页阅\|读"
+        r"|请30秒过后刷新重试"
+        r"|访问太频繁了"
+        r")",
+        re.I,
+    )
+
+    @staticmethod
+    def _extract_lines(node) -> list[str]:
+        lines: list[str] = []
+        for paragraph in node.select("p"):
+            clean = normalize_whitespace(paragraph.get_text("\n", strip=True))
+            if clean:
+                lines.append(clean)
+
+        if lines:
+            return lines
+
+        text = node.get_text("\n", strip=True)
+        return [normalize_whitespace(line) for line in text.splitlines() if normalize_whitespace(line)]
+
+    @staticmethod
+    def _extract_url_page_key(url: str) -> str:
+        path = urlparse(url).path.strip("/")
+        segments = [segment for segment in path.split("/") if segment]
+        trailing_numeric = [segment for segment in segments if segment.isdigit()]
+        if len(trailing_numeric) >= 2 and int(trailing_numeric[-1]) <= 20:
+            return trailing_numeric[-2]
+        if trailing_numeric:
+            return trailing_numeric[-1]
+        return path
+
+    @classmethod
+    def _normalize_title(cls, title: str) -> str:
+        clean = normalize_whitespace(title)
+        match = cls._TITLE_PAGE_SUFFIX_RE.match(clean)
+        if not match:
+            return clean
+        return match.group("title").rstrip()
+
+    def parse_directory(self, html: str, base_url: str) -> dict[int, ChapterEntry]:
+        soup = BeautifulSoup(html, "html.parser")
+        entries: dict[int, ChapterEntry] = {}
+        for link in soup.select("a[href]"):
+            href = link.get("href", "").strip()
+            if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+                continue
+            title = normalize_whitespace(link.get_text(" ", strip=True))
+            if not title:
+                continue
+            chapter_number = parse_chapter_number(title)
+            if chapter_number is None:
+                continue
+            abs_url = urljoin(base_url, href)
+            entries[chapter_number] = ChapterEntry(chapter_number, title, abs_url)
+        return entries
 
     def parse_chapter(self, html: str, expected_chapter_number: int, fallback_title: str = "") -> ParsedChapter:
         soup = BeautifulSoup(html, "html.parser")
@@ -26,9 +94,10 @@ class OneQxsResolver(BaseResolver):
             raw_title = normalize_whitespace(title_node.get_text(" ", strip=True))
         if not raw_title:
             raw_title = fallback_title or f"第{expected_chapter_number}章"
+        raw_title = self._normalize_title(raw_title)
         chapter_number = parse_chapter_number(raw_title) or expected_chapter_number
 
-        content = ""
+        content_lines: list[str] = []
         for selector in (
             "#nr1",
             "#content",
@@ -40,39 +109,32 @@ class OneQxsResolver(BaseResolver):
             node = soup.select_one(selector)
             if not node:
                 continue
-            block = node.decode_contents()
-            block = re.sub(r"<font[^>]*>|</font>", "", block, flags=re.I)
-            block = block.replace("<br/>", "\n").replace("<br>", "\n").replace("<br />", "\n")
-            block = re.sub(r"</p>\s*<p[^>]*>", "\n", block, flags=re.I)
-            block = re.sub(r"<p[^>]*>", "", block, flags=re.I)
-            block = re.sub(r"</p>", "\n", block, flags=re.I)
-            block = re.sub(r"<[^>]+>", "", block)
-            block = normalize_whitespace(block)
-            if len(block) > len(content):
-                content = block
+            candidate_lines = self._extract_lines(node)
+            if len("\n".join(candidate_lines)) > len("\n".join(content_lines)):
+                content_lines = candidate_lines
 
         lines: list[str] = []
-        for line in content.splitlines():
+        normalized_raw_title = normalize_whitespace(raw_title)
+        for line in content_lines:
             clean = normalize_whitespace(line)
             if not clean:
                 continue
-            if re.search(r"(上一页|下一页|上一章|下一章|返回目录|加入书签|加入收藏|本章完)", clean):
+            if self._NOISE_LINE_PATTERN.search(clean):
                 continue
-            if raw_title and clean == normalize_whitespace(raw_title):
+            if normalized_raw_title and clean == normalized_raw_title:
                 continue
             lines.append(clean)
 
-        title = raw_title.strip() or f"第{chapter_number}章"
+        title = self._normalize_title(raw_title).strip() or f"第{chapter_number}章"
         return ParsedChapter(chapter_number=chapter_number, title=title, content="\n".join(lines))
 
     def find_next_part_url(self, html: str, current_url: str, chapter_number: int) -> str | None:
         """
         1qxs can paginate a single chapter (e.g., 1/3, 2/3, 3/3).
-        We follow "next page" links, but avoid hopping to the next chapter when possible.
+        We follow only "next page" links within the same chapter and never hop via "next chapter".
         """
         soup = BeautifulSoup(html, "html.parser")
-        current_key = re.sub(r"[?#].*$", "", current_url)
-        current_base = re.sub(r"(_\d+)?(\.html)?$", "", current_key)
+        current_page_key = self._extract_url_page_key(current_url)
 
         candidates: list[tuple[str, str]] = []
         for link in soup.select("a[href]"):
@@ -86,17 +148,9 @@ class OneQxsResolver(BaseResolver):
             candidates.append((text, abs_url))
 
         for text, href in candidates:
-            if not re.search(r"(下一页|下页|next|下一章)", text, flags=re.I):
+            if not re.search(r"(下一页|下页|next)", text, flags=re.I):
                 continue
-            href_key = re.sub(r"[?#].*$", "", href)
-            href_base = re.sub(r"(_\d+)?(\.html)?$", "", href_key)
-            # Prefer same-base pagination URLs (page 2/3, 3/3).
-            if href_base == current_base:
+            if self._extract_url_page_key(href) == current_page_key:
                 return href
 
-        # Fallback: any "next page" link.
-        for text, href in candidates:
-            if re.search(r"(下一页|下页|next)", text, flags=re.I):
-                return href
         return None
-

@@ -245,6 +245,20 @@ class UploadConfig:
 
 
 @dataclass
+class PipelineWatchConfig:
+    novels: list[str] = field(default_factory=list)
+    interval_seconds: float = 300.0
+    upload_platform: str = ""
+    restart_queue: bool = False
+    bootstrap_from: int = 0
+
+
+@dataclass
+class PipelineConfig:
+    watch: PipelineWatchConfig = field(default_factory=PipelineWatchConfig)
+
+
+@dataclass
 class SourceConfig:
     source_id: str
     resolver_id: str
@@ -272,4 +286,5 @@ class NovelConfig:
     visual: VisualConfig
     video: VideoConfig
     upload: UploadConfig = field(default_factory=UploadConfig)
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     proxy_gateway: ProxyGatewayConfig = field(default_factory=ProxyGatewayConfig)

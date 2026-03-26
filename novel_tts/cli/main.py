@@ -500,10 +500,20 @@ def _build_parser() -> argparse.ArgumentParser:
     visual_group = visual_parser.add_mutually_exclusive_group(required=True)
     visual_group.add_argument("--range")
     visual_group.add_argument("--chapter", type=int)
+    visual_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate visual assets even if the cached final outputs already match the current inputs.",
+    )
 
     video_parser = subparsers.add_parser("video")
     video_parser.add_argument("novel_id")
     video_parser.add_argument("--range", required=True)
+    video_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate final video even if the cached output already matches the current visual/audio inputs.",
+    )
 
     upload_parser = subparsers.add_parser("upload")
     upload_parser.add_argument("novel_id")
@@ -594,7 +604,6 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run.add_argument("--range")
     pipeline_run.add_argument("--skip-crawl", action="store_true")
     pipeline_run.add_argument("--skip-translate", action="store_true")
-    pipeline_run.add_argument("--skip-captions", action="store_true")
     pipeline_run.add_argument("--skip-tts", action="store_true")
     pipeline_run.add_argument("--skip-visual", action="store_true")
     pipeline_run.add_argument("--skip-video", action="store_true")
@@ -609,6 +618,88 @@ def _build_parser() -> argparse.ArgumentParser:
         "--upload-platform",
         choices=["youtube", "tiktok"],
         help="Override upload platform for pipeline upload step. Defaults to upload.default_platform.",
+    )
+    pipeline_watch = pipeline_sub.add_parser("watch")
+    pipeline_watch.add_argument("novel_ids", nargs="*")
+    pipeline_watch.add_argument(
+        "--all",
+        action="store_true",
+        help="Watch all novels from pipeline.watch.novels, or fallback to configs/novels/*.json when that list is empty.",
+    )
+    pipeline_watch.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=None,
+        help="Polling interval between source scans (default: 300 seconds).",
+    )
+    pipeline_watch.add_argument(
+        "--once",
+        action="store_true",
+        help="Run exactly one scan cycle, then exit.",
+    )
+    pipeline_watch.add_argument(
+        "--upload-platform",
+        choices=["youtube", "tiktok"],
+        help="Override upload platform for downstream upload step. Defaults to upload.default_platform.",
+    )
+    pipeline_watch.add_argument(
+        "--restart-queue",
+        action="store_true",
+        default=None,
+        help="Restart the per-novel queue stack before enqueueing newly crawled chapters.",
+    )
+    pipeline_watch.add_argument(
+        "--bootstrap-from",
+        type=int,
+        help="If a novel has no local crawled chapters yet, bootstrap crawl from this chapter instead of skipping.",
+    )
+    pipeline_watch.add_argument("--skip-crawl", action="store_true")
+    pipeline_watch.add_argument("--skip-translate", action="store_true")
+    pipeline_watch.add_argument("--skip-repair", action="store_true")
+    pipeline_watch.add_argument("--skip-polish", action="store_true")
+    pipeline_watch.add_argument("--skip-tts", action="store_true")
+    pipeline_watch.add_argument("--skip-visual", action="store_true")
+    pipeline_watch.add_argument("--skip-video", action="store_true")
+    pipeline_watch.add_argument("--skip-upload", action="store_true")
+    pipeline_watch.add_argument(
+        "--until-crawl",
+        action="store_true",
+        help="Run through crawl, then skip translate, repair, polish, tts, visual, video, and upload.",
+    )
+    pipeline_watch.add_argument(
+        "--until-translate",
+        action="store_true",
+        help="Run through translate, then skip repair, polish, tts, visual, video, and upload.",
+    )
+    pipeline_watch.add_argument(
+        "--until-repair",
+        action="store_true",
+        help="Run through repair, then skip polish, tts, visual, video, and upload.",
+    )
+    pipeline_watch.add_argument(
+        "--until-polish",
+        action="store_true",
+        help="Run through polish, then skip tts, visual, video, and upload.",
+    )
+    pipeline_watch.add_argument(
+        "--until-tts",
+        action="store_true",
+        help="Run through tts, then skip visual, video, and upload.",
+    )
+    pipeline_watch.add_argument(
+        "--until-visual",
+        action="store_true",
+        help="Run through visual, then skip video and upload.",
+    )
+    pipeline_watch.add_argument(
+        "--until-video",
+        action="store_true",
+        help="Run through video, then skip upload.",
+    )
+    pipeline_watch.add_argument(
+        "--until-upload",
+        action="store_true",
+        help="Run through upload. Equivalent to not setting an --until-* cutoff.",
     )
 
     quota_supervisor_parser = subparsers.add_parser("quota-supervisor")
@@ -710,6 +801,37 @@ def _default_log_path(args) -> Path | None:
         log_name = f"{command}.log"
 
     return logs_root / log_name
+
+
+def _resolve_watch_stage_flags(args) -> dict[str, bool]:
+    stage_order = [
+        "crawl",
+        "translate",
+        "repair",
+        "polish",
+        "tts",
+        "visual",
+        "video",
+        "upload",
+    ]
+    explicit_skip = {
+        stage: bool(getattr(args, f"skip_{stage}", False))
+        for stage in stage_order
+    }
+    until_indexes = [
+        index
+        for index, stage in enumerate(stage_order)
+        if bool(getattr(args, f"until_{stage}", False))
+    ]
+    if not until_indexes:
+        return explicit_skip
+
+    cutoff_index = min(until_indexes)
+    resolved = dict(explicit_skip)
+    for index, stage in enumerate(stage_order):
+        if index > cutoff_index:
+            resolved[stage] = True
+    return resolved
 
 
 def _rotate_log_if_new_day(log_path: Path | None) -> None:
@@ -1195,14 +1317,14 @@ def main(argv: list[str] | None = None) -> int:
             config = load_novel_config(args.novel_id)
             chapter = getattr(args, "chapter", None)
             if chapter is not None:
-                visual, thumbnail = generate_visual_for_chapter(config, int(chapter))
+                visual, thumbnail = generate_visual_for_chapter(config, int(chapter), force=bool(getattr(args, "force", False)))
                 LOGGER.info("Visual video: %s", visual)
                 LOGGER.info("Thumbnail: %s", thumbnail)
                 return 0
 
             start, end = parse_range(args.range)
             for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                visual, thumbnail = generate_visual(config, c_start, c_end)
+                visual, thumbnail = generate_visual(config, c_start, c_end, force=bool(getattr(args, "force", False)))
                 LOGGER.info("Visual video: %s", visual)
                 LOGGER.info("Thumbnail: %s", thumbnail)
             return 0
@@ -1213,7 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
             config = load_novel_config(args.novel_id)
             start, end = parse_range(args.range)
             for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                LOGGER.info("Video: %s", create_video(config, c_start, c_end))
+                LOGGER.info("Video: %s", create_video(config, c_start, c_end, force=bool(getattr(args, "force", False))))
             return 0
 
         if args.command == "upload":
@@ -1366,7 +1488,29 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "pipeline":
             from novel_tts.crawl import crawl_range
-            from novel_tts.translate import translate_captions, translate_novel
+            from novel_tts.queue import add_jobs_to_queue, launch_queue_stack, wait_for_range_completion
+            from novel_tts.pipeline import run_watch_pipeline
+
+            if args.pipeline_command == "watch":
+                watch_stage_flags = _resolve_watch_stage_flags(args)
+                return run_watch_pipeline(
+                    repo_root=_repo_root(),
+                    novel_ids=list(getattr(args, "novel_ids", []) or []),
+                    watch_all=bool(getattr(args, "all", False)),
+                    interval_seconds=getattr(args, "interval_seconds", None),
+                    once=bool(getattr(args, "once", False)),
+                    upload_platform_override=getattr(args, "upload_platform", None),
+                    restart_queue=getattr(args, "restart_queue", None),
+                    bootstrap_from=getattr(args, "bootstrap_from", None),
+                    skip_crawl=watch_stage_flags["crawl"],
+                    skip_translate=watch_stage_flags["translate"],
+                    skip_repair=watch_stage_flags["repair"],
+                    skip_polish=watch_stage_flags["polish"],
+                    skip_tts=watch_stage_flags["tts"],
+                    skip_visual=watch_stage_flags["visual"],
+                    skip_video=watch_stage_flags["video"],
+                    skip_upload=watch_stage_flags["upload"],
+                )
 
             config = load_novel_config(args.novel_id)
             if args.range:
@@ -1378,12 +1522,9 @@ def main(argv: list[str] | None = None) -> int:
             if not args.skip_crawl:
                 crawl_range(config, start, end)
             if not args.skip_translate:
-                translate_novel(config)
-            if not args.skip_captions:
-                try:
-                    translate_captions(config)
-                except FileNotFoundError:
-                    LOGGER.warning("Caption source missing, skipping caption translation")
+                launch_queue_stack(config, restart=False, add_queue=False)
+                add_jobs_to_queue(config, start, end)
+                wait_for_range_completion(config, start, end)
             translated_ranges = get_translated_ranges(config, start, end)
             upload_platform = str(
                 getattr(args, "upload_platform", None) or getattr(config.upload, "default_platform", "youtube")

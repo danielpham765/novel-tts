@@ -8,11 +8,28 @@ from bs4 import BeautifulSoup
 from novel_tts.common.text import normalize_whitespace
 
 from ..base import BaseResolver, parse_chapter_number
-from ..types import ParsedChapter
+from ..types import ChapterEntry, ParsedChapter
 
 
 class Wa01Resolver(BaseResolver):
     source_id = "wa01"
+
+    def parse_directory(self, html: str, base_url: str) -> dict[int, ChapterEntry]:
+        soup = BeautifulSoup(html, "html.parser")
+        entries: dict[int, ChapterEntry] = {}
+        for link in soup.select("a[href]"):
+            href = link.get("href", "").strip()
+            if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+                continue
+            title = normalize_whitespace(link.get_text(" ", strip=True))
+            if not title:
+                continue
+            chapter_number = parse_chapter_number(title)
+            if chapter_number is None:
+                continue
+            abs_url = urljoin(base_url, href)
+            entries[chapter_number] = ChapterEntry(chapter_number, title, abs_url)
+        return entries
 
     def parse_chapter(self, html: str, expected_chapter_number: int, fallback_title: str = "") -> ParsedChapter:
         soup = BeautifulSoup(html, "html.parser")
@@ -81,4 +98,3 @@ class Wa01Resolver(BaseResolver):
             if re.search(r"(下一页|下页|next)", text, flags=re.I):
                 return href
         return None
-

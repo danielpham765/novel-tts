@@ -1,9 +1,9 @@
 proxy_gateway:
-  enabled: false
+  enabled: true
   base_url: http://localhost:8888
   mode: socket
   auto_discovery: true
-  keys_per_proxy: 3
+  keys_per_proxy: 2
   direct_run_strategy: proxy_1
   # Proxies are proxy node "name" values from `GET /proxies`, e.g. ["cloud-node-1", "cloud-node-2"].
   proxies: []
@@ -101,3 +101,13 @@ upload:
     disable_stitch: false
     title_file: title.txt
     description_file: description.txt
+
+pipeline:
+  watch:
+    novels:
+      - sau-khi-tro-ve-dai-hoc
+      - thai-hu-chi-ton
+    interval_seconds: 86400
+    restart_queue: false
+    # Keep empty/0 to skip bootstrap for novels with no local crawled chapters.
+    bootstrap_from: 0

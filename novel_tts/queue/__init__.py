@@ -10,6 +10,7 @@ from .translation_queue import (
     run_supervisor,
     run_worker,
     stop_queue_processes,
+    wait_for_range_completion,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "run_supervisor",
     "run_worker",
     "stop_queue_processes",
+    "wait_for_range_completion",
 ]

@@ -76,14 +76,26 @@ def _chapter_hash_path(parts_dir: Path, chapter_number: int) -> Path:
     return _chapter_hash_cache_dir(parts_dir) / f"chapter_{chapter_number}.sha256"
 
 
+def _merged_audio_hash_path(parts_dir: Path) -> Path:
+    return _chapter_hash_cache_dir(parts_dir) / "merged.sha256"
+
+
 def _legacy_chapter_hash_path(output_dir: Path, chapter_number: int) -> Path:
     # Oldest layout: hashes lived next to chapter wavs.
     return output_dir / f"chapter_{chapter_number}.sha256"
 
 
+def _legacy_merged_audio_hash_path(output_dir: Path) -> Path:
+    return output_dir / "merged.sha256"
+
+
 def _legacy_chapter_hash_cache_path(output_dir: Path, chapter_number: int) -> Path:
     # Previous layout (after refactor): hashes lived under output_dir/.cache
     return (output_dir / ".cache") / f"chapter_{chapter_number}.sha256"
+
+
+def _legacy_merged_audio_hash_cache_path(output_dir: Path) -> Path:
+    return (output_dir / ".cache") / "merged.sha256"
 
 
 def _read_cached_hash(parts_dir: Path, *, output_dir: Path, chapter_number: int) -> str | None:
@@ -128,6 +140,59 @@ def _write_cached_hash(parts_dir: Path, chapter_number: int, value: str) -> None
     path.write_text(value, encoding="utf-8")
 
 
+def _read_merged_cached_hash(parts_dir: Path, *, output_dir: Path) -> str | None:
+    hash_path = _merged_audio_hash_path(parts_dir)
+    if hash_path.exists():
+        try:
+            return hash_path.read_text(encoding="utf-8").strip() or None
+        except Exception:
+            return None
+
+    legacy_paths = [
+        _legacy_merged_audio_hash_cache_path(output_dir),
+        _legacy_merged_audio_hash_path(output_dir),
+    ]
+    for legacy_path in legacy_paths:
+        if not legacy_path.exists():
+            continue
+        try:
+            value = legacy_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            value = ""
+        try:
+            hash_path.parent.mkdir(parents=True, exist_ok=True)
+            if value:
+                hash_path.write_text(value, encoding="utf-8")
+            legacy_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return value or None
+
+    return None
+
+
+def _write_merged_cached_hash(parts_dir: Path, value: str) -> None:
+    path = _merged_audio_hash_path(parts_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
+def _merged_cache_value(
+    chapter_hashes: list[tuple[int, str]],
+    *,
+    tempo: float,
+    bitrate: str,
+) -> str:
+    payload = "\n".join(
+        [
+            f"tempo={tempo}",
+            f"bitrate={bitrate}",
+            *[f"chapter={chapter_number}:{chapter_hash}" for chapter_number, chapter_hash in chapter_hashes],
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[dict[str, object]], range_key: str) -> Path:
     subtitle_dir = config.storage.subtitle_dir
     subtitle_dir.mkdir(parents=True, exist_ok=True)
@@ -148,6 +213,25 @@ def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[di
         current_time += duration
     menu_path.write_text("\n".join(lines), encoding="utf-8")
     return menu_path
+
+
+def _remove_incomplete_merged_artifacts(output_dir: Path, parts_dir: Path, merged_path: Path) -> None:
+    try:
+        merged_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        _merged_audio_hash_path(parts_dir).unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        _legacy_merged_audio_hash_cache_path(output_dir).unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        _legacy_merged_audio_hash_path(output_dir).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = None, force: bool = False) -> Path:
@@ -198,6 +282,8 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
     provider.load_model(client)
     LOGGER.info("TTS model ready")
     audio_files: list[Path] = []
+    chapter_hashes: list[tuple[int, str]] = []
+    regenerated_any_audio = False
     for idx, chunk in enumerate(chunks):
         chapter = chapter_info[idx] if idx < len(chapter_info) else {"number": idx + 1, "title": ""}
         chapter_number = int(chapter.get("number") or (idx + 1))
@@ -209,6 +295,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
             except Exception:
                 pass
         expected_hash = _chunk_hash(chunk)
+        chapter_hashes.append((chapter_number, expected_hash))
         chapter_label = f"chapter={chapter.get('number', idx + 1)}"
         if chapter.get("title"):
             chapter_label += f" title={chapter['title']}"
@@ -291,6 +378,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
             output_path,
             output_path.stat().st_size,
         )
+        regenerated_any_audio = True
         audio_files.append(output_path)
 
     file_list_path.write_text("\n".join(f"file '{path.resolve()}'" for path in audio_files), encoding="utf-8")
@@ -300,26 +388,55 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
     except Exception:
         pass
     merged_path = output_dir / f"{output_range_key}.mp3"
-    LOGGER.info("TTS merge start | inputs=%s file_list=%s output=%s", len(audio_files), file_list_path, merged_path)
-    run_ffmpeg(
-        [
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(file_list_path),
-            "-filter:a",
-            f"atempo={config.tts.tempo}",
-            "-acodec",
-            "libmp3lame",
-            "-b:a",
-            config.tts.bitrate,
-            str(merged_path),
-        ]
+    expected_parts = max(1, end - start + 1)
+    available_parts = len(audio_files)
+    if available_parts < expected_parts:
+        _remove_incomplete_merged_artifacts(output_dir, parts_dir, merged_path)
+        LOGGER.info(
+            "TTS merge gated | range=%s parts=%s/%s merged_output=%s",
+            output_range_key,
+            available_parts,
+            expected_parts,
+            merged_path,
+        )
+        return merged_path
+
+    expected_merged_hash = _merged_cache_value(
+        chapter_hashes,
+        tempo=config.tts.tempo,
+        bitrate=config.tts.bitrate,
     )
+    cached_merged_hash = _read_merged_cached_hash(parts_dir, output_dir=output_dir)
+    merged_exists = merged_path.exists() and merged_path.stat().st_size > 0
+    should_merge = force or regenerated_any_audio or (not merged_exists)
+    if (not should_merge) and cached_merged_hash is not None and cached_merged_hash != expected_merged_hash:
+        should_merge = True
+    if should_merge:
+        LOGGER.info("TTS merge start | inputs=%s file_list=%s output=%s", len(audio_files), file_list_path, merged_path)
+        run_ffmpeg(
+            [
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(file_list_path),
+                "-filter:a",
+                f"atempo={config.tts.tempo}",
+                "-acodec",
+                "libmp3lame",
+                "-b:a",
+                config.tts.bitrate,
+                str(merged_path),
+            ]
+        )
+        _write_merged_cached_hash(parts_dir, expected_merged_hash)
+        LOGGER.info("TTS merge done | output=%s size_bytes=%s", merged_path, merged_path.stat().st_size)
+    else:
+        if cached_merged_hash != expected_merged_hash:
+            _write_merged_cached_hash(parts_dir, expected_merged_hash)
+        LOGGER.info("TTS merge cached | output=%s size_bytes=%s", merged_path, merged_path.stat().st_size)
     menu_path = _generate_menu(config, audio_files, chapter_info, output_range_key)
-    LOGGER.info("TTS merge done | output=%s size_bytes=%s", merged_path, merged_path.stat().st_size)
     LOGGER.info("TTS menu generated | path=%s", menu_path)
     return merged_path

@@ -109,6 +109,7 @@ Important subcommands:
 - `queue launch`, `queue add`, `queue worker`, `queue supervisor`, `queue monitor`, `queue ps`, `queue ps-all`, `queue repair`, `queue reset-key`, `queue stop`
 - `youtube playlist`, `youtube playlist update`, `youtube video`, `youtube video update`
 - `pipeline run`
+- `pipeline watch`
 
 Compatibility note:
 
@@ -851,13 +852,12 @@ The same module also backs read/update admin commands:
 
 ## Pipeline Orchestration
 
-The `pipeline run` command is intentionally light orchestration, not a separate subsystem.
+The `pipeline` commands are intentionally light orchestration, not a separate subsystem.
 
 It can:
 
 - crawl a range
-- run direct novel translation
-- translate captions if the caption input exists
+- launch queue translation for the requested chapter range and wait until it completes
 - discover translated batch ranges overlapping the request
 - execute downstream media in one of two modes:
   - `per-stage`

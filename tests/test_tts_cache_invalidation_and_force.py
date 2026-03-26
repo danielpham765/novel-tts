@@ -109,8 +109,10 @@ def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypa
     provider = _DummyProvider(config.storage.tmp_dir)
     monkeypatch.setattr(tts_service, "get_tts_provider", lambda _config: provider)
     monkeypatch.setattr(tts_service, "ffprobe_duration", lambda _path: 10.0)
+    ffmpeg_calls: list[list[str]] = []
 
     def _fake_run_ffmpeg(args: list[str]) -> None:
+        ffmpeg_calls.append(args)
         # Output path is always the last argument.
         Path(args[-1]).write_bytes(b"mp3")
 
@@ -119,22 +121,35 @@ def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypa
     translated_path.write_text("Chương 1: A\nXin chào\n", encoding="utf-8")
     tts_service.run_tts(config, 1, 1)
     assert provider.calls == 1
+    assert len(ffmpeg_calls) == 1
     # Writes per-chapter assets into .parts and keeps the range folder clean.
     audio_dir = config.storage.audio_dir / "chuong_1-1"
+    merged_cache_path = audio_dir / ".parts" / ".cache" / "merged.sha256"
     assert (audio_dir / ".parts" / "chapter_1.wav").exists()
     assert (audio_dir / ".parts" / "file-list.txt").exists()
+    assert merged_cache_path.exists()
     assert not (audio_dir / "file-list.txt").exists()
     assert (config.storage.subtitle_dir / "chuong_1-1_menu.txt").read_text(encoding="utf-8") == "00:00:00 Chương 1 - A"
 
     # Cached (hash matches).
     tts_service.run_tts(config, 1, 1)
     assert provider.calls == 1
+    assert len(ffmpeg_calls) == 1
+
+    # Missing merged cache file is backfilled from the existing merged mp3.
+    merged_cache_path.unlink()
+    tts_service.run_tts(config, 1, 1)
+    assert provider.calls == 1
+    assert len(ffmpeg_calls) == 1
+    assert merged_cache_path.exists()
 
     # Change translated text => cache invalidated, re-synthesize.
     translated_path.write_text("Chương 1: A\nXin chào!!!\n", encoding="utf-8")
     tts_service.run_tts(config, 1, 1)
     assert provider.calls == 2
+    assert len(ffmpeg_calls) == 2
 
     # Force => always re-synthesize.
     tts_service.run_tts(config, 1, 1, force=True)
     assert provider.calls == 3
+    assert len(ffmpeg_calls) == 3

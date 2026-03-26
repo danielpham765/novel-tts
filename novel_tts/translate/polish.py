@@ -4,6 +4,7 @@ import re
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from novel_tts.common.text import normalize_ellipsis
 from novel_tts.common.logging import get_logger
 from novel_tts.config.models import NovelConfig
 
@@ -492,7 +493,6 @@ def normalize_text(
     text = re.sub(r"(?m)^[ \t]+", "", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"([.!?…,:;])([A-Za-zÀ-ỹ“\"'])", r"\1 \2", text)
-    text = re.sub(r"([^\n])\.\.\.\.\.\.+", r"\1……", text)
     text = re.sub(r"(?m)^[ \t]*[“\"]([^\n]+)$", r"“\1", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"(?m)^\s+$", "", text)
@@ -510,7 +510,7 @@ def normalize_text(
     lines = _merge_broken_paragraphs(lines)
     text = "\n\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    text = text.replace("…", "...")
+    text = normalize_ellipsis(text)
     return text.strip() + "\n"
 
 

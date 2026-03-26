@@ -13,6 +13,8 @@ from .models import (
     CrawlConfig,
     ModelsConfig,
     NovelConfig,
+    PipelineConfig,
+    PipelineWatchConfig,
     ProxyGatewayConfig,
     QueueConfig,
     QueueModelConfig,
@@ -226,6 +228,41 @@ def _normalize_upload_youtube_config(youtube_raw: dict) -> dict:
     return normalized
 
 
+def _normalize_pipeline_watch_config(watch_raw: dict) -> dict:
+    normalized = dict(watch_raw)
+    normalized["novels"] = _clean_string_list(
+        normalized.get("novels", []),
+        field_name="pipeline.watch.novels",
+    )
+    try:
+        interval_seconds = float(normalized.get("interval_seconds", 300.0) or 300.0)
+    except Exception as exc:
+        raise ValueError('Invalid "pipeline.watch.interval_seconds" (expected number)') from exc
+    if interval_seconds <= 0:
+        raise ValueError('Invalid "pipeline.watch.interval_seconds" (must be > 0)')
+    normalized["interval_seconds"] = interval_seconds
+
+    upload_platform = _clean_text(normalized.get("upload_platform"))
+    if upload_platform and upload_platform not in {"youtube", "tiktok"}:
+        raise ValueError('Invalid "pipeline.watch.upload_platform" (expected "youtube", "tiktok", or empty)')
+    normalized["upload_platform"] = upload_platform
+    normalized["restart_queue"] = _clean_bool(normalized.get("restart_queue", False))
+
+    bootstrap_value = normalized.get("bootstrap_from")
+    bootstrap_raw = _clean_text(bootstrap_value)
+    if bootstrap_value in {0, "0"} or not bootstrap_raw:
+        normalized["bootstrap_from"] = 0
+    else:
+        try:
+            bootstrap_from = int(bootstrap_raw)
+        except Exception as exc:
+            raise ValueError('Invalid "pipeline.watch.bootstrap_from" (expected positive integer or empty)') from exc
+        if bootstrap_from < 1:
+            raise ValueError('Invalid "pipeline.watch.bootstrap_from" (expected positive integer or empty)')
+        normalized["bootstrap_from"] = bootstrap_from
+    return normalized
+
+
 def _normalize_proxy_gateway_config(proxy_raw: dict) -> ProxyGatewayConfig:
     if proxy_raw is None:
         proxy_raw = {}
@@ -276,6 +313,79 @@ def _normalize_proxy_gateway_config(proxy_raw: dict) -> ProxyGatewayConfig:
         keys_per_proxy=keys_per_proxy,
         proxies=proxies,
         direct_run_strategy=direct_strategy,
+    )
+
+
+def _build_source_configs(
+    *,
+    sources_raw,
+    crawl_override_raw: dict,
+    browser_debug_override_raw: dict,
+) -> list[SourceConfig]:
+    source_configs: list[SourceConfig] = []
+    if isinstance(sources_raw, list) and sources_raw:
+        for index, source_item in enumerate(sources_raw):
+            if not isinstance(source_item, dict):
+                raise ValueError(f'Invalid crawl.sources[{index}] (expected object)')
+            source_id = _clean_text(source_item.get("source_id"))
+            if not source_id:
+                raise KeyError(f'Missing source id (expected "crawl.sources[{index}].source_id")')
+            source_path = _source_config_path(source_id)
+            if not source_path.exists():
+                raise FileNotFoundError(f"Source config not found: {source_path}")
+            source_raw = json.loads(source_path.read_text(encoding="utf-8"))
+            crawl_override_flat = dict(source_item)
+            crawl_override_flat.pop("source_id", None)
+            merged_crawl_raw = _deep_merge(source_raw["crawl"], crawl_override_flat)
+            merged_browser_debug_raw = _deep_merge(source_raw.get("browser_debug", {}), browser_debug_override_raw)
+            source_configs.append(
+                SourceConfig(
+                    source_id=source_id,
+                    resolver_id=str(source_raw.get("resolver_id", source_id)),
+                    crawl=CrawlConfig(**merged_crawl_raw),
+                    browser_debug=BrowserDebugConfig(**merged_browser_debug_raw),
+                )
+            )
+        return source_configs
+
+    crawl_override_flat = dict(crawl_override_raw)
+    crawl_override_flat.pop("sources", None)
+    merged_crawl_raw = dict(crawl_override_flat)
+    merged_crawl_raw.setdefault("site_id", "")
+    merged_browser_debug_raw = dict(browser_debug_override_raw)
+    source_configs.append(
+        SourceConfig(
+            source_id="",
+            resolver_id="",
+            crawl=CrawlConfig(**merged_crawl_raw),
+            browser_debug=BrowserDebugConfig(**merged_browser_debug_raw),
+        )
+    )
+    return source_configs
+
+
+def load_novel_source_configs(novel_id: str) -> list[SourceConfig]:
+    path = _config_path(novel_id)
+    if not path.exists():
+        raise FileNotFoundError(f"Novel config not found: {path}")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    crawl_override_raw = raw.get("crawl", {})
+    if crawl_override_raw is None:
+        crawl_override_raw = {}
+    if not isinstance(crawl_override_raw, dict):
+        raise ValueError('Invalid novel "crawl" config (expected object)')
+    if "source_id" in crawl_override_raw:
+        raise ValueError('Deprecated config key "crawl.source_id" (migrate to crawl.sources[0].source_id)')
+    sources_raw = crawl_override_raw.get("sources", None)
+    browser_debug_override_raw = raw.get("browser_debug", {})
+    if browser_debug_override_raw is None:
+        browser_debug_override_raw = {}
+    if not isinstance(browser_debug_override_raw, dict):
+        raise ValueError('Invalid novel "browser_debug" config (expected object)')
+    return _build_source_configs(
+        sources_raw=sources_raw,
+        crawl_override_raw=crawl_override_raw,
+        browser_debug_override_raw=browser_debug_override_raw,
     )
 
 
@@ -369,29 +479,13 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     if not isinstance(browser_debug_override_raw, dict):
         raise ValueError('Invalid novel "browser_debug" config (expected object)')
 
-    source_id = ""
-    source_raw: dict[str, object] = {}
-    if isinstance(sources_raw, list) and sources_raw:
-        primary_source_raw = sources_raw[0]
-        if not isinstance(primary_source_raw, dict):
-            raise ValueError('Invalid crawl.sources[0] (expected object)')
-        source_id = _clean_text(primary_source_raw.get("source_id"))
-        if not source_id:
-            raise KeyError('Missing source id (expected "crawl.sources[0].source_id")')
-        source_path = _source_config_path(source_id)
-        if not source_path.exists():
-            raise FileNotFoundError(f"Source config not found: {source_path}")
-        source_raw = json.loads(source_path.read_text(encoding="utf-8"))
-        crawl_override_flat = dict(primary_source_raw)
-        crawl_override_flat.pop("source_id", None)
-        merged_crawl_raw = _deep_merge(source_raw["crawl"], crawl_override_flat)
-        merged_browser_debug_raw = _deep_merge(source_raw.get("browser_debug", {}), browser_debug_override_raw)
-    else:
-        crawl_override_flat = dict(crawl_override_raw)
-        crawl_override_flat.pop("sources", None)
-        merged_crawl_raw = dict(crawl_override_flat)
-        merged_crawl_raw.setdefault("site_id", "")
-        merged_browser_debug_raw = dict(browser_debug_override_raw)
+    all_source_configs = _build_source_configs(
+        sources_raw=sources_raw,
+        crawl_override_raw=crawl_override_raw,
+        browser_debug_override_raw=browser_debug_override_raw,
+    )
+    primary_source_cfg = all_source_configs[0]
+    source_id = primary_source_cfg.source_id
     merged_queue_raw = _deep_merge(app_raw.get("queue", {}), raw.get("queue", {}))
     # Normalize legacy queue keys first, but allow model configs to be injected from models.* later.
     merged_queue_raw = _normalize_queue_config(merged_queue_raw, strict=False)
@@ -493,12 +587,7 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     if "REPAIR_MODE" in os.environ:
         translation_raw["repair_mode"] = os.environ["REPAIR_MODE"].strip().lower() in {"1", "true", "yes"}
 
-    source = SourceConfig(
-        source_id=source_id,
-        resolver_id=str(source_raw.get("resolver_id", source_id)) if source_raw else "",
-        crawl=CrawlConfig(**merged_crawl_raw),
-        browser_debug=BrowserDebugConfig(**merged_browser_debug_raw),
-    )
+    source = primary_source_cfg
 
     # Build CaptionConfig from translation.captions.
     captions_raw = dict(captions_section)
@@ -547,6 +636,17 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         youtube=UploadYouTubeConfig(**youtube_raw),
         tiktok=UploadTikTokConfig(**tiktok_raw),
     )
+    pipeline_raw = _deep_merge(app_raw.get("pipeline", {}) or {}, raw.get("pipeline", {}) or {})
+    if pipeline_raw is None:
+        pipeline_raw = {}
+    if not isinstance(pipeline_raw, dict):
+        raise ValueError('Invalid "pipeline" config (expected object)')
+    watch_raw = pipeline_raw.get("watch", {}) or {}
+    if not isinstance(watch_raw, dict):
+        raise ValueError('Invalid "pipeline.watch" config (expected object)')
+    pipeline_cfg = PipelineConfig(
+        watch=PipelineWatchConfig(**_normalize_pipeline_watch_config(watch_raw)),
+    )
 
     return NovelConfig(
         novel_id=raw["novel_id"],
@@ -572,4 +672,5 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         visual=VisualConfig(**visual_raw),
         video=VideoConfig(**video_raw),
         upload=upload_cfg,
+        pipeline=pipeline_cfg,
     )

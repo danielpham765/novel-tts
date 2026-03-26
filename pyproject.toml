@@ -23,6 +23,7 @@ dependencies = [
 
 [project.scripts]
 novel-tts = "novel_tts.cli.main:main"
+novel-tts-context = "novel_tts.dev.context_map:main"
 
 [dependency-groups]
 dev = [

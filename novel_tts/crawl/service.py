@@ -5,13 +5,13 @@ import re
 import time
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from novel_tts.common.logging import get_logger
 from novel_tts.common.text import normalize_whitespace
-from novel_tts.config.models import NovelConfig
+from novel_tts.config.models import NovelConfig, SourceConfig
 
 from .registry import build_default_registry
 from .repair_config import (
@@ -44,6 +44,14 @@ WATERMARK_CONTENT_PATTERNS = (
     re.compile(r"记住本站域名", re.I),
     re.compile(r"記住本站域名", re.I),
     re.compile(r"本站域名", re.I),
+    re.compile(r"小说免费阅读", re.I),
+    re.compile(r"请收藏", re.I),
+    re.compile(r"一七小说", re.I),
+    re.compile(r"1qxs(?:\.com)?", re.I),
+    re.compile(r"章节报错\s*分享给朋友", re.I),
+    re.compile(r"章節報錯\s*分享給朋友", re.I),
+    re.compile(r"速讀谷", re.I),
+    re.compile(r"更新不易.*記得分享", re.I),
     re.compile(r"追台灣小說就上台灣小說網", re.I),
     re.compile(r"台灣小說網", re.I),
     re.compile(r"google搜索\s*twkan", re.I),
@@ -62,6 +70,9 @@ MIN_DUPLICATE_BLOCK_CHARS = 160
 MIN_DUPLICATE_ADJACENT_BLOCK_CHARS = 120
 MIN_DUPLICATE_LINE_CHARS = 60
 DUPLICATE_REPEATED_RATIO_THRESHOLD = 0.18
+PAGINATED_TITLE_SUFFIX_RE = re.compile(
+    r"^(?P<title>.+?)\s*[（(](?P<page>(?:第)?\d+/\d+(?:页|頁)?)[）)]\s*$"
+)
 
 
 @dataclass
@@ -105,6 +116,13 @@ class RepairReport:
     actions: list[RepairAction]
     log_path: Path
     modified_files: list[Path]
+
+
+@dataclass
+class SourceDiscoveryResult:
+    source_config: SourceConfig
+    entries: dict[int, ChapterEntry]
+    latest_chapter: int
 
 
 def _has_requested_chapters(entries: dict[int, ChapterEntry], from_chapter: int, to_chapter: int) -> bool:
@@ -237,6 +255,48 @@ def _is_metadata_noise_line(line: str) -> bool:
         if pattern.search(clean):
             return True
     return False
+
+
+def _strip_paginated_title_suffix(title: str) -> str:
+    normalized_title = normalize_whitespace(title)
+    match = PAGINATED_TITLE_SUFFIX_RE.match(normalized_title)
+    if not match:
+        return normalized_title
+    return match.group("title").rstrip()
+
+
+def _has_paginated_title_suffix(title: str) -> bool:
+    normalized_title = normalize_whitespace(title)
+    return PAGINATED_TITLE_SUFFIX_RE.match(normalized_title) is not None
+
+
+def _normalize_title_for_compare(title: str) -> str:
+    return normalize_whitespace(_strip_paginated_title_suffix(title))
+
+
+def _canonicalize_chapter_block(block: str) -> str:
+    stripped_block = block.strip("\n")
+    if not stripped_block:
+        return ""
+
+    header, sep, body = stripped_block.partition("\n")
+    cleaned_header = _strip_paginated_title_suffix(header).strip()
+    body_lines = [line.rstrip() for line in body.splitlines()] if sep else []
+
+    # Drop duplicated title lines at the start of the body, including paginated variants.
+    normalized_header = _normalize_title_for_compare(cleaned_header)
+    while body_lines and not normalize_whitespace(body_lines[0]):
+        body_lines.pop(0)
+    while body_lines:
+        first_line = body_lines[0]
+        if _normalize_title_for_compare(first_line) != normalized_header:
+            break
+        body_lines.pop(0)
+        while body_lines and not normalize_whitespace(body_lines[0]):
+            body_lines.pop(0)
+
+    cleaned_body = "\n".join(body_lines).strip()
+    return cleaned_header + (f"\n\n{cleaned_body}" if cleaned_body else "")
 
 
 def _detect_duplicated_content(content: str) -> str | None:
@@ -688,6 +748,100 @@ def _remove_metadata_lines_in_batch(*, path: Path, chapters: set[int], chapter_r
     return False, []
 
 
+def _normalize_paginated_titles_in_batch(*, path: Path, chapters: set[int], chapter_regex: str) -> tuple[bool, list[int]]:
+    """
+    Removes trailing page markers like "(4/4)" from selected chapter titles.
+    Returns (changed, cleaned_chapters).
+    """
+    if not chapters:
+        return False, []
+
+    raw = path.read_text(encoding="utf-8")
+    spans = _split_crawled_chapter_spans(raw, chapter_regex)
+    if not spans:
+        return False, []
+
+    changed = False
+    cleaned: list[int] = []
+    rebuilt_parts: list[str] = []
+    last_end = 0
+
+    for number, start, end in spans:
+        rebuilt_parts.append(raw[last_end:start])
+        block = raw[start:end]
+        if number in chapters:
+            header, sep, body = block.partition("\n")
+            cleaned_header = _strip_paginated_title_suffix(header)
+            if cleaned_header != header:
+                changed = True
+                cleaned.append(number)
+                block = cleaned_header.strip() + (f"{sep}{body}" if sep else "")  # preserve original body/newlines
+        rebuilt_parts.append(block)
+        last_end = end
+
+    rebuilt_parts.append(raw[last_end:])
+    updated = "".join(rebuilt_parts)
+    if changed and updated != raw:
+        path.write_text(updated, encoding="utf-8")
+        return True, sorted(set(cleaned))
+    return False, []
+
+
+def _canonicalize_chapter_blocks_in_batch(*, path: Path, chapters: set[int], chapter_regex: str) -> tuple[bool, list[int]]:
+    """
+    Rebuilds selected chapter blocks into canonical form:
+    - title line normalized
+    - duplicate title lines removed from body start
+    - body separated from title by a blank line
+    - chapter blocks separated from each other by triple newlines
+    """
+    if not chapters:
+        return False, []
+
+    raw = path.read_text(encoding="utf-8")
+    parsed = _split_crawled_chapters(raw, chapter_regex)
+    if not parsed:
+        return False, []
+
+    changed = False
+    cleaned: list[int] = []
+    rebuilt_blocks: list[str] = []
+    rebuilt_numbers: list[int] = []
+
+    for chapter_number, title, body in parsed:
+        original_block = title.strip() + (f"\n{body}" if body else "")
+        if chapter_number in chapters:
+            canonical_block = _canonicalize_chapter_block(original_block)
+            if canonical_block != original_block.strip("\n"):
+                changed = True
+                cleaned.append(chapter_number)
+            canonical_body = canonical_block.partition("\n")[2].strip()
+            if rebuilt_numbers and rebuilt_numbers[-1] == chapter_number:
+                previous_block = rebuilt_blocks[-1]
+                previous_body = previous_block.partition("\n")[2].strip()
+                # Prefer the duplicate block that actually has content.
+                if previous_body and not canonical_body:
+                    changed = True
+                    cleaned.append(chapter_number)
+                    continue
+                if canonical_body and not previous_body:
+                    changed = True
+                    cleaned.append(chapter_number)
+                    rebuilt_blocks[-1] = canonical_block
+                    continue
+            rebuilt_blocks.append(canonical_block)
+            rebuilt_numbers.append(chapter_number)
+        else:
+            rebuilt_blocks.append(original_block.strip("\n"))
+            rebuilt_numbers.append(chapter_number)
+
+    updated = "\n\n\n".join(block for block in rebuilt_blocks if block.strip()) + "\n"
+    if changed and updated != raw:
+        path.write_text(updated, encoding="utf-8")
+        return True, sorted(set(cleaned))
+    return False, []
+
+
 def _remove_duplicate_chapters_in_batch(*, path: Path, chapters: set[int], chapter_regex: str) -> tuple[bool, list[int]]:
     """
     Removes duplicated chapter blocks for specific chapter numbers, keeping the first occurrence.
@@ -1009,6 +1163,16 @@ def verify_crawled_content(
                 )
                 continue
 
+            if _has_paginated_title_suffix(normalized_title):
+                issues.append(
+                    CrawlVerifyIssue(
+                        code="paginated_title",
+                        message=f"Tieu de chuong {chapter_number} con hau to phan trang: {normalized_title}",
+                        chapter_number=chapter_number,
+                        path=batch_file,
+                    )
+                )
+
             watermark_error = _detect_watermark_content(body)
             if watermark_error is not None:
                 issues.append(
@@ -1232,6 +1396,7 @@ def repair_crawled_content(
     duplicate_chapters: dict[Path, set[int]] = {}
     watermark_chapters: set[int] = set()
     metadata_noise_chapters: set[int] = set()
+    paginated_title_chapters: set[int] = set()
     for issue in verify_report.issues:
         if issue.chapter_number is None:
             continue
@@ -1249,6 +1414,9 @@ def repair_crawled_content(
             continue
         if issue.code == "metadata_content":
             metadata_noise_chapters.add(int(issue.chapter_number))
+            continue
+        if issue.code == "paginated_title":
+            paginated_title_chapters.add(int(issue.chapter_number))
             continue
         if issue.code in {"invalid_chapter_content", "duplicated_content"}:
             invalid_chapters.add(int(issue.chapter_number))
@@ -1402,6 +1570,36 @@ def repair_crawled_content(
                 )
             )
 
+    # 1bb) Normalize paginated chapter titles such as "(4/4)" suffixes.
+    for batch_file in batch_files:
+        if not batch_file.exists() or not batch_file.is_file():
+            continue
+        raw = batch_file.read_text(encoding="utf-8")
+        present = {num for num, _, _ in _split_crawled_chapter_spans(raw, config.translation.chapter_regex)}
+        targets = {
+            chapter for chapter in paginated_title_chapters if from_chapter <= chapter <= to_chapter and chapter in present
+        }
+        if not targets:
+            continue
+        changed, cleaned = _normalize_paginated_titles_in_batch(
+            path=batch_file,
+            chapters=targets,
+            chapter_regex=config.translation.chapter_regex,
+        )
+        if changed:
+            modified_files.append(batch_file)
+        for chapter in cleaned:
+            handled_chapters.add(int(chapter))
+            actions.append(
+                RepairAction(
+                    action="title_normalized",
+                    chapter=int(chapter),
+                    reason="paginated_title",
+                    target_file=batch_file.name,
+                    timestamp=now,
+                )
+            )
+
     # 1c) Strip leading metadata/noise lines from affected chapters.
     for batch_file in batch_files:
         if not batch_file.exists() or not batch_file.is_file():
@@ -1429,6 +1627,35 @@ def repair_crawled_content(
                     action="metadata_removed",
                     chapter=int(chapter),
                     reason="metadata_content",
+                    target_file=batch_file.name,
+                    timestamp=now,
+                )
+            )
+
+    # 1d) Canonicalize chapter formatting in-range so titles/body separators stay stable
+    # after repair passes and paginated duplicate title lines are removed.
+    for batch_file in batch_files:
+        if not batch_file.exists() or not batch_file.is_file():
+            continue
+        raw = batch_file.read_text(encoding="utf-8")
+        present = {num for num, _, _ in _split_crawled_chapter_spans(raw, config.translation.chapter_regex)}
+        targets = {chapter for chapter in present if from_chapter <= chapter <= to_chapter}
+        if not targets:
+            continue
+        changed, cleaned = _canonicalize_chapter_blocks_in_batch(
+            path=batch_file,
+            chapters=targets,
+            chapter_regex=config.translation.chapter_regex,
+        )
+        if changed:
+            modified_files.append(batch_file)
+        for chapter in cleaned:
+            handled_chapters.add(int(chapter))
+            actions.append(
+                RepairAction(
+                    action="chapter_canonicalized",
+                    chapter=int(chapter),
+                    reason="format_cleanup",
                     target_file=batch_file.name,
                     timestamp=now,
                 )
@@ -1761,34 +1988,42 @@ def _fetch_chapter(entry: ChapterEntry, config: NovelConfig, resolver, strategy_
     )
 
 
-def crawl_range(
+def resolve_directory_entries(
     config: NovelConfig,
-    from_chapter: int,
-    to_chapter: int,
     directory_url: str | None = None,
     *,
-    prune_failure_manifest: bool = True,
-) -> list[Path]:
-    run_started_at = time.time()
-    manifest = _load_failure_manifest(config)
+    from_chapter: int | None = None,
+    to_chapter: int | None = None,
+    fetch_all_pages: bool = False,
+    log_exceptions: bool = True,
+) -> dict[int, ChapterEntry]:
     registry = build_default_registry()
     resolver = registry.get(config.source.resolver_id)
     strategy_chain = build_strategy_chain(config.crawl, config.browser_debug)
     dir_url = directory_url or config.crawl.directory_url
+
     LOGGER.info(
-        "Starting crawl | novel=%s source=%s range=%s-%s directory=%s",
+        "Resolving directory entries | novel=%s source=%s directory=%s range=%s-%s fetch_all=%s",
         config.novel_id,
         config.crawl.site_id,
+        dir_url,
         from_chapter,
         to_chapter,
-        dir_url,
+        fetch_all_pages,
     )
     try:
         directory_result = strategy_chain.fetch(dir_url, config.crawl.request_timeout_seconds)
         entries = resolver.parse_directory(directory_result.html, directory_result.final_url)
         seen_directory_urls = {directory_result.final_url}
         pending_directory_urls = resolver.find_directory_page_urls(directory_result.html, directory_result.final_url)
-        while pending_directory_urls and not _has_requested_chapters(entries, from_chapter, to_chapter):
+        while pending_directory_urls:
+            if (
+                (not fetch_all_pages)
+                and from_chapter is not None
+                and to_chapter is not None
+                and _has_requested_chapters(entries, from_chapter, to_chapter)
+            ):
+                break
             page_url = pending_directory_urls.pop(0)
             if page_url in seen_directory_urls:
                 continue
@@ -1799,24 +2034,117 @@ def crawl_range(
                 if extra_url not in seen_directory_urls and extra_url not in pending_directory_urls:
                     pending_directory_urls.append(extra_url)
     except Exception:
-        LOGGER.exception(
-            "Directory crawl failed | novel=%s source=%s directory=%s",
-            config.novel_id,
-            config.crawl.site_id,
-            dir_url,
-        )
+        if log_exceptions:
+            LOGGER.exception(
+                "Directory crawl failed | novel=%s source=%s directory=%s",
+                config.novel_id,
+                config.crawl.site_id,
+                dir_url,
+            )
+        else:
+            LOGGER.warning(
+                "Directory crawl failed | novel=%s source=%s directory=%s",
+                config.novel_id,
+                config.crawl.site_id,
+                dir_url,
+            )
         raise
+    return entries
 
+
+def config_with_source(config: NovelConfig, source_config: SourceConfig) -> NovelConfig:
+    return replace(
+        config,
+        source_id=source_config.source_id,
+        source=source_config,
+        crawl=source_config.crawl,
+        browser_debug=source_config.browser_debug,
+    )
+
+
+def discover_source_entries(
+    config: NovelConfig,
+    source_config: SourceConfig,
+    *,
+    from_chapter: int | None = None,
+    to_chapter: int | None = None,
+    fetch_all_pages: bool = False,
+    log_exceptions: bool = True,
+) -> SourceDiscoveryResult | None:
+    source_bound_config = config_with_source(config, source_config)
+    entries = resolve_directory_entries(
+        source_bound_config,
+        from_chapter=from_chapter,
+        to_chapter=to_chapter,
+        fetch_all_pages=fetch_all_pages,
+        log_exceptions=log_exceptions,
+    )
+    latest_chapter = max((int(chapter) for chapter in entries), default=0)
+    return SourceDiscoveryResult(
+        source_config=source_config,
+        entries=entries,
+        latest_chapter=latest_chapter,
+    )
+
+
+def crawl_range(
+    config: NovelConfig,
+    from_chapter: int,
+    to_chapter: int,
+    directory_url: str | None = None,
+    *,
+    prune_failure_manifest: bool = True,
+    source_configs: list[SourceConfig] | None = None,
+) -> list[Path]:
+    run_started_at = time.time()
+    manifest = _load_failure_manifest(config)
+    registry = build_default_registry()
+    source_candidates = list(source_configs or [config.source])
+    discovery_results: list[SourceDiscoveryResult] = []
+    for source_cfg in source_candidates:
+        try:
+            result = discover_source_entries(
+                config,
+                source_cfg,
+                from_chapter=from_chapter,
+                to_chapter=to_chapter,
+                fetch_all_pages=False,
+                log_exceptions=True,
+            )
+        except Exception:
+            continue
+        if result is not None:
+            discovery_results.append(result)
+    if not discovery_results:
+        raise RuntimeError(f"Unable to build chapter map for {config.novel_id}")
+    discovery_results.sort(key=lambda item: item.latest_chapter, reverse=True)
+    primary_discovery = discovery_results[0]
+    active_config = config_with_source(config, primary_discovery.source_config)
+    resolver = registry.get(active_config.source.resolver_id)
+    strategy_chain = build_strategy_chain(active_config.crawl, active_config.browser_debug)
+    dir_url = directory_url or active_config.crawl.directory_url
+    LOGGER.info(
+        "Starting crawl | novel=%s source=%s range=%s-%s directory=%s",
+        active_config.novel_id,
+        active_config.crawl.site_id,
+        from_chapter,
+        to_chapter,
+        dir_url,
+    )
+    chapter_sources: dict[int, list[tuple[SourceConfig, ChapterEntry]]] = {}
     chapter_map: dict[int, ChapterEntry] = {}
-    if entries:
-        chapter_map.update(entries)
-        LOGGER.info("Resolved %s chapters from directory", len(chapter_map))
-    elif config.crawl.chapter_url_pattern:
+    for result in discovery_results:
+        for chapter_number, entry in sorted(result.entries.items()):
+            chapter_sources.setdefault(chapter_number, []).append((result.source_config, entry))
+            chapter_map.setdefault(chapter_number, entry)
+    if chapter_map:
+        LOGGER.info("Resolved %s chapters from %s source(s)", len(chapter_map), len(discovery_results))
+    elif active_config.crawl.chapter_url_pattern:
         for chapter_number in range(from_chapter, to_chapter + 1):
             chapter_map[chapter_number] = ChapterEntry(
                 chapter_number=chapter_number,
                 title=f"第{chapter_number}章",
-                url=config.crawl.chapter_url_pattern.format(chapter=chapter_number),
+                url=active_config.crawl.chapter_url_pattern.format(chapter=chapter_number),
             )
         LOGGER.warning("Directory parser returned no entries, using chapter_url_pattern fallback")
     else:
@@ -1838,21 +2166,23 @@ def crawl_range(
         batch_failed = 0
         LOGGER.info(
             "Batch start | novel=%s source=%s batch=%s-%s batch_size=%s",
-            config.novel_id,
-            config.crawl.site_id,
+            active_config.novel_id,
+            active_config.crawl.site_id,
             batch_start,
             batch_end,
             batch_size,
         )
         for chapter_number in range(fetch_start, fetch_end + 1):
-            entry = chapter_map.get(chapter_number)
-            if not entry:
+            candidates = chapter_sources.get(chapter_number, [])
+            if not candidates and chapter_number in chapter_map:
+                candidates = [(active_config.source, chapter_map[chapter_number])]
+            if not candidates:
                 LOGGER.warning("Skipping chapter %s: missing entry", chapter_number)
                 batch_failed += 1
                 total_failed += 1
                 failed_chapters.append(chapter_number)
                 _record_failure(
-                    config,
+                    active_config,
                     manifest,
                     chapter_number=chapter_number,
                     batch_start=batch_start,
@@ -1862,27 +2192,46 @@ def crawl_range(
                     details="Directory parser did not return an entry for this chapter",
                 )
                 continue
-            try:
-                block, parsed_number, stats = _fetch_chapter(entry, config, resolver, strategy_chain)
-            except Exception as exc:
-                LOGGER.exception(
-                    "Chapter crawl failed | novel=%s source=%s chapter=%s batch=%s-%s",
-                    config.novel_id,
-                    config.crawl.site_id,
-                    chapter_number,
-                    batch_start,
-                    batch_end,
-                )
+            block = ""
+            parsed_number = chapter_number
+            stats: dict[str, object] = {}
+            last_exc: Exception | None = None
+            source_used = active_config
+            for candidate_source, entry in candidates:
+                candidate_config = config_with_source(config, candidate_source)
+                candidate_resolver = registry.get(candidate_config.source.resolver_id)
+                candidate_strategy_chain = build_strategy_chain(candidate_config.crawl, candidate_config.browser_debug)
+                try:
+                    block, parsed_number, stats = _fetch_chapter(
+                        entry,
+                        candidate_config,
+                        candidate_resolver,
+                        candidate_strategy_chain,
+                    )
+                    source_used = candidate_config
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    LOGGER.warning(
+                        "Chapter crawl fallback | novel=%s chapter=%s source=%s failed=%s",
+                        config.novel_id,
+                        chapter_number,
+                        candidate_source.source_id,
+                        exc,
+                    )
+                    continue
+            if not block.strip():
+                exc = last_exc or RuntimeError("Unable to fetch chapter from all sources")
                 batch_failed += 1
                 total_failed += 1
                 failed_chapters.append(chapter_number)
                 _record_failure(
-                    config,
+                    active_config,
                     manifest,
                     chapter_number=chapter_number,
                     batch_start=batch_start,
                     batch_end=batch_end,
-                    url=entry.url,
+                    url=candidates[0][1].url if candidates else "",
                     reason=exc.__class__.__name__,
                     details=str(exc),
                 )
@@ -1892,11 +2241,11 @@ def crawl_range(
                 fetched_numbers.append(parsed_number)
                 batch_success += 1
                 total_success += 1
-                _clear_failure(config, manifest, parsed_number)
+                _clear_failure(active_config, manifest, parsed_number)
                 LOGGER.info(
                     "Chapter completed | novel=%s source=%s chapter=%s title=%s chars=%s parts=%s duration=%.2fs strategy=%s final_url=%s",
-                    config.novel_id,
-                    config.crawl.site_id,
+                    source_used.novel_id,
+                    source_used.crawl.site_id,
                     parsed_number,
                     stats["title"],
                     stats["chars"],

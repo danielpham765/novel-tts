@@ -4,6 +4,7 @@ File-first Python CLI pipeline for crawling serialized web novels, translating t
 
 - Architecture: `docs/ARCHITECTURE.md`
 - Agent notes (internal): `docs/agents/codex/AGENTS.md`
+- Compact coding context map: `docs/agents/context-map.yaml`
 
 ## Table of contents
 
@@ -13,6 +14,7 @@ File-first Python CLI pipeline for crawling serialized web novels, translating t
 - [Configuration](#configuration)
 - [Storage contract and invariants](#storage-contract-and-invariants)
 - [Recommended workflows](#recommended-workflows)
+- [Developer Context Workflow](#developer-context-workflow)
 - [Command reference](#command-reference)
 - [Troubleshooting](#troubleshooting)
 
@@ -43,6 +45,29 @@ uv run novel-tts --help
 Tip:
 
 - all commands support top-level `--log-file /path/to/file.log`
+- narrow coding context with `uv run novel-tts-context <task>`
+
+## Developer Context Workflow
+
+Use this when coding with Claude Code, Codex, or another repo agent.
+
+1. Start with the compact map instead of re-reading the whole repo:
+
+```bash
+uv run novel-tts-context --list
+uv run novel-tts-context translate
+uv run novel-tts-context queue
+```
+
+2. Read only the `Read first` files for the task you are changing.
+3. Add `Read only if needed` files only after the bug points there.
+4. Do not scan large/generated directories: `input/`, `output/`, `image/`, `tmp/`, `.logs/`, `.secrets/`, `.venv/`, `tests/`.
+
+Why this exists:
+
+- keeps stable repo context in one small deterministic artifact
+- gives a single obvious narrow-scope path for common tasks
+- reduces repeated loading of large files like `novel_tts/cli/main.py`, `novel_tts/translate/novel.py`, and `novel_tts/queue/translation_queue.py`
 
 ## Requirements
 
@@ -192,8 +217,8 @@ Queue-first guidance:
 
 `pipeline run` is useful for orchestration, but note:
 
-- its translation step uses direct `translate novel`
-- if you want queue-only translation, run queue translation separately and use `pipeline run --skip-translate`
+- its translation step launches the queue stack, enqueues the requested chapter range, and waits for queue completion before downstream media
+- it does not run caption translation
 
 Examples:
 
@@ -201,7 +226,7 @@ Examples:
 # End-to-end range
 uv run novel-tts pipeline run <novel_id> --range <start>-<end>
 
-# Queue-first style: skip translate in pipeline
+# Use existing translated chapters only
 uv run novel-tts pipeline run <novel_id> --range <start>-<end> --skip-translate
 
 # Downstream media stage-by-stage across a large range
@@ -209,6 +234,12 @@ uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-stage
 
 # Process each translated batch end-to-end
 uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-video
+
+# Watch one or more novels for new remote chapters, then crawl -> queue translate ->
+# repair -> polish -> TTS. Visual/video/upload run automatically once a full batch is ready.
+uv run novel-tts pipeline watch <novel_id>
+uv run novel-tts pipeline watch <novel_a> <novel_b> --interval-seconds 600
+uv run novel-tts pipeline watch --all
 ```
 
 ## Command reference
@@ -423,6 +454,8 @@ Behavior notes:
 
 - per-chapter WAVs are written under `output/<novel_id>/audio/<range>/.parts/`
 - per-chapter text hashes are cached under `output/<novel_id>/audio/<range>/.parts/.cache/`
+- merged MP3 cache metadata is stored at `output/<novel_id>/audio/<range>/.parts/.cache/merged.sha256`
+- if all chapter WAVs are cache hits and `output/<novel_id>/audio/<range>/<range>.mp3` already exists, merge is skipped unless `--force` is used
 - if translated text changes, the chapter will be re-synthesized even without `--force`
 
 ```bash
@@ -435,8 +468,15 @@ uv run novel-tts tts <novel_id> --range 701-800 --tts-server-name onPremise --tt
 
 Generates the visual layer under `output/<novel_id>/visual/`.
 
+Behavior notes:
+
+- final visual outputs are cached via `output/<novel_id>/visual/.cache/<range>.sha256`
+- rerender is skipped when the cached inputs still match the existing visual MP4 + thumbnail PNG
+- use `--force` to rerender even when the cache matches
+
 ```bash
 uv run novel-tts visual <novel_id> --range 1-10
+uv run novel-tts visual <novel_id> --range 1-10 --force
 uv run novel-tts visual <novel_id> --chapter 1
 ```
 
@@ -444,8 +484,15 @@ uv run novel-tts visual <novel_id> --chapter 1
 
 Writes final MP4s under `output/<novel_id>/video/`.
 
+Behavior notes:
+
+- final muxed videos are cached via `output/<novel_id>/video/.cache/<range>.sha256`
+- remux is skipped when the cached visual/audio inputs still match the existing final MP4
+- use `--force` to remux even when the cache matches
+
 ```bash
 uv run novel-tts video <novel_id> --range 1-10
+uv run novel-tts video <novel_id> --range 1-10 --force
 ```
 
 ### Upload
@@ -574,11 +621,35 @@ Use:
 
 ```bash
 uv run novel-tts pipeline run <novel_id> --range 1-10
-uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-captions
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-translate
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-upload
 uv run novel-tts pipeline run <novel_id> --range 1-10 --upload-platform tiktok
-uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-translate --skip-captions --skip-tts
+uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-translate --skip-tts
+```
+
+`pipeline watch` is continuous orchestration for ongoing serialized novels:
+
+- checks the remote source for newly published chapters
+- crawls only chapters newer than the current highest local crawled chapter
+- launches queue-first translation, waits for completion, then runs repair and polish
+- reruns TTS on the affected batch range (for example `1251-1260` when chapter `1253` arrives)
+- only runs `visual`, `video`, and `upload` once the audio batch has all chapter parts for that range
+
+Notes:
+
+- for safety, a novel with no local crawled chapters is skipped unless you pass `--bootstrap-from`
+- upload completion is remembered in `input/<novel_id>/.progress/watch_pipeline_state.json`
+- default watch settings come from `configs/app.yaml > pipeline.watch` and can still be overridden by CLI flags
+- `--all` uses `configs/app.yaml > pipeline.watch.novels` when that list is non-empty; otherwise it falls back to all files under `configs/novels/*.json`
+
+```bash
+uv run novel-tts pipeline watch <novel_id>
+uv run novel-tts pipeline watch <novel_id> --once
+uv run novel-tts pipeline watch <novel_id> --interval-seconds 900
+uv run novel-tts pipeline watch --all
+uv run novel-tts pipeline watch <novel_id> --bootstrap-from 1201
+uv run novel-tts pipeline watch <novel_id> --skip-upload
+uv run novel-tts pipeline watch <novel_id> --skip-crawl --skip-translate --skip-repair --skip-polish
 ```
 
 ## Troubleshooting

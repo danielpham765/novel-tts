@@ -13,15 +13,19 @@ CHALLENGE_BODY_TOKENS = (
     "performing security verification",
     "enable javascript and cookies",
     "xác minh bạn không phải là bot",
+    "网络错误,请点击刷新按钮重试",
 )
 RATE_LIMIT_TITLE_TOKENS = (
     "error 1015",
     "access denied",
+    "出错了",
 )
 RATE_LIMIT_BODY_TOKENS = (
     "you are being rate limited",
     "banned you temporarily",
     "temporarily from accessing this website",
+    "访问太频繁了",
+    "请30秒过后刷新重试",
 )
 
 

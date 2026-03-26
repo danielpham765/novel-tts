@@ -394,6 +394,7 @@ def _scan_counts(
     dict[int, dict[str, int]],
     dict[int, dict[str, int]],
     dict[int, dict[str, int]],
+    dict[int, dict[str, int]],
 ]:
     now = _redis_now_seconds(client)
     llm_counts: dict[int, int] = {}
@@ -405,6 +406,7 @@ def _scan_counts(
     quota_tokens_by_model: dict[int, dict[str, int]] = {}
     rpm_used_by_model: dict[int, dict[str, int]] = {}
     rpd_used_by_model: dict[int, dict[str, int]] = {}
+    api_daily_by_model: dict[int, dict[str, int]] = {}
 
     # LLM metric should represent *attempts* (including retries), so prefer :llm:reqs.
     # Fallbacks exist for older workers that didn't emit :llm:reqs.
@@ -422,6 +424,26 @@ def _scan_counts(
 
     llm_keys: set[str] = set()
     llm_bases: set[str] = set()
+    api_metric_bases: set[str] = set()
+
+    def _add_model_count(store: dict[int, dict[str, int]], idx: int, model: str, count: int) -> None:
+        by_model = store.setdefault(idx, {})
+        by_model[model] = by_model.get(model, 0) + int(count or 0)
+
+    # Preferred API attempt metric: :api:reqs (HTTP attempts including retries).
+    for key in client.scan_iter(match=api_pattern, count=1000):
+        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_API_REQS_RE)
+        if idx is None or not model:
+            continue
+        base = str(key).removesuffix(":api:reqs")
+        if base in api_metric_bases:
+            continue
+        api_metric_bases.add(base)
+        count_1m = _zcount_1m(client, key, now)
+        count_1d = _zcount_window(client, str(key), now, window_seconds=86400.0)
+        api_counts[idx] = api_counts.get(idx, 0) + count_1m
+        _add_model_count(api_by_model, idx, model, count_1m)
+        _add_model_count(api_daily_by_model, idx, model, count_1d)
 
     # Preferred: llm:reqs (attempts, including retries)
     for key in client.scan_iter(match=llm_pattern, count=1000):
@@ -435,8 +457,13 @@ def _scan_counts(
         llm_keys.add(key)
         count = _zcount_1m(client, key, now)
         llm_counts[idx] = llm_counts.get(idx, 0) + count
-        by_model = llm_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
+        _add_model_count(llm_by_model, idx, model, count)
+        if base not in api_metric_bases:
+            api_metric_bases.add(base)
+            count_1d = _zcount_window(client, str(key), now, window_seconds=86400.0)
+            api_counts[idx] = api_counts.get(idx, 0) + count
+            _add_model_count(api_by_model, idx, model, count)
+            _add_model_count(api_daily_by_model, idx, model, count_1d)
 
     # Fallback: api:calls (logical calls). This undercounts when retries happen, but is better than 0
     # when :llm:reqs isn't available.
@@ -451,8 +478,13 @@ def _scan_counts(
         llm_keys.add(key)
         count = _zcount_1m(client, key, now)
         llm_counts[idx] = llm_counts.get(idx, 0) + count
-        by_model = llm_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
+        _add_model_count(llm_by_model, idx, model, count)
+        if base not in api_metric_bases:
+            api_metric_bases.add(base)
+            count_1d = _zcount_window(client, str(key), now, window_seconds=86400.0)
+            api_counts[idx] = api_counts.get(idx, 0) + count
+            _add_model_count(api_by_model, idx, model, count)
+            _add_model_count(api_daily_by_model, idx, model, count_1d)
 
     # Backward-compatible fallback: older workers only wrote :quota:reqs.
     for key in client.scan_iter(match=quota_pattern, count=1000):
@@ -465,8 +497,13 @@ def _scan_counts(
         llm_bases.add(base)
         count = _zcount_1m(client, key, now)
         llm_counts[idx] = llm_counts.get(idx, 0) + count
-        by_model = llm_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
+        _add_model_count(llm_by_model, idx, model, count)
+        if base not in api_metric_bases:
+            api_metric_bases.add(base)
+            count_1d = _zcount_window(client, str(key), now, window_seconds=86400.0)
+            api_counts[idx] = api_counts.get(idx, 0) + count
+            _add_model_count(api_by_model, idx, model, count)
+            _add_model_count(api_daily_by_model, idx, model, count_1d)
 
     # Quota TPM usage: sum estimated tokens for active members in the last 60s.
     def _sum_tokens_for_zset(zset_key: str, *, token_hash_key: str, window_seconds: float) -> int:
@@ -498,8 +535,7 @@ def _scan_counts(
         total_tokens = _sum_tokens_for_zset(str(key), token_hash_key=token_key, window_seconds=60.0)
         if total_tokens <= 0:
             continue
-        by_model = quota_tokens_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + total_tokens
+        _add_model_count(quota_tokens_by_model, idx, model, total_tokens)
 
     for key in client.scan_iter(match=tpm_locked_pattern, count=1000):
         idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_TPM_LOCKED_RE)
@@ -509,8 +545,7 @@ def _scan_counts(
         total_tokens = _sum_tokens_for_zset(str(key), token_hash_key=token_key, window_seconds=60.0)
         if total_tokens <= 0:
             continue
-        by_model = quota_tokens_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + total_tokens
+        _add_model_count(quota_tokens_by_model, idx, model, total_tokens)
 
     # Backward-compatible fallback: older workers used :quota:reqs + :quota:tokens.
     for key in client.scan_iter(match=quota_pattern, count=1000):
@@ -533,41 +568,36 @@ def _scan_counts(
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=60.0)
-        by_model = rpm_used_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
+        if count <= 0:
+            continue
+        _add_model_count(rpm_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=rpm_locked_pattern, count=1000):
         idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPM_LOCKED_RE)
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=60.0)
-        by_model = rpm_used_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
+        if count <= 0:
+            continue
+        _add_model_count(rpm_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=rpd_freezed_pattern, count=1000):
         idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPD_FREEZED_RE)
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=86400.0)
-        by_model = rpd_used_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
+        if count <= 0:
+            continue
+        _add_model_count(rpd_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=rpd_locked_pattern, count=1000):
         idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPD_LOCKED_RE)
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=86400.0)
-        by_model = rpd_used_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
-
-    for key in client.scan_iter(match=api_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_API_REQS_RE)
-        if idx is None or not model:
+        if count <= 0:
             continue
-        count = _zcount_1m(client, key, now)
-        api_counts[idx] = api_counts.get(idx, 0) + count
-        by_model = api_by_model.setdefault(idx, {})
-        by_model[model] = by_model.get(model, 0) + count
+        _add_model_count(rpd_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=api_429_pattern, count=1000):
         idx, model = _extract_key_index_and_model_for_429(key)
@@ -588,6 +618,7 @@ def _scan_counts(
         quota_tokens_by_model,
         rpm_used_by_model,
         rpd_used_by_model,
+        api_daily_by_model,
     )
 
 
@@ -613,6 +644,7 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
         quota_tokens_by_model,
         rpm_used_by_model,
         rpd_used_by_model,
+        api_daily_by_model,
     ) = _scan_counts(client, prefix=cfg.prefix)
 
     all_indices: set[int] = set(range(1, len(keys) + 1))
@@ -745,11 +777,21 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
             api_success = max(attempts - rate_limited, 0)
             quota_used = int((quota_tokens_by_model.get(idx, {}) or {}).get(model, 0) or 0)
             tpm_limit = int((tpm_limits_by_model or {}).get(model, 0) or 0)
+            tpm_has_data = model in (quota_tokens_by_model.get(idx, {}) or {})
+            api_attempts_1m = int((api_by_model.get(idx, {}) or {}).get(model, 0) or 0)
             quota_cell = f"{quota_used:,} / {tpm_limit:,}" if tpm_limit > 0 else f"{quota_used:,}"
+            if not tpm_has_data and quota_used <= 0 and api_attempts_1m > 0 and tpm_limit > 0:
+                quota_cell = f"- / {tpm_limit:,}"
+            rpm_has_data = model in (rpm_used_by_model.get(idx, {}) or {})
             rpm_used = int((rpm_used_by_model.get(idx, {}) or {}).get(model, 0) or 0)
+            if not rpm_has_data:
+                rpm_used = api_attempts_1m
             rpm_limit = int((rpm_limits_by_model or {}).get(model, 0) or 0)
             rpm_cell = f"{rpm_used} / {rpm_limit}" if rpm_limit > 0 else str(rpm_used)
+            rpd_has_data = model in (rpd_used_by_model.get(idx, {}) or {})
             rpd_used = int((rpd_used_by_model.get(idx, {}) or {}).get(model, 0) or 0)
+            if not rpd_has_data:
+                rpd_used = int((api_daily_by_model.get(idx, {}) or {}).get(model, 0) or 0)
             rpd_limit = int((rpd_limits_by_model or {}).get(model, 0) or 0)
             rpd_cell = f"{rpd_used} / {rpd_limit}" if rpd_limit > 0 else str(rpd_used)
             display_rows.append(
@@ -791,11 +833,18 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
         tpm_limit = int((tpm_limits_by_model or {}).get(model, 0) or 0)
         total_limit = tpm_limit * key_count if (tpm_limit > 0 and key_count > 0) else 0
         total_quota_cell = f"{total_quota_used:,} / {total_limit:,}" if total_limit > 0 else f"{total_quota_used:,}"
+        total_api_attempts_1m = int((total_api_by_model or {}).get(model, 0) or 0)
+        if total_quota_used <= 0 and total_api_attempts_1m > 0 and total_limit > 0:
+            total_quota_cell = f"- / {total_limit:,}"
         total_rpm_used = int((total_rpm_used_by_model or {}).get(model, 0) or 0)
+        if model not in total_rpm_used_by_model:
+            total_rpm_used = total_api_attempts_1m
         rpm_limit = int((rpm_limits_by_model or {}).get(model, 0) or 0)
         total_rpm_limit = rpm_limit * key_count if (rpm_limit > 0 and key_count > 0) else 0
         total_rpm_cell = f"{total_rpm_used} / {total_rpm_limit}" if total_rpm_limit > 0 else str(total_rpm_used)
         total_rpd_used = int((total_rpd_used_by_model or {}).get(model, 0) or 0)
+        if model not in total_rpd_used_by_model:
+            total_rpd_used = sum(int((api_daily_by_model.get(idx, {}) or {}).get(model, 0) or 0) for idx in displayed_indices)
         rpd_limit = int((rpd_limits_by_model or {}).get(model, 0) or 0)
         total_rpd_limit = rpd_limit * key_count if (rpd_limit > 0 and key_count > 0) else 0
         total_rpd_cell = f"{total_rpd_used} / {total_rpd_limit}" if total_rpd_limit > 0 else str(total_rpd_used)

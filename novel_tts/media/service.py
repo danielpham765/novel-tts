@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -26,7 +27,94 @@ def _line1_for_chapter(template: str, chapter: int) -> str:
     return f"{text} {chapter}"
 
 
-def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Path]:
+def _cache_dir(output_dir: Path) -> Path:
+    return output_dir / ".cache"
+
+
+def _cache_path(output_dir: Path, range_key: str) -> Path:
+    return _cache_dir(output_dir) / f"{range_key}.sha256"
+
+
+def _file_signature(path: Path) -> str:
+    stat = path.stat()
+    return f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _cache_value(*parts: str) -> str:
+    payload = "\n".join(parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _read_cache(output_dir: Path, range_key: str) -> str | None:
+    path = _cache_path(output_dir, range_key)
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except Exception:
+        return None
+
+
+def _write_cache(output_dir: Path, range_key: str, value: str) -> None:
+    path = _cache_path(output_dir, range_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
+def _visual_cache_value(
+    *,
+    mode: str,
+    background: Path,
+    channel_name_image: Path | None,
+    line1: str,
+    line2: str,
+    line3: str,
+    font_file: str,
+    render_width: int,
+    episode_batch_size: int,
+    start: int,
+    end: int,
+) -> str:
+    parts = [
+        f"mode={mode}",
+        f"background={_file_signature(background)}",
+        f"channel_name={_file_signature(channel_name_image) if channel_name_image is not None else ''}",
+        f"line1={line1}",
+        f"line2={line2}",
+        f"line3={line3}",
+        f"font_file={font_file}",
+        f"render_width={render_width}",
+        f"episode_batch_size={episode_batch_size}",
+        f"start={start}",
+        f"end={end}",
+    ]
+    return _cache_value(*parts)
+
+
+def _video_cache_value(
+    *,
+    visual_path: Path,
+    audio_path: Path,
+    duration: float,
+    video_codec: str,
+    audio_codec: str,
+    preset: str,
+    crf: int,
+    audio_bitrate: str,
+) -> str:
+    return _cache_value(
+        f"visual={_file_signature(visual_path)}",
+        f"audio={_file_signature(audio_path)}",
+        f"duration={duration}",
+        f"video_codec={video_codec}",
+        f"audio_codec={audio_codec}",
+        f"preset={preset}",
+        f"crf={crf}",
+        f"audio_bitrate={audio_bitrate}",
+    )
+
+
+def generate_visual(config: NovelConfig, start: int, end: int, force: bool = False) -> tuple[Path, Path]:
     if not ffmpeg_has_filter("drawtext"):
         raise RuntimeError(
             "ffmpeg filter 'drawtext' is unavailable. Install an ffmpeg build with drawtext/libfreetype "
@@ -43,8 +131,30 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
     output_dir.mkdir(parents=True, exist_ok=True)
     output_video = output_dir / f"{range_key}.mp4"
     thumbnail = output_dir / f"{range_key}.png"
-    font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
     episode_batch_size = max(1, int(getattr(config.video, "episode_batch_size", 10) or 10))
+    expected_cache = _visual_cache_value(
+        mode="range",
+        background=background,
+        channel_name_image=channel_name_image,
+        line1=config.visual.line1,
+        line2=config.visual.line2,
+        line3=config.visual.line3,
+        font_file=config.visual.font_file,
+        render_width=int(config.visual.render_width),
+        episode_batch_size=episode_batch_size,
+        start=start,
+        end=end,
+    )
+    cached_value = _read_cache(output_dir, range_key)
+    outputs_exist = (
+        output_video.exists()
+        and output_video.stat().st_size > 0
+        and thumbnail.exists()
+        and thumbnail.stat().st_size > 0
+    )
+    if (not force) and outputs_exist and cached_value == expected_cache:
+        return output_video, thumbnail
+    font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
     part_index = ((start - 1) // episode_batch_size) + 1
     drawtext_filters = ",".join(
         [
@@ -76,10 +186,11 @@ def generate_visual(config: NovelConfig, start: int, end: int) -> tuple[Path, Pa
         ]
     )
     run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", str(thumbnail)])
+    _write_cache(output_dir, range_key, expected_cache)
     return output_video, thumbnail
 
 
-def generate_visual_for_chapter(config: NovelConfig, chapter: int) -> tuple[Path, Path]:
+def generate_visual_for_chapter(config: NovelConfig, chapter: int, force: bool = False) -> tuple[Path, Path]:
     if not ffmpeg_has_filter("drawtext"):
         raise RuntimeError(
             "ffmpeg filter 'drawtext' is unavailable. Install an ffmpeg build with drawtext/libfreetype "
@@ -100,6 +211,28 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int) -> tuple[Path
     output_dir.mkdir(parents=True, exist_ok=True)
     output_video = output_dir / f"{range_key}.mp4"
     thumbnail = output_dir / f"{range_key}.png"
+    expected_cache = _visual_cache_value(
+        mode="chapter",
+        background=background_cover,
+        channel_name_image=None,
+        line1=_line1_for_chapter(config.visual.line1, chapter),
+        line2=config.visual.line2,
+        line3=config.visual.line3,
+        font_file=config.visual.font_file,
+        render_width=int(config.visual.render_width),
+        episode_batch_size=max(1, int(getattr(config.video, "episode_batch_size", 10) or 10)),
+        start=chapter,
+        end=chapter,
+    )
+    cached_value = _read_cache(output_dir, range_key)
+    outputs_exist = (
+        output_video.exists()
+        and output_video.stat().st_size > 0
+        and thumbnail.exists()
+        and thumbnail.stat().st_size > 0
+    )
+    if (not force) and outputs_exist and cached_value == expected_cache:
+        return output_video, thumbnail
     font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
     line1_text = _line1_for_chapter(config.visual.line1, chapter)
 
@@ -134,10 +267,11 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int) -> tuple[Path
         ]
     )
     run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", str(thumbnail)])
+    _write_cache(output_dir, range_key, expected_cache)
     return output_video, thumbnail
 
 
-def create_video(config: NovelConfig, start: int, end: int) -> Path:
+def create_video(config: NovelConfig, start: int, end: int, force: bool = False) -> Path:
     range_key = _range_key(start, end)
     visual_path = config.storage.visual_dir / f"{range_key}.mp4"
     audio_path = config.storage.audio_dir / range_key / f"{range_key}.mp3"
@@ -148,6 +282,19 @@ def create_video(config: NovelConfig, start: int, end: int) -> Path:
     duration = ffprobe_duration(audio_path)
     config.storage.video_dir.mkdir(parents=True, exist_ok=True)
     output_path = config.storage.video_dir / f"{range_key}.mp4"
+    expected_cache = _video_cache_value(
+        visual_path=visual_path,
+        audio_path=audio_path,
+        duration=duration,
+        video_codec=config.video.video_codec,
+        audio_codec=config.video.audio_codec,
+        preset=config.video.preset,
+        crf=config.video.crf,
+        audio_bitrate=config.video.audio_bitrate,
+    )
+    cached_value = _read_cache(config.storage.video_dir, range_key)
+    if (not force) and output_path.exists() and output_path.stat().st_size > 0 and cached_value == expected_cache:
+        return output_path
     run_ffmpeg(
         [
             "-y",
@@ -172,4 +319,5 @@ def create_video(config: NovelConfig, start: int, end: int) -> Path:
             str(output_path),
         ]
     )
+    _write_cache(config.storage.video_dir, range_key, expected_cache)
     return output_path

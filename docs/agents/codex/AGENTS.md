@@ -24,6 +24,23 @@ Primary entrypoints:
 Console script:
 
 - `novel-tts`
+- `novel-tts-context` (compact task-specific coding context)
+
+## Fastest Narrow-Context Path
+
+Before loading subsystem code, start here:
+
+```bash
+uv run novel-tts-context --list
+uv run novel-tts-context translate
+uv run novel-tts-context queue
+```
+
+Source of truth for this compact map:
+
+- `docs/agents/context-map.yaml`
+
+Use it to decide which 2-4 files to read first for a task, and which large files to avoid unless the bug clearly points there.
 
 ## Core Rule
 

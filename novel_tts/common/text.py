@@ -13,6 +13,13 @@ def normalize_whitespace(value: str) -> str:
     )
 
 
+def normalize_ellipsis(value: str) -> str:
+    value = value.replace("…", "...")
+    value = re.sub(r"\.\.\.(?:\s*\.\.\.)+", "...", value)
+    value = re.sub(r"\.{4,}", "...", value)
+    return value
+
+
 def slugify(value: str) -> str:
     value = value.lower().strip()
     value = re.sub(r"[^a-z0-9]+", "-", value)

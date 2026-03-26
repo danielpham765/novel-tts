@@ -1,0 +1,152 @@
+version: 1
+
+stable_repo_context:
+  summary:
+    - "One Python package (`novel_tts`) with one CLI entrypoint (`novel-tts`)."
+    - "Filesystem is the source of truth; Redis is queue/quota bookkeeping only."
+    - "Canonical translation state lives in `input/<novel>/.parts/...`; `translated/*.txt` is derived."
+  read_first:
+    - path: "docs/agents/context-map.yaml"
+      why: "Compact task map and repo-safe reading rules."
+    - path: "docs/agents/codex/AGENTS.md"
+      why: "Short architecture invariants and module ownership."
+  do_not_scan:
+    - "input/"
+    - "output/"
+    - "image/"
+    - "tmp/"
+    - ".logs/"
+    - ".secrets/"
+    - ".venv/"
+    - "tests/"
+  repeated_token_hotspots:
+    - path: "novel_tts/cli/main.py"
+      why: "Large command surface; usually only needed for wiring or CLI bugs."
+    - path: "novel_tts/translate/novel.py"
+      why: "Large translation pipeline; avoid loading unless the task is translate-specific."
+    - path: "novel_tts/queue/translation_queue.py"
+      why: "Large queue runtime; avoid loading for non-queue work."
+    - path: "novel_tts/config/loader.py"
+      why: "Shared config merge logic; read only for config or wiring issues."
+
+tasks:
+  translate:
+    summary: "Chapter translation, `.parts` truth, rebuilds, glossary, repair."
+    read_first:
+      - path: "novel_tts/translate/novel.py"
+        why: "Owns chapter splitting, translation flow, `.parts`, and rebuilds."
+      - path: "novel_tts/translate/providers.py"
+        why: "Provider abstraction and API call boundaries."
+      - path: "novel_tts/config/loader.py"
+        why: "Model/config merge only if behavior depends on config wiring."
+    maybe_read:
+      - path: "novel_tts/translate/glossary.py"
+        why: "Glossary sanitation or auto-update flow."
+      - path: "novel_tts/translate/repair.py"
+        why: "Repair or requeue behavior."
+      - path: "novel_tts/translate/captions.py"
+        why: "Caption-only translate path."
+    avoid_first:
+      - "novel_tts/queue/translation_queue.py"
+      - "novel_tts/cli/main.py"
+    dynamic_context:
+      - "Which command failed: `translate novel`, `translate chapter`, or `translate repair`?"
+      - "Whether the issue is provider behavior, glossary behavior, or `.parts`/rebuild behavior."
+  queue:
+    summary: "Redis-backed chapter queue, worker orchestration, quota handoff."
+    read_first:
+      - path: "novel_tts/queue/translation_queue.py"
+        why: "Queue job discovery, worker spawning, Redis bookkeeping, monitor flows."
+      - path: "novel_tts/translate/novel.py"
+        why: "Queue delegates chapter truth and chapter parsing here."
+      - path: "novel_tts/config/loader.py"
+        why: "Queue model and Redis config merge rules."
+    maybe_read:
+      - path: "novel_tts/quota/client.py"
+        why: "Central quota calls or blocking semantics."
+      - path: "novel_tts/quota/supervisor.py"
+        why: "Supervisor-side quota behavior."
+      - path: "novel_tts/net/proxy_gateway.py"
+        why: "Proxy gateway routing or IP-ban recovery behavior."
+    avoid_first:
+      - "novel_tts/tts/service.py"
+      - "novel_tts/media/service.py"
+    dynamic_context:
+      - "Is the failure in enqueue/discovery, worker subprocesses, Redis state, or quota/proxy handling?"
+      - "Which job type is affected: chapter jobs or `captions`?"
+  tts:
+    summary: "Reads translated batch files, chunks by `Chương`, caches wavs, merges audio."
+    read_first:
+      - path: "novel_tts/tts/service.py"
+        why: "Primary TTS flow, chunking, cache reuse, menu generation."
+      - path: "novel_tts/tts/providers.py"
+        why: "Provider connection and synthesis implementation."
+      - path: "novel_tts/config/loader.py"
+        why: "TTS provider/model config only if config wiring matters."
+    maybe_read:
+      - path: "novel_tts/common/ffmpeg.py"
+        why: "ffmpeg/ffprobe wrappers and failure behavior."
+      - path: "novel_tts/common/text.py"
+        why: "Range parsing or text utilities if CLI/range bug shows up."
+    avoid_first:
+      - "novel_tts/queue/translation_queue.py"
+      - "novel_tts/media/service.py"
+    dynamic_context:
+      - "Which translated batch path/range is involved?"
+      - "Is the problem chunk detection, caching, provider output, or ffmpeg merge?"
+  media:
+    summary: "Visual generation, muxing, and upload-adjacent media outputs."
+    read_first:
+      - path: "novel_tts/media/service.py"
+        why: "Visual render and video mux entrypoints."
+      - path: "novel_tts/upload/service.py"
+        why: "Upload or publishing behavior after media generation."
+      - path: "novel_tts/config/loader.py"
+        why: "Visual/video/upload config assembly."
+    maybe_read:
+      - path: "novel_tts/common/ffmpeg.py"
+        why: "ffmpeg flags or probe behavior."
+      - path: "novel_tts/tts/service.py"
+        why: "Only if the media bug originates in audio/menu artifacts."
+    avoid_first:
+      - "novel_tts/queue/translation_queue.py"
+      - "novel_tts/translate/novel.py"
+    dynamic_context:
+      - "Is the task visual-only, final video mux, or upload behavior?"
+      - "Which artifact contract matters: `output/<novel>/visual`, `video`, or upload metadata?"
+  config_cli:
+    summary: "Config loading, dataclass shape, and CLI dispatch/wiring."
+    read_first:
+      - path: "novel_tts/config/loader.py"
+        why: "All config assembly and normalization lives here."
+      - path: "novel_tts/config/models.py"
+        why: "Typed config graph and field ownership."
+      - path: "novel_tts/cli/main.py"
+        why: "Command parsing, dispatch, and stage wiring."
+    maybe_read:
+      - path: "README.md"
+        why: "Human-facing command contract and workflow examples."
+      - path: "docs/ARCHITECTURE.md"
+        why: "Broader architecture only if wiring change crosses subsystems."
+    avoid_first:
+      - "novel_tts/translate/novel.py"
+      - "novel_tts/queue/translation_queue.py"
+    dynamic_context:
+      - "Is the bug in merge order, env overrides, dataclass schema, or CLI dispatch?"
+      - "Which top-level command family is affected?"
+
+workflow:
+  narrow_scope:
+    - "Read `docs/agents/context-map.yaml` or run `novel-tts-context <task>` first."
+    - "Load only the `read_first` files for that task."
+    - "Add `maybe_read` files only when the observed bug points there."
+    - "Do not inspect storage artifacts unless the bug is artifact-specific."
+  stable_vs_dynamic:
+    stable:
+      - "File-first storage contract."
+      - "Canonical `.parts` translation truth."
+      - "Large generated directories that should not be scanned."
+      - "Subsystem entry files and ownership."
+    dynamic:
+      - "Specific command, range, provider, or artifact involved in the current bug."
+      - "Only the single storage/config file directly implicated by the task."

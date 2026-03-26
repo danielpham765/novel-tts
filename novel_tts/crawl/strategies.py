@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -17,6 +20,10 @@ from .types import FetchResult
 LOGGER = get_logger(__name__)
 
 
+def _is_playwright_sync_loop_error(exc: Exception) -> bool:
+    return "Playwright Sync API inside the asyncio loop" in str(exc)
+
+
 def _default_headers(cookie_header: str = "") -> dict[str, str]:
     headers = {
         "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -25,6 +32,27 @@ def _default_headers(cookie_header: str = "") -> dict[str, str]:
     if cookie_header:
         headers["cookie"] = cookie_header
     return headers
+
+
+def _run_playwright_worker(payload: dict[str, object], *, timeout_seconds: int) -> dict[str, object]:
+    result = subprocess.run(
+        [sys.executable, "-m", "novel_tts.crawl.playwright_worker"],
+        input=json.dumps(payload, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        timeout=max(10, int(timeout_seconds) + 15),
+    )
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if not stdout:
+        raise RuntimeError(stderr or f"playwright worker failed with exit code {result.returncode}")
+    try:
+        parsed = json.loads(stdout)
+    except Exception as exc:
+        raise RuntimeError(f"invalid worker output: {stdout[:400]}") from exc
+    if result.returncode != 0 or not bool(parsed.get("ok", False)):
+        raise RuntimeError(str(parsed.get("error", "")) or stderr or "playwright worker failed")
+    return parsed
 
 
 class FetchStrategy:
@@ -80,10 +108,6 @@ class BootstrapHttpFetchStrategy(FetchStrategy):
     def _bootstrap_from_browser(self, url: str) -> None:
         if self.browser_config.mode != "debug-attach" or not self.browser_config.remote_debugging_url:
             raise RuntimeError("browser bootstrap requires debug-attach mode with remote_debugging_url")
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError as exc:
-            raise RuntimeError("playwright is required for browser bootstrap mode") from exc
 
         parsed = urlparse(url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -94,10 +118,17 @@ class BootstrapHttpFetchStrategy(FetchStrategy):
         except Exception:
             LOGGER.warning("Unable to read browser user-agent from %s", version_url)
 
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(self.browser_config.remote_debugging_url)
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
-            cookies = context.cookies([origin])
+        worker = _run_playwright_worker(
+            {
+                "action": "cookies",
+                "url": origin,
+                "browser_config": {
+                    "remote_debugging_url": self.browser_config.remote_debugging_url,
+                },
+            },
+            timeout_seconds=30,
+        )
+        cookies = list(worker.get("cookies", []) or [])
 
         self.session.cookies.clear()
         for cookie in cookies:
@@ -230,91 +261,55 @@ class BrowserFetchStrategy(FetchStrategy):
                 LOGGER.debug("browser fetch expand attempt failed for text=%s", text, exc_info=True)
 
     def fetch(self, url: str, timeout_seconds: int) -> FetchResult:
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError as exc:
-            raise RuntimeError("playwright is required for browser crawl mode") from exc
-
         debug_artifacts = []
         debug_dir = self.policy.debug_image_dir()
         LOGGER.info("browser fetch start for %s (mode=%s)", url, self.browser_config.mode)
-        if self.browser_config.mode == "debug-attach" and self.browser_config.remote_debugging_url:
-            page = self._get_attached_page()
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
-            except Exception as exc:
-                if "ERR_ABORTED" not in str(exc):
-                    raise
-                LOGGER.warning("browser worker page aborted for %s; recreating page and retrying once", url)
-                page = self._get_attached_page(fresh=True)
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
-            page.wait_for_timeout(self._stabilize_wait_ms)
-            self._expand_directory(page)
-            screenshot_path = debug_dir / "crawl-page.png"
-            page.screenshot(path=str(screenshot_path), full_page=True)
+        screenshot_path = debug_dir / "crawl-page.png"
+        worker = _run_playwright_worker(
+            {
+                "action": "fetch",
+                "url": url,
+                "timeout_ms": timeout_seconds * 1000,
+                "stabilize_wait_ms": self._stabilize_wait_ms,
+                "screenshot_path": str(screenshot_path),
+                "expand_text_candidates": list(self._expand_text_candidates),
+                "allow_fallback": True,
+                "browser_config": {
+                    "mode": self.browser_config.mode,
+                    "remote_debugging_url": self.browser_config.remote_debugging_url,
+                    "executable_path": self.browser_config.executable_path,
+                    "user_data_dir": self.browser_config.user_data_dir,
+                    "headless": self.browser_config.headless,
+                },
+            },
+            timeout_seconds=timeout_seconds,
+        )
+        if screenshot_path.exists():
             debug_artifacts.append(screenshot_path)
             LOGGER.info("browser fetch saved screenshot to %s", screenshot_path)
-            html = page.content()
-            title = page.title()
-            final_url = page.url
-            block_reason = self.policy.classify(html, title)
-            challenge_detected = bool(block_reason)
-            return FetchResult(
-                url=url,
-                final_url=final_url,
-                html=html,
-                title=title,
-                strategy_name=self.name,
-                challenge_detected=challenge_detected,
-                block_reason=block_reason,
-                debug_artifacts=debug_artifacts,
+        html = str(worker.get("html", "") or "")
+        title = str(worker.get("title", "") or "")
+        final_url = str(worker.get("final_url", "") or url)
+        mode_used = str(worker.get("mode_used", "") or "").strip()
+        if mode_used.startswith("standalone:"):
+            LOGGER.warning(
+                "browser debug-attach unavailable for %s via %s; falling back to standalone browser (%s)",
+                url,
+                self.browser_config.remote_debugging_url,
+                mode_used.split(":", 1)[1],
             )
-
-        with sync_playwright() as playwright:
-            browser = None
-            context = None
-            page = None
-            if self.browser_config.user_data_dir:
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=self.browser_config.user_data_dir,
-                    headless=self.browser_config.headless,
-                    executable_path=self.browser_config.executable_path or None,
-                )
-                page = context.pages[0] if context.pages else context.new_page()
-            else:
-                launch_args = {"headless": self.browser_config.headless}
-                if self.browser_config.executable_path:
-                    launch_args["executable_path"] = self.browser_config.executable_path
-                browser = playwright.chromium.launch(**launch_args)
-                context = browser.new_context()
-                page = context.new_page()
-
-            assert page is not None
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
-            page.wait_for_timeout(self._stabilize_wait_ms)
-            self._expand_directory(page)
-            screenshot_path = debug_dir / "crawl-page.png"
-            page.screenshot(path=str(screenshot_path), full_page=True)
-            debug_artifacts.append(screenshot_path)
-            LOGGER.info("browser fetch saved screenshot to %s", screenshot_path)
-            html = page.content()
-            title = page.title()
-            final_url = page.url
-            block_reason = self.policy.classify(html, title)
-            challenge_detected = bool(block_reason)
-            context.close()
-            if browser:
-                browser.close()
-            return FetchResult(
-                url=url,
-                final_url=final_url,
-                html=html,
-                title=title,
-                strategy_name=self.name,
-                challenge_detected=challenge_detected,
-                block_reason=block_reason,
-                debug_artifacts=debug_artifacts,
-            )
+        block_reason = self.policy.classify(html, title)
+        challenge_detected = bool(block_reason)
+        return FetchResult(
+            url=url,
+            final_url=final_url,
+            html=html,
+            title=title,
+            strategy_name=self.name,
+            challenge_detected=challenge_detected,
+            block_reason=block_reason,
+            debug_artifacts=debug_artifacts,
+        )
 
 
 @dataclass
@@ -328,7 +323,20 @@ class StrategyChain:
             try:
                 result = strategy.fetch(url, timeout_seconds)
             except Exception as exc:
-                LOGGER.exception("%s fetch failed at %s", strategy.name, url)
+                if strategy.name == "browser" and last_result is not None:
+                    LOGGER.warning(
+                        "browser fetch failed at %s; keeping previous %s result (%s)",
+                        url,
+                        last_result.strategy_name,
+                        exc,
+                    )
+                    return last_result
+                if _is_playwright_sync_loop_error(exc):
+                    LOGGER.warning("%s fetch unavailable at %s (%s)", strategy.name, url, exc)
+                elif isinstance(exc, RequestException):
+                    LOGGER.warning("%s fetch request failed at %s (%s)", strategy.name, url, exc)
+                else:
+                    LOGGER.exception("%s fetch failed at %s", strategy.name, url)
                 if strategy.name in {"http", "http-session"} and self.policy.should_try_browser_fallback():
                     continue
                 raise

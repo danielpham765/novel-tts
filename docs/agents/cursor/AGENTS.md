@@ -10,6 +10,11 @@ It focuses on:
 
 If you need deeper background, prefer `docs/ARCHITECTURE.md` rather than re-discovering structure from scratch.
 
+For the narrowest task-specific entrypoint, start with:
+
+- `docs/agents/context-map.yaml`
+- `uv run novel-tts-context <task>`
+
 ---
 
 ## Fast Mental Model
