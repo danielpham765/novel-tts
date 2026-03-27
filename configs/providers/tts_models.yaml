@@ -48,10 +48,10 @@ cpu:
 gpu:
   # Preset cho máy 4 vCPU + NVIDIA Tesla T4:
   # dùng backend GPU native để tránh kéo tải sang CPU như GGUF/CPU.
-  backbone: "VieNeu-TTS (GPU)"
-  codec: "NeuCodec (Standard)"
+  backbone: "VieNeu-TTS-0.3B (GPU)"
+  codec: "NeuCodec (Distill)"
   device: "CUDA"
-  use_lmdeploy: false
+  use_lmdeploy: true
   custom_model_id: ""
   base_model: "VieNeu-TTS (GPU)"
   hf_token: ""

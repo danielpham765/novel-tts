@@ -1,4 +1,4 @@
 local: "http://127.0.0.1:7860/"
 onPremise: "http://192.168.2.1:7860/"
-ttsCloud: "http://47.129.229.150:7860/"
+ttsCloud: "http://47.128.219.175:7860/"
 # onPremise: "https://tts.aquafox.io/"

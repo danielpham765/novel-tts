@@ -172,7 +172,7 @@ def test_run_upload_youtube_dry_run_rewrites_tap_index_from_range(tmp_path: Path
 
     captured: dict[str, str] = {}
 
-    def _capture(config, spec, *, dry_run):  # type: ignore[no-redef]
+    def _capture(config, spec, *, dry_run, force=False):  # type: ignore[no-redef]
         captured["title"] = spec.title
         return {"status": "dry-run", "platform": "youtube", "range_key": spec.range_key}
 
@@ -195,7 +195,7 @@ def test_run_uploads_batches_youtube_with_sleep(tmp_path: Path, monkeypatch: pyt
 
     monkeypatch.setattr(
         "novel_tts.upload.service.run_upload",
-        lambda _cfg, start, end, *, platform, dry_run=False: calls.append((start, end, platform, dry_run))
+        lambda _cfg, start, end, *, platform, dry_run=False, force=False: calls.append((start, end, platform, dry_run))
         or {"range_key": f"chuong_{start}-{end}", "status": "uploaded"},
     )
     monkeypatch.setattr("novel_tts.upload.service.time.sleep", lambda seconds: sleeps.append(seconds))
@@ -218,7 +218,10 @@ def test_run_uploads_skips_batch_sleep_for_dry_run(tmp_path: Path, monkeypatch: 
 
     monkeypatch.setattr(
         "novel_tts.upload.service.run_upload",
-        lambda _cfg, start, end, *, platform, dry_run=False: {"range_key": f"chuong_{start}-{end}", "status": "dry-run"},
+        lambda _cfg, start, end, *, platform, dry_run=False, force=False: {
+            "range_key": f"chuong_{start}-{end}",
+            "status": "dry-run",
+        },
     )
     monkeypatch.setattr(
         "novel_tts.upload.service.time.sleep",
@@ -315,6 +318,10 @@ def test_run_upload_youtube_rotates_account_on_quota_exceeded_before_video_inser
         def __init__(self, account_name: str) -> None:
             self.account_name = account_name
 
+        def list(self, **_kwargs):
+            call_order.append(f"{self.account_name}:playlistItems.list")
+            return _Request({"items": []})
+
         def insert(self, **_kwargs):
             call_order.append(f"{self.account_name}:playlistItems.insert")
             return _Request({})
@@ -348,6 +355,7 @@ def test_run_upload_youtube_rotates_account_on_quota_exceeded_before_video_inser
     assert result["status"] == "uploaded"
     assert result["video_id"] == "vid123"
     assert call_order == [
+        "account-1:playlistItems.list",
         "account-1:videos.insert",
         "account-2:videos.insert",
         "account-2:thumbnails.set",
@@ -405,6 +413,10 @@ def test_run_upload_youtube_uses_selected_fixed_account_and_logs_it(
         def __init__(self, account_name: str) -> None:
             self.account_name = account_name
 
+        def list(self, **_kwargs):
+            call_order.append(f"{self.account_name}:playlistItems.list")
+            return _Request({"items": []})
+
         def insert(self, **_kwargs):
             call_order.append(f"{self.account_name}:playlistItems.insert")
             return _Request({})
@@ -437,6 +449,7 @@ def test_run_upload_youtube_uses_selected_fixed_account_and_logs_it(
 
     assert result["status"] == "uploaded"
     assert call_order == [
+        "account-2:playlistItems.list",
         "account-2:videos.insert",
         "account-2:thumbnails.set",
         "account-2:playlistItems.insert",
@@ -444,6 +457,190 @@ def test_run_upload_youtube_uses_selected_fixed_account_and_logs_it(
     content = log_path.read_text(encoding="utf-8")
     assert "Uploading chuong_1-10 with YouTube project account-2" in content
     assert "mode=2" in content
+
+
+def test_run_upload_youtube_skips_when_title_already_exists_in_playlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    _prepare_output_files(config)
+    (config.storage.output_dir / "title.txt").write_text("Tập 1 | Vô Cực Thiên Tôn", encoding="utf-8")
+
+    class _MediaFileUpload:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "googleapiclient.http",
+        type("_M", (), {"MediaFileUpload": _MediaFileUpload}),
+    )
+
+    call_order: list[str] = []
+
+    class _Request:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def execute(self):
+            return self._payload
+
+    class _PlaylistItemsResource:
+        def list(self, **_kwargs):
+            call_order.append("playlistItems.list")
+            return _Request(
+                {
+                    "items": [
+                        {
+                            "id": "PLI123",
+                            "snippet": {"playlistId": "PL1234567890", "position": 0},
+                            "contentDetails": {"videoId": "vid-existing"},
+                        }
+                    ]
+                }
+            )
+
+    class _VideosResource:
+        def list(self, **_kwargs):
+            call_order.append("videos.list")
+            return _Request(
+                {
+                    "items": [
+                        {
+                            "id": "vid-existing",
+                            "snippet": {
+                                "title": " tập 1 | vô cực thiên tôn ",
+                                "description": "existing",
+                                "thumbnails": {},
+                            },
+                            "status": {},
+                            "contentDetails": {},
+                            "statistics": {},
+                        }
+                    ]
+                }
+            )
+
+        def insert(self, **_kwargs):
+            call_order.append("videos.insert")
+            return _Request({"id": "vid-new"})
+
+    class _ThumbnailsResource:
+        def set(self, **_kwargs):
+            call_order.append("thumbnails.set")
+            return _Request({})
+
+    class _YoutubeClient:
+        def playlistItems(self):
+            return _PlaylistItemsResource()
+
+        def videos(self):
+            return _VideosResource()
+
+        def thumbnails(self):
+            return _ThumbnailsResource()
+
+    accounts = [type("Account", (), {"index": 1, "label": "account-1"})()]
+    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda _account: _YoutubeClient())
+
+    result = run_upload(config, 1, 10, platform="youtube", dry_run=False)
+
+    assert result["status"] == "skipped"
+    assert result["video_id"] == "vid-existing"
+    assert call_order == ["playlistItems.list", "videos.list"]
+
+
+def test_run_upload_youtube_force_uploads_even_when_title_exists_in_playlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    _prepare_output_files(config)
+    (config.storage.output_dir / "title.txt").write_text("Tập 1 | Vô Cực Thiên Tôn", encoding="utf-8")
+
+    class _MediaFileUpload:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "googleapiclient.http",
+        type("_M", (), {"MediaFileUpload": _MediaFileUpload}),
+    )
+
+    call_order: list[str] = []
+
+    class _Request:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def execute(self):
+            return self._payload
+
+    class _VideosResource:
+        def list(self, **_kwargs):
+            call_order.append("videos.list")
+            return _Request(
+                {
+                    "items": [
+                        {
+                            "id": "vid-existing",
+                            "snippet": {"title": "Tập 1 | Vô Cực Thiên Tôn", "thumbnails": {}},
+                            "status": {},
+                            "contentDetails": {},
+                            "statistics": {},
+                        }
+                    ]
+                }
+            )
+
+        def insert(self, **_kwargs):
+            call_order.append("videos.insert")
+            return _Request({"id": "vid-new"})
+
+    class _PlaylistItemsResource:
+        def list(self, **_kwargs):
+            call_order.append("playlistItems.list")
+            return _Request(
+                {
+                    "items": [
+                        {
+                            "id": "PLI123",
+                            "snippet": {"playlistId": "PL1234567890", "position": 0},
+                            "contentDetails": {"videoId": "vid-existing"},
+                        }
+                    ]
+                }
+            )
+
+        def insert(self, **_kwargs):
+            call_order.append("playlistItems.insert")
+            return _Request({})
+
+    class _ThumbnailsResource:
+        def set(self, **_kwargs):
+            call_order.append("thumbnails.set")
+            return _Request({})
+
+    class _YoutubeClient:
+        def playlistItems(self):
+            return _PlaylistItemsResource()
+
+        def videos(self):
+            return _VideosResource()
+
+        def thumbnails(self):
+            return _ThumbnailsResource()
+
+    accounts = [type("Account", (), {"index": 1, "label": "account-1"})()]
+    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda _account: _YoutubeClient())
+
+    result = run_upload(config, 1, 10, platform="youtube", dry_run=False, force=True)
+
+    assert result["status"] == "uploaded"
+    assert result["video_id"] == "vid-new"
+    assert call_order == ["videos.insert", "thumbnails.set", "playlistItems.insert"]
 
 
 def test_list_youtube_playlists_collects_all_pages(monkeypatch: pytest.MonkeyPatch) -> None:

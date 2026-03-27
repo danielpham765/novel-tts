@@ -24,6 +24,14 @@ def test_upload_parser_accepts_dry_run() -> None:
     assert args.dry_run is True
 
 
+def test_upload_parser_accepts_force() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(["upload", "vo-cuc-thien-ton", "--platform", "youtube", "--range", "1-10", "--force"])
+    assert args.command == "upload"
+    assert args.platform == "youtube"
+    assert args.force is True
+
+
 def test_upload_parser_accepts_update_playlist_index_without_range() -> None:
     parser = _build_parser()
     args = parser.parse_args(["upload", "vo-cuc-thien-ton", "--platform", "youtube", "--update-playlist-index"])

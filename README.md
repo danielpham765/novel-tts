@@ -618,6 +618,7 @@ Use:
 
 - `--skip-upload` to disable upload
 - `--upload-platform` to override platform
+- `--from-stage` / `--to-stage` to run only a contiguous slice of stages
 
 ```bash
 uv run novel-tts pipeline run <novel_id> --range 1-10
@@ -625,6 +626,8 @@ uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-translate
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-upload
 uv run novel-tts pipeline run <novel_id> --range 1-10 --upload-platform tiktok
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-translate --skip-tts
+uv run novel-tts pipeline run <novel_id> --range 1-10 --from-stage tts
+uv run novel-tts pipeline run <novel_id> --range 1-10 --from-stage translate --to-stage video
 ```
 
 `pipeline watch` is continuous orchestration for ongoing serialized novels:
@@ -641,6 +644,7 @@ Notes:
 - upload completion is remembered in `input/<novel_id>/.progress/watch_pipeline_state.json`
 - default watch settings come from `configs/app.yaml > pipeline.watch` and can still be overridden by CLI flags
 - `--all` uses `configs/app.yaml > pipeline.watch.novels` when that list is non-empty; otherwise it falls back to all files under `configs/novels/*.json`
+- `--from-stage` / `--to-stage` let you run only a contiguous slice of watch stages
 
 ```bash
 uv run novel-tts pipeline watch <novel_id>
@@ -650,6 +654,8 @@ uv run novel-tts pipeline watch --all
 uv run novel-tts pipeline watch <novel_id> --bootstrap-from 1201
 uv run novel-tts pipeline watch <novel_id> --skip-upload
 uv run novel-tts pipeline watch <novel_id> --skip-crawl --skip-translate --skip-repair --skip-polish
+uv run novel-tts pipeline watch --all --to-stage polish
+uv run novel-tts pipeline watch <novel_id> --from-stage tts --to-stage upload
 ```
 
 ## Troubleshooting

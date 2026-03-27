@@ -45,10 +45,11 @@ models:
 
 tts:
   provider: gradio_vie_tts
-  # voice: Ly
   voice: Doan
-  server_name: local
-  model_name: macos
+  # server_name: local
+  # model_name: macos
+  server_name: ttsCloud
+  model_name: gpu
   generation_mode: Standard (Một lần)
   use_batch: true
   max_batch_size_run: 64
@@ -74,13 +75,16 @@ upload:
   default_platform: youtube
   youtube:
     enabled: true
-    project: 2
+    project: rotate
+    # project: 3
     credentials_path:
       - .secrets/youtube/client_secrets.json
       - .secrets/youtube/client_secrets-2.json
+      - .secrets/youtube/client_secrets-3.json
     token_path:
       - .secrets/youtube/token.json
       - .secrets/youtube/token-2.json
+      - .secrets/youtube/token-3.json
     category_id: "22"
     privacy_status: public
     self_declared_made_for_kids: false

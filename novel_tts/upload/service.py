@@ -767,6 +767,16 @@ def _list_playlist_videos(youtube, playlist_id: str) -> list[dict[str, object]]:
     ]
 
 
+def _find_playlist_video_by_title(youtube, playlist_id: str, title: str) -> dict[str, object] | None:
+    title_key = _normalize_title(title)
+    if not title_key:
+        return None
+    for video in _list_playlist_videos(youtube, playlist_id):
+        if _normalize_title(str(video.get("title", ""))) == title_key:
+            return video
+    return None
+
+
 def list_youtube_videos() -> list[dict[str, object]]:
     def _action(youtube, _account: YouTubeAccountPaths) -> list[dict[str, object]]:
         uploads_playlist_id = _get_uploads_playlist_id(youtube)
@@ -1115,7 +1125,7 @@ def update_youtube_playlist(
     return _playlist_to_metadata(item)
 
 
-def _upload_youtube(config: NovelConfig, spec: UploadSpec, *, dry_run: bool) -> dict[str, str]:
+def _upload_youtube(config: NovelConfig, spec: UploadSpec, *, dry_run: bool, force: bool = False) -> dict[str, str]:
     cfg = config.upload.youtube
     if not cfg.enabled:
         raise ValueError('YouTube upload is disabled. Set "upload.youtube.enabled=true" in config to enable it.')
@@ -1151,6 +1161,32 @@ def _upload_youtube(config: NovelConfig, spec: UploadSpec, *, dry_run: bool) -> 
         },
     }
     accounts = _select_youtube_accounts(_youtube_accounts_from_config(config), project_selector=cfg.project)
+    if not force:
+        existing_video = _run_with_youtube_accounts(
+            accounts,
+            cfg,
+            operation_name=f"playlistItems.list {spec.playlist_id}",
+            action=lambda youtube, _account: _find_playlist_video_by_title(youtube, spec.playlist_id, spec.title),
+        )
+        if existing_video is not None:
+            existing_video_id = str(existing_video.get("id", "")).strip()
+            LOGGER.info(
+                "Skipping YouTube upload for %s because playlist %s already contains title %r (video_id=%s).",
+                spec.range_key,
+                spec.playlist_id,
+                spec.title,
+                existing_video_id or "unknown",
+            )
+            result = {
+                "platform": "youtube",
+                "range_key": spec.range_key,
+                "status": "skipped",
+            }
+            if existing_video_id:
+                result["video_id"] = existing_video_id
+                result["video_url"] = f"https://www.youtube.com/watch?v={existing_video_id}"
+            return result
+
     last_error: Exception | None = None
     for offset, account in enumerate(accounts):
         LOGGER.info(
@@ -1265,13 +1301,21 @@ def _run_tiktok_dry_run(config: NovelConfig, start: int, end: int, *, dry_run: b
     return {"platform": "tiktok", "range_key": range_key, "status": "dry-run"}
 
 
-def run_upload(config: NovelConfig, start: int, end: int, *, platform: str, dry_run: bool = False) -> dict[str, str]:
+def run_upload(
+    config: NovelConfig,
+    start: int,
+    end: int,
+    *,
+    platform: str,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict[str, str]:
     platform_norm = str(platform or "").strip().lower()
     if platform_norm not in {"youtube", "tiktok"}:
         raise ValueError(f"Unsupported upload platform: {platform!r}")
     if platform_norm == "youtube":
         spec = _build_upload_spec(config, start, end, require_media_files=not dry_run)
-        return _upload_youtube(config, spec, dry_run=dry_run)
+        return _upload_youtube(config, spec, dry_run=dry_run, force=force)
     return _run_tiktok_dry_run(config, start, end, dry_run=dry_run)
 
 
@@ -1281,6 +1325,7 @@ def run_uploads(
     *,
     platform: str,
     dry_run: bool = False,
+    force: bool = False,
 ) -> list[dict[str, str]]:
     platform_norm = str(platform or "").strip().lower()
     items = list(ranges)
@@ -1293,7 +1338,7 @@ def run_uploads(
     batch_sleep = max(0.0, float(getattr(youtube_cfg, "upload_batch_sleep_seconds", 30.0) or 30.0))
 
     for index, (start, end) in enumerate(items, start=1):
-        results.append(run_upload(config, start, end, platform=platform_norm, dry_run=dry_run))
+        results.append(run_upload(config, start, end, platform=platform_norm, dry_run=dry_run, force=force))
         if (
             platform_norm == "youtube"
             and (not dry_run)

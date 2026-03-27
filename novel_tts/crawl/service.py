@@ -69,6 +69,8 @@ BATCH_FILENAME_PATTERN = re.compile(r"chuong_(\d+)-(\d+)\.txt$")
 MIN_DUPLICATE_BLOCK_CHARS = 160
 MIN_DUPLICATE_ADJACENT_BLOCK_CHARS = 120
 MIN_DUPLICATE_LINE_CHARS = 60
+MIN_DUPLICATE_LINE_SEQUENCE_CHARS = 240
+MIN_DUPLICATE_LINE_SEQUENCE_LINES = 3
 DUPLICATE_REPEATED_RATIO_THRESHOLD = 0.18
 PAGINATED_TITLE_SUFFIX_RE = re.compile(
     r"^(?P<title>.+?)\s*[（(](?P<page>(?:第)?\d+/\d+(?:页|頁)?)[）)]\s*$"
@@ -352,10 +354,55 @@ def _detect_duplicated_content(content: str) -> str | None:
         if run >= 1:
             consecutive_line_dupes += 1
 
+    repeated_line_counts = Counter(
+        line for line in lines if line and len(line) >= MIN_DUPLICATE_LINE_CHARS
+    )
+    repeated_line_chars = sum(len(line) * (count - 1) for line, count in repeated_line_counts.items() if count >= 2)
+    repeated_line_items = sum(1 for count in repeated_line_counts.values() if count >= 2)
+    repeated_line_ratio = repeated_line_chars / max(1, len(raw))
+
+    longest_seq_lines = 0
+    longest_seq_chars = 0
+    eligible_lines = [line if len(line) >= MIN_DUPLICATE_LINE_CHARS else "" for line in lines]
+    for left in range(len(eligible_lines)):
+        if not eligible_lines[left]:
+            continue
+        for right in range(left + 1, len(eligible_lines)):
+            if eligible_lines[left] != eligible_lines[right]:
+                continue
+            seq_lines = 0
+            seq_chars = 0
+            cursor = 0
+            while (
+                left + cursor < len(eligible_lines)
+                and right + cursor < len(eligible_lines)
+                and eligible_lines[left + cursor]
+                and eligible_lines[left + cursor] == eligible_lines[right + cursor]
+            ):
+                seq_lines += 1
+                seq_chars += len(eligible_lines[left + cursor])
+                cursor += 1
+            if (
+                seq_lines > longest_seq_lines
+                or (seq_lines == longest_seq_lines and seq_chars > longest_seq_chars)
+            ):
+                longest_seq_lines = seq_lines
+                longest_seq_chars = seq_chars
+
     if adjacent_runs:
         return f"adjacent_duplicate_blocks={adjacent_runs}"
     if repeated_blocks and repeated_ratio >= DUPLICATE_REPEATED_RATIO_THRESHOLD:
         return f"repeated_blocks={repeated_blocks} repeated_ratio={repeated_ratio:.0%}"
+    if (
+        repeated_line_items >= MIN_DUPLICATE_LINE_SEQUENCE_LINES
+        and repeated_line_ratio >= DUPLICATE_REPEATED_RATIO_THRESHOLD
+    ):
+        return f"repeated_lines={repeated_line_items} repeated_ratio={repeated_line_ratio:.0%}"
+    if (
+        longest_seq_lines >= MIN_DUPLICATE_LINE_SEQUENCE_LINES
+        and longest_seq_chars >= MIN_DUPLICATE_LINE_SEQUENCE_CHARS
+    ):
+        return f"repeated_line_sequence lines={longest_seq_lines} chars={longest_seq_chars}"
     if consecutive_line_dupes:
         return f"consecutive_duplicate_lines={consecutive_line_dupes}"
     return None

@@ -529,6 +529,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Rewrite uploaded YouTube video descriptions so the playlist line uses each video's own id.",
     )
+    upload_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Upload even if the target YouTube playlist already contains a video with the same title.",
+    )
 
     youtube_parser = subparsers.add_parser("youtube")
     youtube_sub = youtube_parser.add_subparsers(dest="youtube_command", required=True)
@@ -609,6 +614,16 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run.add_argument("--skip-video", action="store_true")
     pipeline_run.add_argument("--skip-upload", action="store_true")
     pipeline_run.add_argument(
+        "--from-stage",
+        choices=["crawl", "translate", "tts", "visual", "video", "upload"],
+        help="Start pipeline execution at this stage and skip all earlier stages.",
+    )
+    pipeline_run.add_argument(
+        "--to-stage",
+        choices=["crawl", "translate", "tts", "visual", "video", "upload"],
+        help="Stop pipeline execution after this stage and skip all later stages.",
+    )
+    pipeline_run.add_argument(
         "--mode",
         choices=["per-stage", "per-video"],
         default="per-stage",
@@ -662,44 +677,14 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_watch.add_argument("--skip-video", action="store_true")
     pipeline_watch.add_argument("--skip-upload", action="store_true")
     pipeline_watch.add_argument(
-        "--until-crawl",
-        action="store_true",
-        help="Run through crawl, then skip translate, repair, polish, tts, visual, video, and upload.",
+        "--from-stage",
+        choices=["crawl", "translate", "repair", "polish", "tts", "visual", "video", "upload"],
+        help="Start watch execution at this stage and skip all earlier stages.",
     )
     pipeline_watch.add_argument(
-        "--until-translate",
-        action="store_true",
-        help="Run through translate, then skip repair, polish, tts, visual, video, and upload.",
-    )
-    pipeline_watch.add_argument(
-        "--until-repair",
-        action="store_true",
-        help="Run through repair, then skip polish, tts, visual, video, and upload.",
-    )
-    pipeline_watch.add_argument(
-        "--until-polish",
-        action="store_true",
-        help="Run through polish, then skip tts, visual, video, and upload.",
-    )
-    pipeline_watch.add_argument(
-        "--until-tts",
-        action="store_true",
-        help="Run through tts, then skip visual, video, and upload.",
-    )
-    pipeline_watch.add_argument(
-        "--until-visual",
-        action="store_true",
-        help="Run through visual, then skip video and upload.",
-    )
-    pipeline_watch.add_argument(
-        "--until-video",
-        action="store_true",
-        help="Run through video, then skip upload.",
-    )
-    pipeline_watch.add_argument(
-        "--until-upload",
-        action="store_true",
-        help="Run through upload. Equivalent to not setting an --until-* cutoff.",
+        "--to-stage",
+        choices=["crawl", "translate", "repair", "polish", "tts", "visual", "video", "upload"],
+        help="Stop watch execution after this stage and skip all later stages.",
     )
 
     quota_supervisor_parser = subparsers.add_parser("quota-supervisor")
@@ -803,7 +788,7 @@ def _default_log_path(args) -> Path | None:
     return logs_root / log_name
 
 
-def _resolve_watch_stage_flags(args) -> dict[str, bool]:
+def _resolve_watch_stage_flags(args, parser: argparse.ArgumentParser) -> dict[str, bool]:
     stage_order = [
         "crawl",
         "translate",
@@ -818,20 +803,62 @@ def _resolve_watch_stage_flags(args) -> dict[str, bool]:
         stage: bool(getattr(args, f"skip_{stage}", False))
         for stage in stage_order
     }
-    until_indexes = [
-        index
-        for index, stage in enumerate(stage_order)
-        if bool(getattr(args, f"until_{stage}", False))
-    ]
-    if not until_indexes:
-        return explicit_skip
+    return _resolve_stage_window_flags(
+        stage_order=stage_order,
+        explicit_skip=explicit_skip,
+        from_stage=getattr(args, "from_stage", None),
+        to_stage=getattr(args, "to_stage", None),
+        parser=parser,
+        command_name="pipeline watch",
+    )
 
-    cutoff_index = min(until_indexes)
+
+def _resolve_stage_window_flags(
+    *,
+    stage_order: list[str],
+    explicit_skip: dict[str, bool],
+    from_stage: str | None,
+    to_stage: str | None,
+    parser: argparse.ArgumentParser,
+    command_name: str,
+) -> dict[str, bool]:
     resolved = dict(explicit_skip)
+    if not from_stage and not to_stage:
+        return resolved
+
+    index_by_stage = {stage: index for index, stage in enumerate(stage_order)}
+    start_index = index_by_stage.get(from_stage or stage_order[0], 0)
+    end_index = index_by_stage.get(to_stage or stage_order[-1], len(stage_order) - 1)
+    if start_index > end_index:
+        parser.error(f"{command_name}: --from-stage must be before or equal to --to-stage")
+
     for index, stage in enumerate(stage_order):
-        if index > cutoff_index:
+        if index < start_index or index > end_index:
             resolved[stage] = True
     return resolved
+
+
+def _resolve_run_stage_flags(args, parser: argparse.ArgumentParser) -> dict[str, bool]:
+    stage_order = [
+        "crawl",
+        "translate",
+        "tts",
+        "visual",
+        "video",
+        "upload",
+    ]
+    explicit_skip = {
+        stage: bool(getattr(args, f"skip_{stage}", False))
+        for stage in stage_order
+    }
+    return _resolve_stage_window_flags(
+        stage_order=stage_order,
+        explicit_skip=explicit_skip,
+        from_stage=getattr(args, "from_stage", None),
+        to_stage=getattr(args, "to_stage", None),
+        parser=parser,
+        command_name="pipeline run",
+    )
 
 
 def _rotate_log_if_new_day(log_path: Path | None) -> None:
@@ -1374,6 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
                 upload_ranges,
                 platform=str(args.platform),
                 dry_run=bool(getattr(args, "dry_run", False)),
+                force=bool(getattr(args, "force", False)),
             ):
                 LOGGER.info("Upload result: %s", result)
             return 0
@@ -1492,7 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
             from novel_tts.pipeline import run_watch_pipeline
 
             if args.pipeline_command == "watch":
-                watch_stage_flags = _resolve_watch_stage_flags(args)
+                watch_stage_flags = _resolve_watch_stage_flags(args, parser)
                 return run_watch_pipeline(
                     repo_root=_repo_root(),
                     novel_ids=list(getattr(args, "novel_ids", []) or []),
@@ -1512,6 +1540,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_upload=watch_stage_flags["upload"],
                 )
 
+            run_stage_flags = _resolve_run_stage_flags(args, parser)
             config = load_novel_config(args.novel_id)
             if args.range:
                 start, end = parse_range(args.range)
@@ -1519,9 +1548,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.from_chapter is None or args.to_chapter is None:
                     parser.error("pipeline run requires --range or both --from and --to")
                 start, end = args.from_chapter, args.to_chapter
-            if not args.skip_crawl:
+            if not run_stage_flags["crawl"]:
                 crawl_range(config, start, end)
-            if not args.skip_translate:
+            if not run_stage_flags["translate"]:
                 launch_queue_stack(config, restart=False, add_queue=False)
                 add_jobs_to_queue(config, start, end)
                 wait_for_range_completion(config, start, end)
@@ -1534,20 +1563,20 @@ def main(argv: list[str] | None = None) -> int:
                 _run_pipeline_per_video(
                     config,
                     translated_ranges=translated_ranges,
-                    skip_tts=bool(args.skip_tts),
-                    skip_visual=bool(args.skip_visual),
-                    skip_video=bool(args.skip_video),
-                    skip_upload=bool(args.skip_upload),
+                    skip_tts=run_stage_flags["tts"],
+                    skip_visual=run_stage_flags["visual"],
+                    skip_video=run_stage_flags["video"],
+                    skip_upload=run_stage_flags["upload"],
                     upload_platform=upload_platform,
                 )
             else:
                 _run_pipeline_per_stage(
                     config,
                     translated_ranges=translated_ranges,
-                    skip_tts=bool(args.skip_tts),
-                    skip_visual=bool(args.skip_visual),
-                    skip_video=bool(args.skip_video),
-                    skip_upload=bool(args.skip_upload),
+                    skip_tts=run_stage_flags["tts"],
+                    skip_visual=run_stage_flags["visual"],
+                    skip_video=run_stage_flags["video"],
+                    skip_upload=run_stage_flags["upload"],
                     upload_platform=upload_platform,
                 )
             return 0

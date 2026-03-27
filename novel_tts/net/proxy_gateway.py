@@ -7,6 +7,7 @@ from typing import Any
 import requests
 
 from novel_tts.config.models import ProxyGatewayConfig, RedisConfig
+from novel_tts import __version__
 
 LOGGER = logging.getLogger(__name__)
 
@@ -17,6 +18,59 @@ _SNAPSHOT_CACHE: dict[str, object] = {
     "error": "",
 }
 _LAST_FALLBACK_WARN_AT = 0.0
+_STRIP_REQUEST_HEADERS = {
+    "connection",
+    "content-length",
+    "forwarded",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "via",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+}
+_DEFAULT_ACCEPT_LANGUAGE = "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
+_USER_AGENT_TEMPLATES: list[dict[str, str]] = [
+    {
+        "label": "macos_chrome",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    },
+    {
+        "label": "ubuntu_chrome",
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    },
+    {
+        "label": "windows_edge",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0",
+    },
+    {
+        "label": "ios_safari",
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1",
+    },
+    {
+        "label": "android_chrome",
+        "user-agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36",
+    },
+    {
+        "label": "macos_safari",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    },
+    {
+        "label": "android_samsung",
+        "user-agent": "Mozilla/5.0 (Linux; Android 14; SAMSUNG SM-S926B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/125.0.0.0 Mobile Safari/537.36",
+    },
+    {
+        "label": "ipad_safari",
+        "user-agent": "Mozilla/5.0 (iPad; CPU OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1",
+    },
+]
 
 
 def _status_key(prefix: str) -> str:
@@ -198,6 +252,67 @@ def _normalize_proxy_body(body: Any) -> str:
         return str(body)
 
 
+def _prepare_upstream_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    cleaned: dict[str, str] = {}
+    for raw_key, raw_value in (headers or {}).items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        if key.lower() in _STRIP_REQUEST_HEADERS:
+            continue
+        cleaned[key] = value
+
+    return cleaned
+
+
+def _build_proxy_header_profiles(proxy_count: int) -> list[dict[str, str]]:
+    if proxy_count <= 0:
+        return []
+
+    profiles: list[dict[str, str]] = []
+    for idx in range(proxy_count):
+        template = _USER_AGENT_TEMPLATES[idx % len(_USER_AGENT_TEMPLATES)]
+        profiles.append(
+            {
+                "label": f'{template["label"]}_{idx + 1}',
+                "user-agent": template["user-agent"],
+                "accept-language": _DEFAULT_ACCEPT_LANGUAGE,
+            }
+        )
+    return profiles
+
+
+def _apply_proxy_identity_headers(
+    headers: dict[str, str],
+    *,
+    proxy: str | None,
+    proxies: list[str],
+) -> dict[str, str]:
+    if not proxy or not proxies:
+        return headers
+
+    try:
+        proxy_idx = proxies.index(proxy)
+    except ValueError:
+        return headers
+
+    profiles = _build_proxy_header_profiles(len(proxies))
+    if proxy_idx >= len(profiles):
+        return headers
+
+    profile = profiles[proxy_idx]
+    existing_lower = {key.lower(): key for key in headers}
+    merged = dict(headers)
+    if "user-agent" not in existing_lower:
+        merged["user-agent"] = profile["user-agent"]
+    if "accept-language" not in existing_lower:
+        merged["accept-language"] = profile["accept-language"]
+    return merged
+
+
 def request(
     method: str,
     url: str,
@@ -216,7 +331,7 @@ def request(
     if not url:
         raise ValueError("Missing URL")
 
-    hdrs = dict(headers or {})
+    hdrs = _prepare_upstream_headers(headers)
 
     enabled = bool(getattr(cfg, "enabled", False))
     # Never proxy requests from k1: always call upstream directly.
@@ -270,6 +385,7 @@ def request(
         raise ValueError(f"Invalid proxy gateway mode: {mode}")
 
     proxy = _select_proxy_for_request(cfg, key_index=key_index)
+    hdrs = _apply_proxy_identity_headers(hdrs, proxy=proxy, proxies=list(getattr(cfg, "proxies", None) or []))
     payload: dict[str, Any] = {
         "method": method,
         "url": url,
