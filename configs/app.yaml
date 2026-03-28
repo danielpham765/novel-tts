@@ -75,14 +75,14 @@ upload:
   default_platform: youtube
   youtube:
     enabled: true
-    project: rotate
-    # project: 3
+    # project: rotate
+    project: 1
     credentials_path:
-      - .secrets/youtube/client_secrets.json
+      - .secrets/youtube/client_secrets-1.json
       - .secrets/youtube/client_secrets-2.json
       - .secrets/youtube/client_secrets-3.json
     token_path:
-      - .secrets/youtube/token.json
+      - .secrets/youtube/token-1.json
       - .secrets/youtube/token-2.json
       - .secrets/youtube/token-3.json
     category_id: "22"

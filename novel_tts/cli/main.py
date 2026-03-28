@@ -25,7 +25,7 @@ from novel_tts.common.logging import (
     install_exception_logging,
 )
 from novel_tts.common.text import parse_range
-from novel_tts.common.errors import RateLimitExceededError
+from novel_tts.common.errors import InputTranslationError, RateLimitExceededError
 from novel_tts.config import load_novel_config, NovelConfig
 
 LOGGER = get_logger(__name__)
@@ -218,6 +218,7 @@ def _run_pipeline_per_stage(
     skip_video: bool,
     skip_upload: bool,
     upload_platform: str,
+    force: bool,
 ) -> None:
     from novel_tts.media import create_video, generate_visual
     from novel_tts.tts import run_tts
@@ -225,16 +226,16 @@ def _run_pipeline_per_stage(
 
     if not skip_tts:
         for c_start, c_end, range_key in translated_ranges:
-            run_tts(config, c_start, c_end, range_key)
+            run_tts(config, c_start, c_end, range_key, force=force)
     if not skip_visual:
         for c_start, c_end, _ in translated_ranges:
-            generate_visual(config, c_start, c_end)
+            generate_visual(config, c_start, c_end, force=force)
     if not skip_video:
         for c_start, c_end, _ in translated_ranges:
-            create_video(config, c_start, c_end)
+            create_video(config, c_start, c_end, force=force)
     if not skip_upload:
         upload_ranges = [(c_start, c_end) for c_start, c_end, _ in translated_ranges]
-        run_uploads(config, upload_ranges, platform=upload_platform, dry_run=False)
+        run_uploads(config, upload_ranges, platform=upload_platform, dry_run=False, force=force)
 
 
 def _run_pipeline_per_video(
@@ -246,6 +247,7 @@ def _run_pipeline_per_video(
     skip_video: bool,
     skip_upload: bool,
     upload_platform: str,
+    force: bool,
 ) -> None:
     from novel_tts.media import create_video, generate_visual
     from novel_tts.tts import run_tts
@@ -253,13 +255,13 @@ def _run_pipeline_per_video(
 
     for c_start, c_end, range_key in translated_ranges:
         if not skip_tts:
-            run_tts(config, c_start, c_end, range_key)
+            run_tts(config, c_start, c_end, range_key, force=force)
         if not skip_visual:
-            generate_visual(config, c_start, c_end)
+            generate_visual(config, c_start, c_end, force=force)
         if not skip_video:
-            create_video(config, c_start, c_end)
+            create_video(config, c_start, c_end, force=force)
         if not skip_upload:
-            run_uploads(config, [(c_start, c_end)], platform=upload_platform, dry_run=False)
+            run_uploads(config, [(c_start, c_end)], platform=upload_platform, dry_run=False, force=force)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -478,6 +480,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     queue_add_parser.add_argument("--force", action="store_true", help="Enqueue even if already translated (force re-translate)")
 
+    queue_requeue_untranslated_exhausted_parser = queue_sub.add_parser("requeue-untranslated-exhausted")
+    queue_requeue_untranslated_exhausted_parser.add_argument("novel_id")
+
     tts_parser = subparsers.add_parser("tts")
     tts_parser.add_argument("novel_id")
     tts_parser.add_argument("--range", required=True)
@@ -528,6 +533,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--update-playlist-index",
         action="store_true",
         help="Rewrite uploaded YouTube video descriptions so the playlist line uses each video's own id.",
+    )
+    upload_parser.add_argument(
+        "--update-playlist-position",
+        action="store_true",
+        help="Reorder uploaded YouTube playlist videos by episode number parsed from each title (Tap/Tập 1, 2, ...).",
+    )
+    upload_parser.add_argument(
+        "--remove-duplicated",
+        action="store_true",
+        help="Delete older duplicated YouTube videos in the configured playlist, keeping only the latest uploaded copy per title.",
     )
     upload_parser.add_argument(
         "--force",
@@ -613,6 +628,11 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run.add_argument("--skip-visual", action="store_true")
     pipeline_run.add_argument("--skip-video", action="store_true")
     pipeline_run.add_argument("--skip-upload", action="store_true")
+    pipeline_run.add_argument(
+        "--force",
+        action="store_true",
+        help="Force supported stages to rebuild or re-run existing outputs. Applies to translate queue add, tts, visual, video, and upload.",
+    )
     pipeline_run.add_argument(
         "--from-stage",
         choices=["crawl", "translate", "tts", "visual", "video", "upload"],
@@ -1175,6 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
                 launch_queue_stack,
                 list_all_queue_processes,
                 list_queue_processes,
+                requeue_untranslated_exhausted_jobs,
                 run_status_monitor,
                 run_supervisor,
                 run_worker,
@@ -1324,6 +1345,10 @@ def main(argv: list[str] | None = None) -> int:
                 if not chapters:
                     parser.error("queue add requires --all, --range, --chapters, or --repair-report")
                 return add_chapters_to_queue(config, chapters, force=bool(getattr(args, "force", False)))
+            if args.queue_command == "requeue-untranslated-exhausted":
+                if config is None:
+                    parser.error("queue requeue-untranslated-exhausted requires a novel_id")
+                return requeue_untranslated_exhausted_jobs(config)
 
         if args.command == "tts":
             from novel_tts.tts import run_tts
@@ -1366,7 +1391,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "upload":
-            from novel_tts.upload import run_uploads, update_uploaded_youtube_playlist_index_descriptions
+            from novel_tts.upload import (
+                remove_duplicated_uploaded_youtube_videos,
+                run_uploads,
+                update_uploaded_youtube_playlist_index_descriptions,
+                update_uploaded_youtube_playlist_positions,
+            )
 
             config = load_novel_config(args.novel_id)
             if bool(getattr(args, "update_playlist_index", False)):
@@ -1391,8 +1421,77 @@ def main(argv: list[str] | None = None) -> int:
                 print(pretty_results)
                 return 0
 
+            if bool(getattr(args, "update_playlist_position", False)):
+                if str(args.platform) != "youtube":
+                    parser.error("--update-playlist-position is only supported with --platform youtube")
+                if getattr(args, "range", None):
+                    parser.error("--update-playlist-position does not support --range")
+                results = update_uploaded_youtube_playlist_positions(
+                    config,
+                    log_summary=False,
+                )
+                pretty_results = json.dumps(results, ensure_ascii=False, indent=2)
+                LOGGER.info("Upload playlist-position update result: %s", pretty_results)
+                unchanged_count = sum(1 for item in results if str(item.get("status", "")) == "unchanged")
+                updated_count = sum(1 for item in results if str(item.get("status", "")) == "updated")
+                skipped_count = sum(1 for item in results if str(item.get("status", "")) == "skipped")
+                LOGGER.info("Uploaded Video count: %s", len(results))
+                LOGGER.info("Correct playlist position - video count: %s", unchanged_count)
+                LOGGER.info("Update playlist position - video count: %s", updated_count)
+                LOGGER.info("Skipped playlist position update - video count: %s", skipped_count)
+                print(pretty_results)
+                return 0
+
+            if bool(getattr(args, "remove_duplicated", False)):
+                if str(args.platform) != "youtube":
+                    parser.error("--remove-duplicated is only supported with --platform youtube")
+                if getattr(args, "range", None):
+                    parser.error("--remove-duplicated does not support --range")
+                preview_results = remove_duplicated_uploaded_youtube_videos(
+                    config,
+                    execute=False,
+                    log_summary=False,
+                )
+                preview_pretty = json.dumps(preview_results, ensure_ascii=False, indent=2)
+                would_keep_count = sum(1 for item in preview_results if str(item.get("status", "")) == "would_keep")
+                would_delete_count = sum(1 for item in preview_results if str(item.get("status", "")) == "would_delete")
+                skipped_count = sum(1 for item in preview_results if str(item.get("status", "")) == "skipped")
+                LOGGER.info("Upload duplicated-video cleanup preview: %s", preview_pretty)
+                LOGGER.info("Would keep latest duplicate videos: %s", would_keep_count)
+                LOGGER.info("Would delete older duplicate videos: %s", would_delete_count)
+                LOGGER.info("Skipped duplicate cleanup videos: %s", skipped_count)
+                print("Duplicate cleanup preview:")
+                print(preview_pretty)
+                if would_delete_count == 0:
+                    print("No duplicated videos to delete.")
+                    return 0
+
+                confirm = input("Execute delete? [y/N]: ").strip().lower()
+                if confirm not in {"y", "yes"}:
+                    print("Delete cancelled.")
+                    return 0
+
+                results = remove_duplicated_uploaded_youtube_videos(
+                    config,
+                    execute=True,
+                    log_summary=False,
+                )
+                pretty_results = json.dumps(results, ensure_ascii=False, indent=2)
+                LOGGER.info("Upload duplicated-video cleanup result: %s", pretty_results)
+                kept_count = sum(1 for item in results if str(item.get("status", "")) == "kept")
+                deleted_count = sum(1 for item in results if str(item.get("status", "")) == "deleted")
+                skipped_count = sum(1 for item in results if str(item.get("status", "")) == "skipped")
+                LOGGER.info("Kept latest duplicate videos: %s", kept_count)
+                LOGGER.info("Deleted older duplicate videos: %s", deleted_count)
+                LOGGER.info("Skipped duplicate cleanup videos: %s", skipped_count)
+                print(pretty_results)
+                return 0
+
             if not getattr(args, "range", None):
-                parser.error("upload requires --range unless --update-playlist-index is used")
+                parser.error(
+                    "upload requires --range unless --update-playlist-index, "
+                    "--update-playlist-position, or --remove-duplicated is used"
+                )
 
             start, end = parse_range(args.range)
             upload_ranges = [(c_start, c_end) for c_start, c_end, _ in get_translated_ranges(config, start, end)]
@@ -1552,13 +1651,14 @@ def main(argv: list[str] | None = None) -> int:
                 crawl_range(config, start, end)
             if not run_stage_flags["translate"]:
                 launch_queue_stack(config, restart=False, add_queue=False)
-                add_jobs_to_queue(config, start, end)
+                add_jobs_to_queue(config, start, end, force=bool(getattr(args, "force", False)))
                 wait_for_range_completion(config, start, end)
             translated_ranges = get_translated_ranges(config, start, end)
             upload_platform = str(
                 getattr(args, "upload_platform", None) or getattr(config.upload, "default_platform", "youtube")
             )
             pipeline_mode = str(getattr(args, "mode", "per-stage") or "per-stage")
+            pipeline_force = bool(getattr(args, "force", False))
             if pipeline_mode == "per-video":
                 _run_pipeline_per_video(
                     config,
@@ -1568,6 +1668,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_video=run_stage_flags["video"],
                     skip_upload=run_stage_flags["upload"],
                     upload_platform=upload_platform,
+                    force=pipeline_force,
                 )
             else:
                 _run_pipeline_per_stage(
@@ -1578,6 +1679,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_video=run_stage_flags["video"],
                     skip_upload=run_stage_flags["upload"],
                     upload_platform=upload_platform,
+                    force=pipeline_force,
                 )
             return 0
 
@@ -1774,6 +1876,10 @@ def main(argv: list[str] | None = None) -> int:
         code = _rate_limit_exit_code(str(exc))
         LOGGER.warning("Rate limited (exit=%s): %s", code, exc)
         return code
+    except InputTranslationError as exc:
+        # Used by queue workers: only these input/content failures should consume the chapter retry budget.
+        LOGGER.error("Input translation failure (exit=77): %s", exc)
+        return 77
     except Exception:
         LOGGER.exception("Command failed")
         return 1

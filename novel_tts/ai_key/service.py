@@ -395,6 +395,7 @@ def _scan_counts(
     dict[int, dict[str, int]],
     dict[int, dict[str, int]],
     dict[int, dict[str, int]],
+    dict[int, dict[str, int]],
 ]:
     now = _redis_now_seconds(client)
     llm_counts: dict[int, int] = {}
@@ -403,6 +404,7 @@ def _scan_counts(
     api_by_model: dict[int, dict[str, int]] = {}
     api_429_by_model: dict[int, dict[str, int]] = {}
     llm_by_model: dict[int, dict[str, int]] = {}
+    api_success_by_model: dict[int, dict[str, int]] = {}
     quota_tokens_by_model: dict[int, dict[str, int]] = {}
     rpm_used_by_model: dict[int, dict[str, int]] = {}
     rpd_used_by_model: dict[int, dict[str, int]] = {}
@@ -543,9 +545,11 @@ def _scan_counts(
             continue
         token_key = f"{str(key).removesuffix(':quota:tpm:locked')}:quota:tpm:locked_tokens"
         total_tokens = _sum_tokens_for_zset(str(key), token_hash_key=token_key, window_seconds=60.0)
-        if total_tokens <= 0:
-            continue
-        _add_model_count(quota_tokens_by_model, idx, model, total_tokens)
+        if total_tokens > 0:
+            _add_model_count(quota_tokens_by_model, idx, model, total_tokens)
+            success_count = _zcount_window(client, str(key), now, window_seconds=60.0)
+            if success_count > 0:
+                _add_model_count(api_success_by_model, idx, model, success_count)
 
     # Backward-compatible fallback: older workers used :quota:reqs + :quota:tokens.
     for key in client.scan_iter(match=quota_pattern, count=1000):
@@ -615,6 +619,7 @@ def _scan_counts(
         api_by_model,
         api_429_by_model,
         llm_by_model,
+        api_success_by_model,
         quota_tokens_by_model,
         rpm_used_by_model,
         rpd_used_by_model,
@@ -641,6 +646,7 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
         api_by_model,
         api_429_by_model,
         llm_by_model,
+        api_success_by_model,
         quota_tokens_by_model,
         rpm_used_by_model,
         rpd_used_by_model,
@@ -743,6 +749,7 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
     total_api_by_model: dict[str, int] = {}
     total_api_429_by_model: dict[str, int] = {}
     total_llm_by_model: dict[str, int] = {}
+    total_api_success_by_model: dict[str, int] = {}
     total_quota_tokens_by_model: dict[str, int] = {}
     total_rpm_used_by_model: dict[str, int] = {}
     total_rpd_used_by_model: dict[str, int] = {}
@@ -753,6 +760,8 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
             total_api_429_by_model[model] = total_api_429_by_model.get(model, 0) + int(count or 0)
         for model, count in (llm_by_model.get(idx, {}) or {}).items():
             total_llm_by_model[model] = total_llm_by_model.get(model, 0) + int(count or 0)
+        for model, count in (api_success_by_model.get(idx, {}) or {}).items():
+            total_api_success_by_model[model] = total_api_success_by_model.get(model, 0) + int(count or 0)
         for model, count in (quota_tokens_by_model.get(idx, {}) or {}).items():
             total_quota_tokens_by_model[model] = total_quota_tokens_by_model.get(model, 0) + int(count or 0)
         for model, count in (rpm_used_by_model.get(idx, {}) or {}).items():
@@ -763,18 +772,24 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
     if not models_to_show:
         models_to_show = [""]
 
+    def _api_success_for_model(idx: int, model: str) -> int:
+        return int((api_success_by_model.get(idx, {}) or {}).get(model, 0) or 0)
+
+    def _api_success_total_for_model(model: str) -> int:
+        return int((total_api_success_by_model or {}).get(model, 0) or 0)
+
     display_rows: list[dict[str, str]] = []
     for idx in displayed_indices:
         key_label = _label(idx)
         api_val = str(int(api_counts.get(idx, 0)))
         api_429_val = str(int(api_429_counts.get(idx, 0)))
         llm_val = str(int(llm_counts.get(idx, 0)))
-        api_success_count_val = str(max(int(api_val) - int(api_429_val), 0))
+        api_success_count_val = str(sum(_api_success_for_model(idx, model) for model in models_to_show))
         for i, model in enumerate(models_to_show):
             llm_model_val = str(int((llm_by_model.get(idx, {}) or {}).get(model, 0) or 0))
             attempts = int((api_by_model.get(idx, {}) or {}).get(model, 0) or 0)
             rate_limited = int((api_429_by_model.get(idx, {}) or {}).get(model, 0) or 0)
-            api_success = max(attempts - rate_limited, 0)
+            api_success = _api_success_for_model(idx, model)
             quota_used = int((quota_tokens_by_model.get(idx, {}) or {}).get(model, 0) or 0)
             tpm_limit = int((tpm_limits_by_model or {}).get(model, 0) or 0)
             tpm_has_data = model in (quota_tokens_by_model.get(idx, {}) or {})
@@ -815,19 +830,13 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
     total_api = sum(int(api_counts.get(idx, 0) or 0) for idx in displayed_indices)
     total_api_429 = sum(int(api_429_counts.get(idx, 0) or 0) for idx in displayed_indices)
     total_llm = sum(int(llm_counts.get(idx, 0) or 0) for idx in displayed_indices)
-    total_api_success_count = max(int(total_api) - int(total_api_429), 0)
+    total_api_success_count = sum(_api_success_total_for_model(model) for model in models_to_show)
     key_count = sum(1 for idx in displayed_indices if 1 <= idx <= len(keys))
-
-    total_api_success_by_model: dict[str, int] = {}
-    for model in models_to_show:
-        attempts = int((total_api_by_model or {}).get(model, 0) or 0)
-        rate_limited = int((total_api_429_by_model or {}).get(model, 0) or 0)
-        total_api_success_by_model[model] = max(attempts - rate_limited, 0)
 
     total_rows: list[dict[str, str]] = []
     for i, model in enumerate(models_to_show):
         llm_model_val = str(int((total_llm_by_model or {}).get(model, 0) or 0))
-        api_success_val = str(int((total_api_success_by_model or {}).get(model, 0) or 0))
+        api_success_val = str(_api_success_total_for_model(model))
         api_429_val = str(int((total_api_429_by_model or {}).get(model, 0) or 0))
         total_quota_used = int((total_quota_tokens_by_model or {}).get(model, 0) or 0)
         tpm_limit = int((tpm_limits_by_model or {}).get(model, 0) or 0)

@@ -110,6 +110,127 @@ def test_gemini_generate_in_queue_worker_mode_releases_on_timeout(monkeypatch) -
     assert len(acquire_calls) == 1
 
 
+@pytest.mark.parametrize("status_code", [403, 503])
+def test_gemini_generate_in_queue_worker_mode_releases_on_transient_proxy_http(monkeypatch, status_code: int) -> None:
+    os.environ["GEMINI_API_KEY"] = "test"
+    os.environ["NOVEL_TTS_QUOTA_MODE"] = "raise"
+    os.environ["NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS"] = "0"
+
+    acquire_calls: list[int] = []
+
+    def fake_acquire(model: str, estimated_tokens: int) -> None:
+        del model, estimated_tokens
+        acquire_calls.append(1)
+
+    request_calls: list[int] = []
+
+    def fake_request(*args, **kwargs):
+        del args, kwargs
+        request_calls.append(1)
+        return SimpleNamespace(
+            status_code=status_code,
+            url="http://localhost:8888/proxy",
+            headers={},
+            content=b"",
+            text="proxy error",
+            json=lambda: {},
+            raise_for_status=lambda: (_ for _ in ()).throw(
+                providers.requests.exceptions.HTTPError(f"{status_code} proxy")
+            ),
+        )
+
+    monkeypatch.setattr(providers, "_acquire_gemini_rate_slot", fake_acquire)
+    monkeypatch.setattr(providers.proxy_gateway_mod, "request", fake_request)
+    monkeypatch.setattr(providers.time, "sleep", lambda *_args, **_kwargs: None)
+
+    p = providers.GeminiHttpProvider(
+        proxy_gateway=providers.ProxyGatewayConfig(enabled=True, base_url="http://localhost:8888")
+    )
+    with pytest.raises(RateLimitExceededError) as exc:
+        p.generate("gemma-3-27b-it", "hi", "sys")
+
+    assert "proxy transient http" in str(exc.value).lower()
+    assert f"{status_code}" in str(exc.value)
+    assert len(request_calls) == 1
+    assert len(acquire_calls) == 1
+
+
+def test_gemini_generate_in_queue_worker_mode_uses_long_cooldown_for_suspended_proxy_key(monkeypatch) -> None:
+    os.environ["GEMINI_API_KEY"] = "test"
+    os.environ["NOVEL_TTS_QUOTA_MODE"] = "raise"
+    os.environ["NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS"] = "0"
+
+    def fake_request(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(
+            status_code=403,
+            url="http://localhost:8888/proxy",
+            headers={},
+            content=b"1",
+            text="Permission denied: Consumer 'api_key:test' has been suspended.",
+            json=lambda: {"error": {"message": "Permission denied: Consumer 'api_key:test' has been suspended."}},
+            raise_for_status=lambda: (_ for _ in ()).throw(
+                providers.requests.exceptions.HTTPError("403 proxy")
+            ),
+        )
+
+    monkeypatch.setattr(providers, "_acquire_gemini_rate_slot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(providers.proxy_gateway_mod, "request", fake_request)
+    monkeypatch.setattr(providers.time, "sleep", lambda *_args, **_kwargs: None)
+
+    p = providers.GeminiHttpProvider(
+        proxy_gateway=providers.ProxyGatewayConfig(enabled=True, base_url="http://localhost:8888")
+    )
+    with pytest.raises(RateLimitExceededError) as exc:
+        p.generate("gemini-3.1-flash-lite-preview", "hi", "sys")
+
+    assert "proxy transient http 403" in str(exc.value).lower()
+    assert "suggested_wait=3600.00s" in str(exc.value)
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_gemini_generate_in_queue_worker_mode_releases_on_transient_upstream_http(monkeypatch, status_code: int) -> None:
+    os.environ["GEMINI_API_KEY"] = "test"
+    os.environ["NOVEL_TTS_QUOTA_MODE"] = "raise"
+    os.environ["NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS"] = "0"
+
+    acquire_calls: list[int] = []
+
+    def fake_acquire(model: str, estimated_tokens: int) -> None:
+        del model, estimated_tokens
+        acquire_calls.append(1)
+
+    request_calls: list[int] = []
+
+    def fake_request(*args, **kwargs):
+        del args, kwargs
+        request_calls.append(1)
+        return SimpleNamespace(
+            status_code=status_code,
+            url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=test",
+            headers={},
+            content=b"",
+            text="temporary upstream error",
+            json=lambda: {},
+            raise_for_status=lambda: (_ for _ in ()).throw(
+                providers.requests.exceptions.HTTPError(f"{status_code} upstream")
+            ),
+        )
+
+    monkeypatch.setattr(providers, "_acquire_gemini_rate_slot", fake_acquire)
+    monkeypatch.setattr(providers.proxy_gateway_mod, "request", fake_request)
+    monkeypatch.setattr(providers.time, "sleep", lambda *_args, **_kwargs: None)
+
+    p = providers.GeminiHttpProvider()
+    with pytest.raises(RateLimitExceededError) as exc:
+        p.generate("gemini-3.1-flash-lite-preview", "hi", "sys")
+
+    assert "upstream transient http" in str(exc.value).lower()
+    assert f"{status_code}" in str(exc.value)
+    assert len(request_calls) == 1
+    assert len(acquire_calls) == 1
+
+
 def test_gemini_generate_uses_first_key_from_file_when_env_missing(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_RATE_LIMIT_KEY_PREFIX", raising=False)

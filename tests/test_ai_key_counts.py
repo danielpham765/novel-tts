@@ -53,9 +53,11 @@ def test_scan_counts_llm_prefers_llm_reqs_attempts_over_api_calls() -> None:
         api_by_model,
         api_429_by_model,
         llm_by_model,
+        api_success_by_model,
         quota_tokens_by_model,
         rpm_used_by_model,
         rpd_used_by_model,
+        api_daily_by_model,
     ) = _scan_counts(client, prefix="novel_tts")
 
     assert api_counts == {1: 5}
@@ -64,9 +66,11 @@ def test_scan_counts_llm_prefers_llm_reqs_attempts_over_api_calls() -> None:
     assert api_429_by_model == {}
     assert llm_counts == {1: 5}
     assert llm_by_model == {1: {"gemma": 5}}
+    assert api_success_by_model == {}
     assert quota_tokens_by_model == {}
     assert rpm_used_by_model == {}
     assert rpd_used_by_model == {}
+    assert api_daily_by_model == {1: {"gemma": 5}}
 
 
 def test_scan_counts_llm_falls_back_to_api_calls_when_no_llm_reqs() -> None:
@@ -77,7 +81,7 @@ def test_scan_counts_llm_falls_back_to_api_calls_when_no_llm_reqs() -> None:
         },
     )
 
-    _, _, llm_counts, _, _, llm_by_model, _, _, _ = _scan_counts(client, prefix="novel_tts")
+    _, _, llm_counts, _, _, llm_by_model, _, _, _, _, _ = _scan_counts(client, prefix="novel_tts")
     assert llm_counts == {2: 3}
     assert llm_by_model == {2: {"gemma": 3}}
 
@@ -90,7 +94,7 @@ def test_scan_counts_llm_falls_back_to_quota_reqs_when_no_llm_or_api_calls() -> 
         },
     )
 
-    _, _, llm_counts, _, _, llm_by_model, _, _, _ = _scan_counts(client, prefix="novel_tts")
+    _, _, llm_counts, _, _, llm_by_model, _, _, _, _, _ = _scan_counts(client, prefix="novel_tts")
     assert llm_counts == {3: 7}
     assert llm_by_model == {3: {"gemma": 7}}
 
@@ -134,11 +138,46 @@ def test_scan_counts_central_quota_rpm_rpd_and_tpm_tokens() -> None:
         _api_by_model,
         _api_429_by_model,
         _llm_by_model,
+        api_success_by_model,
         quota_tokens_by_model,
         rpm_used_by_model,
         rpd_used_by_model,
+        _api_daily_by_model,
     ) = _scan_counts(client, prefix="novel_tts")
 
+    assert api_success_by_model == {4: {"gemma": 1}}
     assert quota_tokens_by_model == {4: {"gemma": 30}}
     assert rpm_used_by_model == {4: {"gemma": 5}}
     assert rpd_used_by_model == {4: {"gemma": 9}}
+
+
+def test_scan_counts_does_not_count_success_without_locked_tokens() -> None:
+    client = FakeRedis(
+        now_seconds=1000.0,
+        zcount_by_key={
+            "novel_tts:novel:k1:gemini:api:reqs": 2,
+            "novel_tts:novel:k1:gemini:llm:reqs": 2,
+            "novel_tts:novel:k1:gemini:quota:tpm:locked": 2,
+        },
+    )
+
+    (
+        api_counts,
+        _api_429_counts,
+        llm_counts,
+        api_by_model,
+        _api_429_by_model,
+        llm_by_model,
+        api_success_by_model,
+        quota_tokens_by_model,
+        _rpm_used_by_model,
+        _rpd_used_by_model,
+        _api_daily_by_model,
+    ) = _scan_counts(client, prefix="novel_tts")
+
+    assert api_counts == {1: 2}
+    assert llm_counts == {1: 2}
+    assert api_by_model == {1: {"gemini": 2}}
+    assert llm_by_model == {1: {"gemini": 2}}
+    assert api_success_by_model == {}
+    assert quota_tokens_by_model == {}

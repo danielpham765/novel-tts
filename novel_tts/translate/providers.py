@@ -21,6 +21,9 @@ LOGGER = logging.getLogger(__name__)
 QUOTA_LOGGER = logging.getLogger("quota.client")
 
 _HAN_REGEX = re.compile(r"[\u4e00-\u9fff]")
+_TRANSIENT_PROXY_STATUS_CODES = {403, 500, 502, 503, 504}
+_TRANSIENT_UPSTREAM_STATUS_CODES = {500, 502, 503, 504}
+_SUSPENDED_KEY_COOLDOWN_SECONDS = 3600.0
 
 
 class TranslationProvider:
@@ -130,6 +133,110 @@ def _get_rate_limit_configs() -> dict[str, dict]:
         _RATE_LIMIT_CONFIGS = {}
         _RATE_LIMIT_CONFIGS_RAW = raw
     return _RATE_LIMIT_CONFIGS
+
+
+def _response_url(response) -> str:
+    try:
+        return str(getattr(response, "url", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_proxy_response(*, response, proxy_gateway: ProxyGatewayConfig | None) -> bool:
+    url = _response_url(response)
+    if not url:
+        return False
+    base_url = str(getattr(proxy_gateway, "base_url", "") or "").strip().rstrip("/")
+    if base_url and url.startswith(f"{base_url}/proxy"):
+        return True
+    return url.endswith("/proxy")
+
+
+def _proxy_transient_error_text(*, response, model: str, suggested_wait_seconds: float) -> str:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    message = ""
+    try:
+        payload = response.json() if getattr(response, "content", None) else {}
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        err = payload.get("error") or {}
+        if isinstance(err, dict):
+            message = str(err.get("message") or "").strip()
+    if not message:
+        try:
+            message = str(getattr(response, "text", "") or "").strip()
+        except Exception:
+            message = ""
+    lowered = message.lower()
+    effective_wait_seconds = float(suggested_wait_seconds)
+    if "has been suspended" in lowered or "consumer" in lowered and "suspended" in lowered:
+        effective_wait_seconds = max(effective_wait_seconds, _SUSPENDED_KEY_COOLDOWN_SECONDS)
+    if len(message) > 240:
+        message = message[:237] + "..."
+    via = _response_url(response) or "proxy"
+    detail_text = f" message={message!r}" if message else ""
+    return (
+        f"Gemini proxy transient HTTP {status_code} "
+        f"(model={model} suggested_wait={float(effective_wait_seconds):.2f}s via={via}){detail_text}"
+    )
+
+
+def _upstream_transient_error_text(*, response, model: str, suggested_wait_seconds: float) -> str:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    message = ""
+    try:
+        payload = response.json() if getattr(response, "content", None) else {}
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        err = payload.get("error") or {}
+        if isinstance(err, dict):
+            message = str(err.get("message") or "").strip()
+    if not message:
+        try:
+            message = str(getattr(response, "text", "") or "").strip()
+        except Exception:
+            message = ""
+    if len(message) > 240:
+        message = message[:237] + "..."
+    via = _response_url(response) or "upstream"
+    detail_text = f" message={message!r}" if message else ""
+    return (
+        f"Gemini upstream transient HTTP {status_code} "
+        f"(model={model} suggested_wait={float(suggested_wait_seconds):.2f}s via={via}){detail_text}"
+    )
+
+
+def _raise_for_transient_gemini_response(
+    *,
+    response,
+    model: str,
+    proxy_gateway: ProxyGatewayConfig | None,
+    suggested_wait_seconds: float,
+    is_queue_worker_mode: bool,
+) -> None:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    message = ""
+    if _is_proxy_response(response=response, proxy_gateway=proxy_gateway):
+        if status_code not in _TRANSIENT_PROXY_STATUS_CODES:
+            return
+        message = _proxy_transient_error_text(
+            response=response,
+            model=model,
+            suggested_wait_seconds=suggested_wait_seconds,
+        )
+    else:
+        if status_code not in _TRANSIENT_UPSTREAM_STATUS_CODES:
+            return
+        message = _upstream_transient_error_text(
+            response=response,
+            model=model,
+            suggested_wait_seconds=suggested_wait_seconds,
+        )
+    if is_queue_worker_mode:
+        raise RateLimitExceededError(message)
+    raise RuntimeError(message)
 
 
 def _redis_now_seconds(client) -> float:
@@ -717,6 +824,13 @@ class GeminiHttpProvider(TranslationProvider):
                     meta_text = (" " + " ".join(meta)) if meta else ""
                     detail_text = f" message={message!r}" if message else ""
                     raise RateLimitExceededError(f"Gemini HTTP 429 (model={model}){meta_text}{detail_text}")
+                _raise_for_transient_gemini_response(
+                    response=response,
+                    model=model,
+                    proxy_gateway=self.proxy_gateway,
+                    suggested_wait_seconds=timeout_suggested_wait_seconds,
+                    is_queue_worker_mode=is_queue_worker_mode,
+                )
                 response.raise_for_status()
                 payload = response.json()
                 prompt_feedback = payload.get("promptFeedback") or {}
@@ -805,6 +919,13 @@ class GeminiHttpProvider(TranslationProvider):
                     meta_text = (" " + " ".join(meta)) if meta else ""
                     detail_text = f" message={message!r}" if message else ""
                     raise RateLimitExceededError(f"Gemini HTTP 429 (model={model}){meta_text}{detail_text}")
+                _raise_for_transient_gemini_response(
+                    response=response,
+                    model=model,
+                    proxy_gateway=self.proxy_gateway,
+                    suggested_wait_seconds=timeout_suggested_wait_seconds,
+                    is_queue_worker_mode=is_queue_worker_mode,
+                )
                 response.raise_for_status()
                 payload = response.json()
                 prompt_feedback = payload.get("promptFeedback") or {}

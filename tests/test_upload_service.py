@@ -1625,4 +1625,123 @@ def test_update_uploaded_youtube_playlist_index_descriptions_without_range_filte
             "status": "updated",
         }
     ]
-    assert updates == ["vid1"]
+
+
+def test_update_uploaded_youtube_playlist_index_descriptions_handles_playlists_larger_than_50(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config(tmp_path)
+    for index in range(1, 56):
+        start = ((index - 1) * 10) + 1
+        end = start + 9
+        range_key = f"chuong_{start}-{end}"
+        _prepare_output_files(config, range_key=range_key)
+        _prepare_translated_file(config, range_key=range_key)
+    (config.storage.output_dir / "title.txt").write_text(
+        "Tập {index} | Thanh Niên Giả Câm 18 Năm | Thái Hư Chí Tôn | FULL",
+        encoding="utf-8",
+    )
+
+    updates: list[str] = []
+
+    class _Request:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def execute(self):
+            return self._payload
+
+    class _ChannelsResource:
+        def list(self, **_kwargs):
+            return _Request({"items": [{"contentDetails": {"relatedPlaylists": {"uploads": "UU123"}}}]})
+
+    class _PlaylistItemsResource:
+        def list(self, **kwargs):
+            page_token = kwargs.get("pageToken")
+            if page_token == "PAGE2":
+                return _Request(
+                    {
+                        "items": [
+                            {
+                                "id": f"PLI{index}",
+                                "snippet": {"playlistId": "PL1234567890", "position": index - 1},
+                                "contentDetails": {"videoId": f"vid{index}"},
+                            }
+                            for index in range(51, 56)
+                        ]
+                    }
+                )
+            return _Request(
+                {
+                    "items": [
+                        {
+                            "id": f"PLI{index}",
+                            "snippet": {"playlistId": "PL1234567890", "position": index - 1},
+                            "contentDetails": {"videoId": f"vid{index}"},
+                        }
+                        for index in range(1, 51)
+                    ],
+                    "nextPageToken": "PAGE2",
+                }
+            )
+
+    class _VideosResource:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs):
+            self.calls.append(kwargs)
+            items = []
+            for raw_id in str(kwargs["id"]).split(","):
+                index = int(raw_id.replace("vid", ""))
+                items.append(
+                    {
+                        "id": f"vid{index}",
+                        "snippet": {
+                            "title": f"Tập {index} | Thanh Niên Giả Câm 18 Năm | Thái Hư Chí Tôn | FULL",
+                            "description": "Danh sách phát: https://www.youtube.com/watch?v=oldid&list=PL1234567890\nRest",
+                            "thumbnails": {},
+                            "categoryId": "22",
+                        },
+                        "contentDetails": {},
+                        "status": {"privacyStatus": "public"},
+                        "statistics": {},
+                    }
+                )
+            return _Request({"items": items})
+
+        def update(self, **kwargs):
+            updates.append(str(kwargs["body"]["id"]))
+            return _Request(kwargs["body"])
+
+    class _YoutubeClient:
+        def __init__(self) -> None:
+            self._videos = _VideosResource()
+
+        def channels(self):
+            return _ChannelsResource()
+
+        def playlistItems(self):
+            return _PlaylistItemsResource()
+
+        def videos(self):
+            return self._videos
+
+    client = _YoutubeClient()
+    _patch_default_youtube_client(monkeypatch, client)
+    monkeypatch.setattr("novel_tts.upload.service.time.sleep", lambda _seconds: None)
+
+    result = update_uploaded_youtube_playlist_index_descriptions(config)
+
+    assert len(result) == 55
+    assert result[-1] == {
+        "title": "Tập 55 | Thanh Niên Giả Câm 18 Năm | Thái Hư Chí Tôn | FULL",
+        "video_id": "vid55",
+        "status": "updated",
+    }
+    assert len(updates) == 55
+    assert updates[-1] == "vid55"
+    assert [call["id"] for call in client._videos.calls] == [
+        ",".join(f"vid{index}" for index in range(1, 51)),
+        ",".join(f"vid{index}" for index in range(51, 56)),
+    ]

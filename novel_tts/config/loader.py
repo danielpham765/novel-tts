@@ -54,6 +54,12 @@ def _glossary_path(novel_id: str) -> Path:
     return _root_dir() / "configs" / "glossaries" / f"{novel_id}.json"
 
 
+def _auto_glossary_path(path: Path) -> Path:
+    if path.suffix:
+        return path.with_name(f"{path.stem}.auto{path.suffix}")
+    return path.with_name(path.name + ".auto.json")
+
+
 def _polish_replacement_path(name: str) -> Path:
     return _root_dir() / "configs" / "polish_replacement" / f"{name}.json"
 
@@ -577,12 +583,22 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     glossary_path = root / glossary_file if glossary_file else _glossary_path(novel_id)
     if glossary_path.exists():
         glossary_raw = json.loads(glossary_path.read_text(encoding="utf-8"))
-        glossary_clean, _dropped = sanitize_glossary_entries(glossary_raw)
+        glossary_clean, dropped_curated = sanitize_glossary_entries(glossary_raw, mode="runtime")
+        if dropped_curated:
+            LOGGER.info(
+                "Ignored %s risky glossary entries while loading %s",
+                len(dropped_curated),
+                glossary_path.name,
+            )
         translation_raw["glossary"] = glossary_clean
         translation_raw["glossary_file"] = str(glossary_path.relative_to(root))
     else:
         translation_raw.setdefault("glossary", {})
         translation_raw["glossary_file"] = glossary_file
+    blocked_targets_raw = translation_raw.get("blocked_glossary_targets", []) or []
+    if not isinstance(blocked_targets_raw, list):
+        raise ValueError('Invalid "translation.blocked_glossary_targets" config (expected list)')
+    translation_raw["blocked_glossary_targets"] = [str(item).strip() for item in blocked_targets_raw if str(item).strip()]
     translation_raw["polish_replacements"] = _load_polish_replacements(novel_id)
     if "REPAIR_MODE" in os.environ:
         translation_raw["repair_mode"] = os.environ["REPAIR_MODE"].strip().lower() in {"1", "true", "yes"}

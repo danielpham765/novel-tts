@@ -571,8 +571,8 @@ def _probe_gemini_429(
 
     Returns:
       - True: confirmed 429
-      - False: request completed and was not 429 (any other status)
-      - None: probe failed (network/timeout/invalid inputs)
+      - False: request completed successfully and was not 429
+      - None: probe failed or returned another transient/proxy error (403/5xx/etc.)
     """
 
     api_key = (api_key or "").strip()
@@ -598,7 +598,14 @@ def _probe_gemini_429(
     except Exception as exc:
         LOGGER.debug("Gemini 429 probe failed | model=%s err=%s", model, exc)
         return None
-    return bool(response.status_code == 429)
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code == 429:
+        return True
+    if status_code == 200:
+        return False
+    if status_code == 403 or status_code >= 500:
+        return None
+    return False
 
 
 def _parse_quota_suggested_wait_seconds(text: str) -> float | None:
@@ -1573,6 +1580,18 @@ def _has_exhausted_retries(config: NovelConfig, client, job_id: str) -> bool:
     return _retry_count(config, client, job_id) >= config.queue.max_retries
 
 
+def _exhausted_retry_count(config: NovelConfig, client) -> int:
+    count = 0
+    for value in client.hgetall(_key(config, "retries")).values():
+        try:
+            retries = int(value)
+        except (TypeError, ValueError):
+            continue
+        if retries >= config.queue.max_retries:
+            count += 1
+    return count
+
+
 def _enqueue_needed_jobs(config: NovelConfig, client) -> None:
     for path in sorted(config.storage.origin_dir.glob("*.txt")):
         for job_id in _chapter_jobs_for_file(config, path):
@@ -1833,6 +1852,61 @@ def add_all_jobs_to_queue(config: NovelConfig, *, force: bool = False) -> int:
     return 0
 
 
+def requeue_untranslated_exhausted_jobs(config: NovelConfig) -> int:
+    """
+    Requeue only chapter jobs that still need work but were skipped by `queue add --all`
+    because their retry budget was exhausted.
+
+    This intentionally does not requeue chapters that are already up to date, but it *does*
+    clean stale retry entries for those chapters so queue status reflects actual remaining work.
+    """
+    client = _client(config)
+    job_ids: list[str] = []
+    stale_retry_job_ids: list[str] = []
+
+    for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
+        for chapter_num, chapter_text in load_source_chapters(config, source_path):
+            try:
+                chap_str = str(int(str(chapter_num)))
+            except Exception:
+                continue
+            job_id = _job_id(source_path.name, chap_str)
+            if not _has_exhausted_retries(config, client, job_id):
+                continue
+            if not _chapter_needs_work(config, source_path, chap_str, chapter_text=chapter_text):
+                stale_retry_job_ids.append(job_id)
+                continue
+            job_ids.append(job_id)
+
+    if stale_retry_job_ids:
+        client.hdel(_key(config, "retries"), *stale_retry_job_ids)
+        LOGGER.info(
+            "Cleaned stale exhausted retries | novel=%s removed=%s",
+            config.novel_id,
+            len(stale_retry_job_ids),
+        )
+
+    if not job_ids:
+        if stale_retry_job_ids:
+            print(
+                "Queued 0 job(s). "
+                f"Cleaned {len(stale_retry_job_ids)} stale retry record(s) for already-translated chapters."
+            )
+        else:
+            print("Queued 0 job(s).")
+        return 0
+
+    rc = add_job_ids_to_queue(
+        config,
+        job_ids,
+        force=True,
+        label="requeue untranslated exhausted",
+    )
+    if stale_retry_job_ids:
+        print(f"Cleaned {len(stale_retry_job_ids)} stale retry record(s) for already-translated chapters.")
+    return rc
+
+
 def add_job_ids_to_queue(
     config: NovelConfig,
     job_ids: list[str],
@@ -1913,10 +1987,41 @@ def add_job_ids_to_queue(
     return 0
 
 
+def _worker_pid_from_worker_id(worker_id: str) -> int | None:
+    text = str(worker_id or "").strip()
+    if not text:
+        return None
+    tail = text.rsplit(":", 1)[-1].strip()
+    try:
+        pid = int(tail)
+    except Exception:
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
 def _requeue_stale_inflight(config: NovelConfig, client) -> None:
     now = time.time()
     for job_id, payload in client.hgetall(_key(config, "inflight")).items():
         meta = json.loads(payload)
+        worker_pid = _worker_pid_from_worker_id(meta.get("worker") or "")
+        if worker_pid is not None and (not _pid_is_alive(worker_pid)):
+            client.hdel(_key(config, "inflight"), job_id)
+            if _has_exhausted_retries(config, client, job_id):
+                continue
+            _requeue_job_priority(config, client, job_id)
+            continue
         started_at = float(meta.get("started_at", 0))
         if now - started_at < config.queue.inflight_ttl_seconds:
             continue
@@ -2013,6 +2118,7 @@ def _write_status_line(
         "queued": client.scard(_key(config, "queued")),
         "inflight": len(inflight_payloads),
         "retries": client.hlen(_key(config, "retries")),
+        "exhausted": _exhausted_retry_count(config, client),
         "done": len(done_payloads),
         "inflight_by_model": inflight_by_model,
         "done_by_model": {model: int(count) for model, count in model_done.items()},
@@ -2061,7 +2167,7 @@ def _write_status_line(
         f"| done={done_pct:.2f}% | parts={snapshot['parts']}/{snapshot['chapter_total']} "
         f"| part_done={part_pct:.2f}% | files/min={files_per_min:.2f} | parts/min={parts_per_min:.2f} "
         f"| ETA_files={eta_files} | ETA_parts={eta_parts} | ETA_queue={eta_queue} | checkpoints={snapshot['checkpoints']} "
-        f"| retries={snapshot['retries']} | pending={snapshot['pending']} | queued={snapshot['queued']} "
+        f"| retries={snapshot['retries']} | exhausted={snapshot['exhausted']} | pending={snapshot['pending']} | queued={snapshot['queued']} "
         f"| inflight={snapshot['inflight']} | workers={snapshot['inflight']} "
         f"| inflight_by_model={snapshot['inflight_by_model']} "
         f"| done_by_model={snapshot['done_by_model']} | failed_by_model={snapshot['failed_by_model']}"
@@ -2814,11 +2920,38 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             client.hincrby(_key(config, "model_done"), model, 1)
             LOGGER.info("Worker done: %s", job_id)
             continue
+        if proc.returncode == 77:
+            client.hdel(_key(config, "inflight"), job_id)
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            LOGGER.error(
+                "Worker input failure | job=%s key_index=%s model=%s returncode=%s stdout=%r stderr=%r",
+                job_id,
+                key_index,
+                model,
+                proc.returncode,
+                stdout[-4000:],
+                stderr[-4000:],
+            )
+            consecutive_rate_limit_releases = 0
+            client.hincrby(_key(config, "model_failed"), model, 1)
+            retries = client.hincrby(_key(config, "retries"), job_id, 1)
+            if is_captions:
+                needs_work = _captions_needs_translation(config)
+            else:
+                assert source_path is not None
+                needs_work = _chapter_needs_work(config, source_path, chapter_num)
+            if retries < config.queue.max_retries and (is_force or needs_work):
+                if client.sadd(_key(config, "queued"), job_id):
+                    client.rpush(_key(config, "pending"), job_id)
+            else:
+                LOGGER.error("Worker gave up on %s after %s input retries", job_id, retries)
+            continue
         client.hdel(_key(config, "inflight"), job_id)
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
         LOGGER.error(
-            "Worker failed | job=%s key_index=%s model=%s returncode=%s stdout=%r stderr=%r",
+            "Worker transient/unclassified failure | job=%s key_index=%s model=%s returncode=%s stdout=%r stderr=%r",
             job_id,
             key_index,
             model,
@@ -2828,17 +2961,15 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
         )
         consecutive_rate_limit_releases = 0
         client.hincrby(_key(config, "model_failed"), model, 1)
-        retries = client.hincrby(_key(config, "retries"), job_id, 1)
         if is_captions:
             needs_work = _captions_needs_translation(config)
         else:
             assert source_path is not None
             needs_work = _chapter_needs_work(config, source_path, chapter_num)
-        if retries < config.queue.max_retries and (is_force or needs_work):
-            if client.sadd(_key(config, "queued"), job_id):
-                client.rpush(_key(config, "pending"), job_id)
-        else:
-            LOGGER.error("Worker gave up on %s after %s retries", job_id, retries)
+        if is_force or needs_work:
+            _delay_job(config, client, job_id, 15.0)
+            time.sleep(1.0)
+            continue
 
 
 def run_supervisor(config: NovelConfig) -> int:
@@ -3545,32 +3676,42 @@ def _sort_queue_rows(rows: list[dict[str, str]]) -> None:
     )
 
 
-def _queue_counts_from_redis(config: NovelConfig, client) -> tuple[int, int, int, int, int]:
+def _queue_counts_from_redis(config: NovelConfig, client) -> tuple[int, int, int, int, int, int]:
     pending = int(_pending_total_len(config, client) or 0)
     queued = int(client.scard(_key(config, "queued")) or 0)
     inflight = int(client.hlen(_key(config, "inflight")) or 0)
     retries = int(client.hlen(_key(config, "retries")) or 0)
+    exhausted = int(_exhausted_retry_count(config, client) or 0)
     done = int(client.hlen(_key(config, "done")) or 0)
-    return pending, queued, inflight, retries, done
+    return pending, queued, inflight, retries, exhausted, done
 
 
-def _queue_counts_from_state_log(config: NovelConfig) -> tuple[int, int, int, int, int]:
+def _queue_counts_from_state_log(config: NovelConfig) -> tuple[int, int, int, int, int, int]:
     _status_log, state_log = _status_paths(config)
     if not state_log.exists():
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
     try:
         snapshot = json.loads(state_log.read_text(encoding="utf-8"))
     except Exception:
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
     pending = int(snapshot.get("pending", 0) or 0)
     queued = int(snapshot.get("queued", 0) or 0)
     inflight = int(snapshot.get("inflight", 0) or 0)
     retries = int(snapshot.get("retries", 0) or 0)
+    exhausted = int(snapshot.get("exhausted", 0) or 0)
     done = int(snapshot.get("done", 0) or 0)
-    return pending, queued, inflight, retries, done
+    return pending, queued, inflight, retries, exhausted, done
 
 
-def _apply_live_redis_overrides(config: NovelConfig, client, rows: list[dict[str, str]], *, children_by_ppid: dict[str, list[dict[str, str]]]) -> None:
+def _apply_live_redis_overrides(
+    config: NovelConfig,
+    client,
+    rows: list[dict[str, str]],
+    *,
+    children_by_ppid: dict[str, list[dict[str, str]]],
+    pending: int,
+    queued: int,
+) -> None:
     # If Redis is available, use cooldown keys as the source of truth for remaining time so
     # `queue reset-key` immediately reflects in ps output (log-derived countdowns can be stale).
     for row in rows:
@@ -3658,6 +3799,36 @@ def _apply_live_redis_overrides(config: NovelConfig, client, rows: list[dict[str
                 else ""
             )
 
+    has_queue_work = int(pending or 0) > 0 or int(queued or 0) > 0
+    if not has_queue_work:
+        return
+
+    for row in rows:
+        if row.get("role") != "worker":
+            continue
+        if (row.get("state") or "").strip() != "idle":
+            continue
+        raw_key_index = (row.get("key_index") or "").strip()
+        raw_model = (row.get("model") or "").strip()
+        if (not raw_key_index) or (not raw_model):
+            continue
+        try:
+            key_index = int(raw_key_index)
+        except Exception:
+            continue
+        try:
+            should_pause, _blocked_model, wait_seconds = _worker_should_pause_for_quota(
+                config,
+                client,
+                key_index,
+                raw_model,
+            )
+        except Exception:
+            continue
+        if should_pause and float(wait_seconds or 0.0) > 0.05:
+            row["state"] = "waiting-quota"
+            row["countdown"] = str(int(math.ceil(float(wait_seconds))))
+
 
 def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
     """List queue-related processes for a novel in a pm2-like summary, plus progress."""
@@ -3674,18 +3845,25 @@ def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
     _enrich_translate_chapter_meta(rows, ppid_by_pid=ppid_by_pid, worker_meta_by_pid=worker_meta_by_pid)
     children_by_ppid = _classify_queue_rows(rows, surface_worker_target=True)
 
-    pending = queued = inflight = retries = done = 0
+    pending = queued = inflight = retries = exhausted = done = 0
     client = None
     try:
         client = _client(config)
-        pending, queued, inflight, retries, done = _queue_counts_from_redis(config, client)
-        _apply_live_redis_overrides(config, client, rows, children_by_ppid=children_by_ppid)
+        pending, queued, inflight, retries, exhausted, done = _queue_counts_from_redis(config, client)
+        _apply_live_redis_overrides(
+            config,
+            client,
+            rows,
+            children_by_ppid=children_by_ppid,
+            pending=pending,
+            queued=queued,
+        )
     except Exception:
-        pending, queued, inflight, retries, done = _queue_counts_from_state_log(config)
+        pending, queued, inflight, retries, exhausted, done = _queue_counts_from_state_log(config)
 
     print(
         f"\nNovel {config.novel_id}:"
-        f" pending={pending} queued={queued} inflight={inflight} retries={retries} done={done}"
+        f" pending={pending} queued={queued} inflight={inflight} retries={retries} exhausted={exhausted} done={done}"
     )
 
     _sort_queue_rows(rows)
@@ -3719,7 +3897,7 @@ def list_all_queue_processes(include_all: bool = False) -> int:
         _enrich_translate_chapter_meta(rows, ppid_by_pid=ppid_by_pid, worker_meta_by_pid=worker_meta_by_pid)
         children_by_ppid = _classify_queue_rows(rows, surface_worker_target=True)
 
-        pending = queued = inflight = retries = done = 0
+        pending = queued = inflight = retries = exhausted = done = 0
         loaded = False
         client = None
         config = None
@@ -3730,7 +3908,7 @@ def list_all_queue_processes(include_all: bool = False) -> int:
 
             config = load_novel_config(novel_id)
             client = _client(config)
-            pending, queued, inflight, retries, done = _queue_counts_from_redis(config, client)
+            pending, queued, inflight, retries, exhausted, done = _queue_counts_from_redis(config, client)
             _apply_live_redis_overrides(config, client, rows, children_by_ppid=children_by_ppid)
             loaded = True
         except Exception:
@@ -3765,12 +3943,13 @@ def list_all_queue_processes(include_all: bool = False) -> int:
                 queued = int(snapshot.get("queued", 0) or 0)
                 inflight = int(snapshot.get("inflight", 0) or 0)
                 retries = int(snapshot.get("retries", 0) or 0)
+                exhausted = int(snapshot.get("exhausted", 0) or 0)
                 done = int(snapshot.get("done", 0) or 0)
                 break
 
         print(
             f"\nNovel {novel_id}:"
-            f" pending={pending} queued={queued} inflight={inflight} retries={retries} done={done}"
+            f" pending={pending} queued={queued} inflight={inflight} retries={retries} exhausted={exhausted} done={done}"
         )
 
         _sort_queue_rows(rows)

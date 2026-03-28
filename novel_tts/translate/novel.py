@@ -10,10 +10,10 @@ from pathlib import Path
 
 from novel_tts.common.logging import get_logger
 from novel_tts.common.text import normalize_ellipsis
-from novel_tts.common.errors import RateLimitExceededError
+from novel_tts.common.errors import InputTranslationError, RateLimitExceededError
 from novel_tts.config.models import NovelConfig
 
-from .glossary import normalize_glossary_text, sanitize_glossary_entries
+from .glossary import normalize_glossary_text, sanitize_glossary_entries, source_text_variants
 from .model import _clean_model_name, resolve_translation_model
 from .providers import PromptBlockedError, get_translation_provider
 
@@ -22,6 +22,14 @@ HAN_REGEX = re.compile(r"[\u4e00-\u9fff]")
 JSON_BLOCK_REGEX = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 PLACEHOLDER_TOKEN_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}QXZ")
 PLACEHOLDER_LIKE_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}Q(?:XZ)?")
+ROMANIZED_ARTIFACT_RE = re.compile(
+    r"thiển trương viên|thập ma|thiểu điểm|chẩm hội|na khả thị|thiên chân vạn xác|"
+    r"thuấn gian(?: giải khai)?|trừu trứ lương khí|kinh đào hãi lãng|đích phu trượng|"
+    r"thuyết hoàn điều chuyển|khán liễu nhãn|cật sung liễu|đương tâm liễu|"
+    r"thính danh tự|đảo hấp nhất khẩu lương khí|giá chủng|bất thị thiện|"
+    r"vi hà hội như vậy|bình nhiễu|phủ tắc đáng bất trụ|vạn niên tuế nguyệt",
+    re.I,
+)
 GLOSSARY_STATUS_PENDING = "pending"
 GLOSSARY_STATUS_DONE = "done"
 
@@ -94,6 +102,19 @@ def _effective_glossary_model(config: NovelConfig, default_model: str) -> str:
     return global_default or _clean_model_name(default_model)
 
 
+def _alternate_repair_model(config: NovelConfig, current_model: str) -> str:
+    current = _clean_model_name(current_model)
+    enabled = [_clean_model_name(item) for item in getattr(getattr(config, "models", None), "enabled_models", []) or []]
+    enabled = [item for item in enabled if item and item != current]
+    if not enabled:
+        return ""
+    if current.startswith("gemma"):
+        for model in enabled:
+            if model.startswith("gemini"):
+                return model
+    return enabled[0]
+
+
 def make_placeholders(text: str, glossary: dict[str, str]) -> tuple[str, dict[str, str]]:
     masked, mapping, _replacements = make_placeholders_with_replacements(text, glossary)
     return masked, mapping
@@ -118,11 +139,16 @@ def make_placeholders_with_replacements(
         # or "Biến cố ZXQ125QXZ"). In that case we skip placeholdering so the model can translate from the original term.
         if isinstance(value, str) and PLACEHOLDER_LIKE_RE.search(value):
             continue
-        if key in text:
-            text = text.replace(key, token)
-            value_str = value if isinstance(value, str) else str(value)
+        value_str = value if isinstance(value, str) else str(value)
+        replaced_any = False
+        for variant in source_text_variants(str(key)):
+            if variant not in text:
+                continue
+            text = text.replace(variant, token)
+            replacements.append({"src": variant, "token": token, "value": value_str})
+            replaced_any = True
+        if replaced_any:
             mapping[token] = value_str
-            replacements.append({"src": str(key), "token": token, "value": value_str})
     return text, mapping, replacements
 
 
@@ -252,6 +278,25 @@ def has_han(text: str) -> bool:
     return bool(HAN_REGEX.search(text))
 
 
+def find_romanized_artifacts(text: str) -> list[str]:
+    if not text:
+        return []
+    found = ROMANIZED_ARTIFACT_RE.findall(text)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in found:
+        key = str(item).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(str(item).strip())
+    return unique
+
+
+def has_romanized_artifacts(text: str) -> bool:
+    return bool(find_romanized_artifacts(text))
+
+
 def build_glossary(mapping: dict[str, str]) -> str:
     return "\n".join(f"- {token} = {value}" for token, value in mapping.items())
 
@@ -307,6 +352,15 @@ def glossary_path(config: NovelConfig) -> Path | None:
     return config.storage.root / config.translation.glossary_file
 
 
+def auto_glossary_path(config: NovelConfig) -> Path | None:
+    path = glossary_path(config)
+    if path is None:
+        return None
+    if path.suffix:
+        return path.with_name(f"{path.stem}.auto{path.suffix}")
+    return path.with_name(path.name + ".auto.json")
+
+
 def glossary_marker_path(config: NovelConfig, source_path: Path, chapter_num: str) -> Path:
     return config.storage.parts_dir / source_path.stem / f"{int(chapter_num):04d}.glossary.json"
 
@@ -346,12 +400,242 @@ def refresh_glossary(config: NovelConfig) -> None:
         return
     try:
         glossary_raw = json.loads(path.read_text(encoding="utf-8"))
-        glossary_clean, dropped = sanitize_glossary_entries(glossary_raw)
+        glossary_clean, dropped = sanitize_glossary_entries(glossary_raw, mode="runtime")
         if dropped:
-            LOGGER.info("Ignored %s generic glossary entries while loading %s", len(dropped), path.name)
+            LOGGER.info("Ignored %s risky glossary entries while loading %s", len(dropped), path.name)
         config.translation.glossary = glossary_clean
     except Exception as exc:
         LOGGER.warning("Unable to refresh glossary from %s: %s", path, exc)
+
+
+def _blocked_target_allowed_sources(config: NovelConfig) -> dict[str, list[str]]:
+    entries: dict[str, str] = {}
+    curated = getattr(getattr(config, "translation", None), "glossary", {}) or {}
+    if isinstance(curated, dict):
+        entries.update({str(k): str(v) for k, v in curated.items() if isinstance(k, str) and isinstance(v, str)})
+
+    auto_path = auto_glossary_path(config)
+    if auto_path is not None and auto_path.exists():
+        auto_raw = _load_json_object(auto_path)
+        auto_clean, _dropped = sanitize_glossary_entries(auto_raw, mode="runtime", context_entries=entries)
+        entries.update(auto_clean)
+
+    reverse: dict[str, list[str]] = {}
+    for source, target in entries.items():
+        source_norm = normalize_glossary_text(source)
+        target_norm = normalize_glossary_text(target).lower()
+        if not source_norm or not target_norm:
+            continue
+        bucket = reverse.setdefault(target_norm, [])
+        if source_norm not in bucket:
+            bucket.append(source_norm)
+    return reverse
+
+
+def _is_name_like_target(target: str) -> bool:
+    words = [part for part in re.split(r"\s+", normalize_glossary_text(target)) if part]
+    if len(words) < 2 or len(words) > 3:
+        return False
+    capitalized = 0
+    for word in words:
+        if len(word) < 2:
+            return False
+        for ch in word:
+            if ch.isalpha():
+                if ch.isupper():
+                    capitalized += 1
+                break
+    return capitalized == len(words)
+
+
+def _proper_target_sources(config: NovelConfig) -> dict[str, list[str]]:
+    cache = getattr(config.translation, "_proper_target_sources_cache", None)
+    if isinstance(cache, dict):
+        return cache
+    reverse: dict[str, list[str]] = {}
+    glossary = getattr(config.translation, "glossary", {}) or {}
+    polish = getattr(config.translation, "polish_replacements", {}) or {}
+    for source, target in glossary.items():
+        source_norm = normalize_glossary_text(source)
+        target_norm = normalize_glossary_text(target)
+        if not source_norm or not target_norm or not _is_name_like_target(target_norm):
+            continue
+        bucket = reverse.setdefault(target_norm, [])
+        for variant in source_text_variants(source_norm):
+            if variant not in bucket:
+                bucket.append(variant)
+        polished_target = normalize_glossary_text(polish.get(target_norm, "")) if isinstance(polish, dict) else ""
+        if polished_target and _is_name_like_target(polished_target):
+            polished_bucket = reverse.setdefault(polished_target, [])
+            for variant in source_text_variants(source_norm):
+                if variant not in polished_bucket:
+                    polished_bucket.append(variant)
+    setattr(config.translation, "_proper_target_sources_cache", reverse)
+    return reverse
+
+
+def _all_target_sources(config: NovelConfig) -> dict[str, list[str]]:
+    cache = getattr(config.translation, "_all_target_sources_cache", None)
+    if isinstance(cache, dict):
+        return cache
+
+    reverse: dict[str, list[str]] = {}
+    glossary = getattr(config.translation, "glossary", {}) or {}
+    polish = getattr(config.translation, "polish_replacements", {}) or {}
+    for source, target in glossary.items():
+        source_norm = normalize_glossary_text(source)
+        target_norm = normalize_glossary_text(target)
+        if not source_norm or not target_norm:
+            continue
+        bucket = reverse.setdefault(target_norm, [])
+        for variant in source_text_variants(source_norm):
+            if variant not in bucket:
+                bucket.append(variant)
+        polished_target = normalize_glossary_text(polish.get(target_norm, "")) if isinstance(polish, dict) else ""
+        if polished_target:
+            polished_bucket = reverse.setdefault(polished_target, [])
+            for variant in source_text_variants(source_norm):
+                if variant not in polished_bucket:
+                    polished_bucket.append(variant)
+
+    setattr(config.translation, "_all_target_sources_cache", reverse)
+    return reverse
+
+
+def _is_licensed_target_substring(config: NovelConfig, target: str, source_text: str) -> bool:
+    target_norm = normalize_glossary_text(target)
+    source_norm = normalize_glossary_text(source_text)
+    if not target_norm or not source_norm:
+        return False
+
+    for longer_target, sources in _all_target_sources(config).items():
+        if longer_target == target_norm or target_norm not in longer_target:
+            continue
+        if any(source in source_norm for source in sources):
+            return True
+    return False
+
+
+def _is_licensed_cross_target_bigram(config: NovelConfig, text: str, target: str, source_text: str) -> bool:
+    words = [part for part in normalize_glossary_text(target).split() if part]
+    if len(words) != 2:
+        return False
+
+    source_norm = normalize_glossary_text(source_text)
+    if not source_norm:
+        return False
+
+    word_pattern = r"[A-ZÀ-Ỵ][\wÀ-ỹ]+"
+    pattern = re.compile(
+        rf"(?P<prev>{word_pattern})\s+(?P<first>{re.escape(words[0])})\s+(?P<second>{re.escape(words[1])})\s+(?P<next>{word_pattern})"
+    )
+    all_targets = _all_target_sources(config)
+    for match in pattern.finditer(text):
+        left_target = f"{match.group('prev')} {match.group('first')}"
+        right_target = f"{match.group('second')} {match.group('next')}"
+        left_sources = all_targets.get(left_target, [])
+        right_sources = all_targets.get(right_target, [])
+        if not left_sources or not right_sources:
+            continue
+        if any(source in source_norm for source in left_sources) and any(source in source_norm for source in right_sources):
+            return True
+    return False
+
+
+def _is_licensed_prefixed_target_variant(config: NovelConfig, text: str, target: str, source_text: str) -> bool:
+    target_norm = normalize_glossary_text(target)
+    source_norm = normalize_glossary_text(source_text)
+    if not target_norm or not source_norm:
+        return False
+
+    word_pattern = r"[A-ZÀ-Ỵ][\wÀ-ỹ]+"
+    prefixed_pattern = re.compile(rf"{word_pattern}\s+{re.escape(target_norm)}(?![\wÀ-ỹ])")
+    if not prefixed_pattern.search(text):
+        return False
+
+    for longer_target, sources in _all_target_sources(config).items():
+        if longer_target == target_norm or not longer_target.endswith(f" {target_norm}"):
+            continue
+        if any(source in source_norm for source in sources):
+            return True
+    return False
+
+
+def _has_suspicious_target_context(text: str, target: str) -> bool:
+    escaped = re.escape(target)
+    pattern = re.compile(rf"(?<![\wÀ-ỹ]){escaped}(?![\wÀ-ỹ])")
+    count = len(pattern.findall(text))
+    if count >= 2:
+        return True
+    neighbor = r"[A-ZÀ-Ỵ][\wÀ-ỹ]+"
+    before = re.search(rf"{neighbor}\s+{escaped}(?![\wÀ-ỹ])", text)
+    after = re.search(rf"(?<![\wÀ-ỹ]){escaped}\s+{neighbor}", text)
+    return bool(before or after)
+
+
+def find_source_mismatched_proper_targets(config: NovelConfig, text: str, *, source_text: str = "") -> list[str]:
+    source_norm = normalize_glossary_text(source_text)
+    if not source_norm:
+        return []
+    hits: list[str] = []
+    seen: set[str] = set()
+    proper_targets = _proper_target_sources(config)
+    allowed_targets = {
+        target
+        for target, sources in proper_targets.items()
+        if any(source in source_norm for source in sources)
+    }
+    for target, sources in proper_targets.items():
+        if target in seen:
+            continue
+        if not re.search(rf"(?<![\wÀ-ỹ]){re.escape(target)}(?![\wÀ-ỹ])", text):
+            continue
+        if any(source in source_norm for source in sources):
+            continue
+        if _is_licensed_target_substring(config, target, source_norm):
+            continue
+        if _is_licensed_cross_target_bigram(config, text, target, source_norm):
+            continue
+        if _is_licensed_prefixed_target_variant(config, text, target, source_norm):
+            continue
+        # Ignore substrings of larger, source-licensed target phrases that already appear in output.
+        if any(target != allowed and target in allowed and allowed in text for allowed in allowed_targets):
+            continue
+        if not _has_suspicious_target_context(text, target):
+            continue
+        hits.append(target)
+        seen.add(target)
+    return hits
+
+
+def find_blocked_glossary_targets(config: NovelConfig, text: str, *, source_text: str = "") -> list[str]:
+    hits: list[str] = []
+    seen: set[str] = set()
+    source_norm = normalize_glossary_text(source_text)
+    allowed_sources = _blocked_target_allowed_sources(config) if source_norm else {}
+    for target in getattr(config.translation, "blocked_glossary_targets", []) or []:
+        normalized = normalize_glossary_text(target)
+        if not normalized or normalized in seen:
+            continue
+        if normalized in text:
+            if source_norm:
+                allowed = allowed_sources.get(normalized.lower(), [])
+                if any(src in source_norm for src in allowed):
+                    continue
+                if _is_licensed_target_substring(config, normalized, source_norm):
+                    continue
+                if _is_licensed_cross_target_bigram(config, text, normalized, source_norm):
+                    continue
+                if _is_licensed_prefixed_target_variant(config, text, normalized, source_norm):
+                    continue
+            hits.append(normalized)
+            seen.add(normalized)
+    for target in find_source_mismatched_proper_targets(config, text, source_text=source_text):
+        if target in seen:
+            continue
+        hits.append(target)
+        seen.add(target)
+    return hits
 
 
 def _strip_json_wrappers(text: str) -> str:
@@ -515,6 +799,48 @@ def _save_glossary_progress(config: NovelConfig, unit_key: str, payload: dict) -
 def _clear_glossary_progress(config: NovelConfig, unit_key: str) -> None:
     key = _glossary_progress_key(unit_key)
     clear_progress(config, key)
+
+
+def _translated_stage_key(unit_key: str) -> str:
+    return f"translated_stage__{unit_key}"
+
+
+def _load_translated_stage(config: NovelConfig, unit_key: str) -> dict:
+    path = progress_path(config, _translated_stage_key(unit_key))
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_translated_stage(
+    config: NovelConfig,
+    unit_key: str,
+    *,
+    raw_sha1: str,
+    translate_model: str,
+    chunks: list[str],
+) -> None:
+    config.storage.progress_dir.mkdir(parents=True, exist_ok=True)
+    progress_path(config, _translated_stage_key(unit_key)).write_text(
+        json.dumps(
+            {
+                "raw_sha1": raw_sha1,
+                "translate_model": translate_model,
+                "chunks": chunks,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _clear_translated_stage(config: NovelConfig, unit_key: str) -> None:
+    clear_progress(config, _translated_stage_key(unit_key))
 
 
 def _repair_progress_key(prefix: str, unit_key: str) -> str:
@@ -894,6 +1220,8 @@ def repair_against_source_chunked(
     unit_key: str,
     source_text: str,
     translated_text: str,
+    force_repair_without_han: bool = False,
+    forbidden_terms: list[str] | None = None,
 ) -> str:
     """
     Repair against source in multiple smaller windows to reduce TPM bursts.
@@ -951,6 +1279,14 @@ def repair_against_source_chunked(
         center = (idx + 0.5) / max(1, total)
         src_window = _slice_center(source_text, max_chars=source_window_chars, center_frac=center)
         tr_window = translated_windows[idx]
+        forbidden_lines = ""
+        if forbidden_terms:
+            forbidden_lines = (
+                "\n"
+                "Tuyệt đối không dùng lại các cách gọi/dịch sai sau trong đoạn trả lời:\n"
+                + "\n".join(f"- {term}" for term in forbidden_terms[:32])
+                + "\n"
+            )
         LOGGER.info(
             "repair_against_source (chunked) fixing | unit=%s chunk=%s/%s chars=%s han=%s",
             unit_key,
@@ -959,9 +1295,11 @@ def repair_against_source_chunked(
             len(tr_window),
             count_han_chars(tr_window),
         )
-        # This stage exists to eliminate remaining Han residue. If a window has no Han at all,
-        # avoid sending the (possibly sensitive) source excerpt to the provider unnecessarily.
-        if not has_han(tr_window):
+        # Most callers use this stage to eliminate remaining Han residue, so we skip clean windows by default
+        # to avoid sending unnecessary source excerpts. Some callers reuse the same repair path for glossary/
+        # terminology cleanup where the bad output is pure Vietnamese text; those call sites opt in to
+        # force_repair_without_han=True so the window is actually repaired instead of being returned unchanged.
+        if not force_repair_without_han and not has_han(tr_window):
             repaired.append(tr_window)
             _save_repair_progress(config, stage_prefix, unit_key, repaired)
             continue
@@ -973,6 +1311,7 @@ def repair_against_source_chunked(
             "- Chỉ sửa đoạn BẢN DỊCH HIỆN CÓ sao cho khớp với BẢN GỐC.\n"
             "- Giữ nguyên ý và thứ tự theo BẢN GỐC, không thêm ý, không cắt mất nội dung.\n"
             "- Phải thay hết toàn bộ chữ Hán còn sót (kể cả chữ Hán lẻ bị trộn trong câu tiếng Việt).\n"
+            f"{forbidden_lines}"
             "- Không viết tiêu đề/ghi chú, không nhắc lại phần ngoài đoạn này.\n"
             "- Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH) tương ứng.\n\n"
             f"BẢN GỐC (TRÍCH):\n{src_window}\n\n"
@@ -1002,6 +1341,7 @@ def repair_against_source_chunked(
                 "Nhiệm vụ của ngươi:\n"
                 "- Dịch hết toàn bộ chữ Hán còn sót sang tiếng Việt.\n"
                 "- Giữ nguyên ý và thứ tự theo đoạn hiện có, không thêm ý, không cắt mất nội dung.\n"
+                f"{forbidden_lines}"
                 "- Không viết tiêu đề/ghi chú.\n"
                 "- Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH).\n\n"
                 f"ĐOẠN CẦN SỬA (TRÍCH):\n{tr_window}"
@@ -1341,8 +1681,18 @@ def _compact_glossary_context(
     return compact_source, compact_translated, was_compacted
 
 
-def _merge_glossary_file(config: NovelConfig, updates: dict[str, str]) -> tuple[dict[str, str], int]:
-    path = glossary_path(config)
+def _load_json_object(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _merge_auto_glossary_file(config: NovelConfig, updates: dict[str, str]) -> tuple[dict[str, str], int]:
+    path = auto_glossary_path(config)
     if path is None or not updates:
         return config.translation.glossary, 0
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1351,25 +1701,53 @@ def _merge_glossary_file(config: NovelConfig, updates: dict[str, str]) -> tuple[
     added = 0
     with lock_path.open("r+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        current: dict[str, str] = {}
-        if path.exists():
-            try:
-                current = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                LOGGER.warning("Unable to read existing glossary %s: %s", path, exc)
+        curated_path = glossary_path(config)
+        curated_raw = _load_json_object(curated_path) if curated_path is not None else {}
+        curated_clean, _curated_dropped = sanitize_glossary_entries(curated_raw, mode="runtime")
+        current_raw = _load_json_object(path)
+        current, _dropped_current = sanitize_glossary_entries(
+            current_raw,
+            mode="auto",
+            context_entries=curated_clean,
+        )
+        filtered_updates, _dropped_updates = sanitize_glossary_entries(
+            updates,
+            mode="auto",
+            context_entries={**curated_clean, **current},
+        )
+        candidate = dict(current)
+        candidate.update(filtered_updates)
+        candidate, _dropped_candidate = sanitize_glossary_entries(
+            candidate,
+            mode="auto",
+            context_entries=curated_clean,
+        )
         merged = dict(current)
         changed = False
-        for key, value in updates.items():
+        for key, value in filtered_updates.items():
             key = normalize_glossary_text(key)
             value = normalize_glossary_text(value)
-            filtered, dropped = sanitize_glossary_entries({key: value})
+            filtered, dropped = sanitize_glossary_entries(
+                {key: value},
+                mode="auto",
+                context_entries={**curated_clean, **merged},
+            )
             if dropped:
                 continue
             key, value = next(iter(filtered.items()))
+            if curated_clean.get(key):
+                if curated_clean.get(key) != value:
+                    LOGGER.info("Keeping curated glossary entry %s=%s over auto value %s", key, curated_clean.get(key), value)
+                continue
+            if candidate.get(key) != value:
+                LOGGER.info("Rejected auto glossary entry %s=%s after runtime validation", key, value)
+                continue
             existing = merged.get(key)
             if existing:
                 if existing != value:
-                    LOGGER.info("Keeping existing glossary entry %s=%s over new value %s", key, existing, value)
+                    LOGGER.info("Replacing existing auto glossary entry %s=%s with %s", key, existing, value)
+                    merged[key] = value
+                    changed = True
                 continue
             merged[key] = value
             changed = True
@@ -1384,8 +1762,8 @@ def _merge_glossary_file(config: NovelConfig, updates: dict[str, str]) -> tuple[
             path.write_text(json.dumps(ordered, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             merged = ordered
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-    config.translation.glossary = merged
-    return merged, added
+    config.translation.glossary = curated_clean
+    return curated_clean, added
 
 
 def update_glossary_from_chapter(
@@ -1417,8 +1795,8 @@ def update_glossary_from_chapter(
         else:
             updates = _extract_glossary_updates(config, provider, source_text, translated_text)
         if updates:
-            merged, added = _merge_glossary_file(config, updates)
-            LOGGER.info("Updated glossary | added=%s total=%s", added, len(merged))
+            merged, added = _merge_auto_glossary_file(config, updates)
+            LOGGER.info("Updated auto glossary candidates | added=%s curated_total=%s", added, len(merged))
         if marker_path is not None:
             _write_glossary_marker(marker_path, status=GLOSSARY_STATUS_DONE, last_error="")
     except Exception as exc:
@@ -1727,7 +2105,9 @@ def _generate_translation_chunk(
     primary_prompt = (
         f"{translation_cfg.base_rules}\n"
         f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
-        "Hãy tự kiểm tra và sửa ngay trong một lần trả lời trước khi xuất kết quả cuối cùng.\n\n"
+        "Hãy tự kiểm tra và sửa ngay trong một lần trả lời trước khi xuất kết quả cuối cùng. "
+        "Tuyệt đối không để xuất hiện kiểu phiên âm máy/pinyin lẫn vào tiếng Việt như "
+        "'tha', 'ngã', 'nhĩ', 'liễu', 'thập ma', 'chẩm hội'.\n\n"
         f"Dịch đoạn sau sang tiếng Việt:\n{chunk.replace(chr(10), f' {translation_cfg.line_token} ')}"
     )
     try:
@@ -1773,7 +2153,12 @@ def _generate_translation_chunk(
                 "Chỉ trả về bản dịch.\n\n"
                 f"{segment.replace(chr(10), f' {translation_cfg.line_token} ')}"
             )
-            outputs.append(_generate_once(provider, model, softened_prompt))
+            try:
+                outputs.append(_generate_once(provider, model, softened_prompt))
+            except PromptBlockedError as exc2:
+                raise InputTranslationError(
+                    f"Provider blocked segment after prompt fallback: reason={exc2.reason}"
+                ) from exc2
     return "".join(outputs)
 
 
@@ -1812,7 +2197,12 @@ def patch_remaining_han(config: NovelConfig, provider, model: str, text: str, ma
             "Chỉ trả về đúng một dòng đã dịch.\n\n"
             f"{line}"
         )
-        fixed = _generate_once(provider, model, prompt)
+        try:
+            fixed = _generate_once(provider, model, prompt)
+        except PromptBlockedError as exc:
+            raise InputTranslationError(
+                f"Provider blocked Han-repair line after prompt fallback: reason={exc.reason}"
+            ) from exc
         fixed = apply_rule_based_han_fixes(fixed.strip(), translation_cfg.han_fallback_replacements)
         lines[idx] = strip_small_han_residue(fixed)
     return "\n".join(lines)
@@ -1846,7 +2236,12 @@ def aggressive_repair_han(config: NovelConfig, provider, model: str, text: str, 
                 "Chỉ trả về đúng đoạn đã sửa.\n\n"
                 f"{segment}"
             )
-            fixed = _generate_once(provider, model, prompt).strip()
+            try:
+                fixed = _generate_once(provider, model, prompt).strip()
+            except PromptBlockedError as exc:
+                raise InputTranslationError(
+                    f"Provider blocked aggressive Han repair after prompt fallback: reason={exc.reason}"
+                ) from exc
             fixed = apply_rule_based_han_fixes(fixed, translation_cfg.han_fallback_replacements)
             fixed = strip_small_han_residue(fixed)
             if has_han(fixed) and count_han_chars(fixed) <= 6:
@@ -1933,50 +2328,71 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
             },
         )
         LOGGER.info(
-            "Saved placeholder snapshot | unit=%s replacements=%s",
+            "Saved fresh placeholder snapshot | unit=%s replacements=%s",
             unit_key,
             len(replacements),
         )
     effective_chunk_max_len = _effective_chunk_max_len(config, translate_model)
     chunks = split_chunks(masked, effective_chunk_max_len)
-    translate_fingerprint = _hash_text(
-        f"{raw_sha1}\n{effective_chunk_max_len}\n{len(masked)}\n{len(mapping)}\n{translate_model}"
-    )[:12]
-    translate_progress_key = f"translate_{translate_fingerprint}__{unit_key}"
-    translated_chunks = load_progress(config, translate_progress_key)
-    if translated_chunks:
+    translated_stage = _load_translated_stage(config, unit_key)
+    stage_sha1 = str(translated_stage.get("raw_sha1") or "").strip() if isinstance(translated_stage, dict) else ""
+    stage_chunks = translated_stage.get("chunks") if isinstance(translated_stage, dict) else None
+    translated_chunks: list[str]
+    translate_progress_key = ""
+    if stage_sha1 == raw_sha1 and isinstance(stage_chunks, list) and stage_chunks:
+        translated_chunks = [str(chunk) for chunk in stage_chunks]
         LOGGER.info(
-            "Loaded translate progress | unit=%s chunks=%s/%s chunk_max_len=%s",
+            "Loaded completed translate stage | unit=%s chunks=%s cached_model=%s",
             unit_key,
             len(translated_chunks),
-            len(chunks),
-            effective_chunk_max_len,
+            str(translated_stage.get("translate_model") or "").strip() or "unknown",
         )
-    LOGGER.info("QUEUE_PHASE translate | unit=%s model=%s", unit_key, translate_model or "unknown")
-    for idx, chunk in enumerate(chunks[len(translated_chunks):], len(translated_chunks) + 1):
-        LOGGER.info("Translating %s chunk %s/%s", unit_key, idx, len(chunks))
-        started = time.perf_counter()
-        glossary_text = _glossary_text_for_text(mapping, chunk, max_chars=effective_chunk_max_len)
-        result = _generate_translation_chunk(
-            provider,
-            translation_cfg,
-            translate_model,
-            glossary_text,
-            chunk,
-            chunk_max_len=effective_chunk_max_len,
-        )
-        elapsed = time.perf_counter() - started
-        LOGGER.info(
-            "Translated %s chunk %s/%s in %.1fs (chars=%s)",
+    else:
+        translate_fingerprint = _hash_text(
+            f"{raw_sha1}\n{effective_chunk_max_len}\n{len(masked)}\n{len(mapping)}\n{translate_model}"
+        )[:12]
+        translate_progress_key = f"translate_{translate_fingerprint}__{unit_key}"
+        translated_chunks = load_progress(config, translate_progress_key)
+        if translated_chunks:
+            LOGGER.info(
+                "Loaded translate progress | unit=%s chunks=%s/%s chunk_max_len=%s",
+                unit_key,
+                len(translated_chunks),
+                len(chunks),
+                effective_chunk_max_len,
+            )
+        LOGGER.info("QUEUE_PHASE translate | unit=%s model=%s", unit_key, translate_model or "unknown")
+        for idx, chunk in enumerate(chunks[len(translated_chunks):], len(translated_chunks) + 1):
+            LOGGER.info("Translating %s chunk %s/%s", unit_key, idx, len(chunks))
+            started = time.perf_counter()
+            glossary_text = _glossary_text_for_text(mapping, chunk, max_chars=effective_chunk_max_len)
+            result = _generate_translation_chunk(
+                provider,
+                translation_cfg,
+                translate_model,
+                glossary_text,
+                chunk,
+                chunk_max_len=effective_chunk_max_len,
+            )
+            elapsed = time.perf_counter() - started
+            LOGGER.info(
+                "Translated %s chunk %s/%s in %.1fs (chars=%s)",
+                unit_key,
+                idx,
+                len(chunks),
+                elapsed,
+                len(chunk),
+            )
+            translated_chunks.append(result.replace(translation_cfg.line_token, "\n"))
+            save_progress(config, translate_progress_key, translated_chunks)
+            time.sleep(_effective_chunk_sleep_seconds(config, translate_model))
+        _save_translated_stage(
+            config,
             unit_key,
-            idx,
-            len(chunks),
-            elapsed,
-            len(chunk),
+            raw_sha1=raw_sha1,
+            translate_model=translate_model,
+            chunks=translated_chunks,
         )
-        translated_chunks.append(result.replace(translation_cfg.line_token, "\n"))
-        save_progress(config, translate_progress_key, translated_chunks)
-        time.sleep(_effective_chunk_sleep_seconds(config, translate_model))
     LOGGER.info("QUEUE_PHASE repair | unit=%s model=%s", unit_key, (repair_model or "unknown"))
     merged = restore_placeholders("".join(translated_chunks), mapping)
     # If any placeholder-like tokens survive restoration, they are either hallucinated tokens or stale progress.
@@ -2002,6 +2418,29 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
 
     merged = post_process(merged, translation_cfg.post_replacements)
     merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+    romanized_hits = find_romanized_artifacts(merged)
+    if romanized_hits:
+        LOGGER.info(
+            "Romanized artifacts detected; repairing against source | unit=%s examples=%s",
+            unit_key,
+            ", ".join(romanized_hits[:8]),
+        )
+        started = time.perf_counter()
+        merged = repair_against_source_chunked(
+            config,
+            provider,
+            repair_model,
+            unit_key=unit_key,
+            source_text=raw_text,
+            translated_text=merged,
+        )
+        LOGGER.info(
+            "repair_against_source (romanized-artifacts) done in %.1fs | unit=%s",
+            time.perf_counter() - started,
+            unit_key,
+        )
+        merged = post_process(merged, translation_cfg.post_replacements)
+        merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
     if has_han(merged) and count_han_chars(merged) > 12:
         LOGGER.info("Han residue detected; running final_cleanup | unit=%s count=%s", unit_key, count_han_chars(merged))
         try:
@@ -2083,7 +2522,7 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
             merged = strip_all_remaining_han(merged)
             merged = post_process(merged, translation_cfg.post_replacements)
         else:
-            raise RuntimeError(f"Still contains Han characters after cleanup: {unit_key}")
+            raise InputTranslationError(f"Still contains Han characters after cleanup: {unit_key}")
 
     # Final safety: some repair stages call the model on already-restored text and may re-emit placeholder tokens.
     # Always attempt restoration one last time before writing chapter parts.
@@ -2122,14 +2561,69 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
                 len(remaining),
                 ", ".join(remaining[:8]),
             )
-    clear_progress(config, translate_progress_key)
+    remaining_romanized = find_romanized_artifacts(merged)
+    if remaining_romanized:
+        raise InputTranslationError(
+            f"Romanized translation artifacts detected after cleanup: {unit_key} examples={', '.join(remaining_romanized[:8])}"
+        )
+    blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
+    if blocked_targets:
+        LOGGER.warning(
+            "Blocked glossary targets detected after cleanup; repairing against source | unit=%s examples=%s",
+            unit_key,
+            ", ".join(blocked_targets[:8]),
+        )
+        merged = repair_against_source_chunked(
+            config,
+            provider,
+            repair_model,
+            unit_key=unit_key,
+            source_text=raw_text,
+            translated_text=merged,
+            force_repair_without_han=True,
+            forbidden_terms=blocked_targets,
+        )
+        merged = post_process(merged, translation_cfg.post_replacements)
+        merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+        blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
+        if blocked_targets:
+            fallback_repair_model = _alternate_repair_model(config, repair_model)
+            if fallback_repair_model:
+                LOGGER.warning(
+                    "Blocked glossary targets persisted after repair with %s; retrying with %s | unit=%s examples=%s",
+                    repair_model,
+                    fallback_repair_model,
+                    unit_key,
+                    ", ".join(blocked_targets[:8]),
+                )
+                merged = repair_against_source_chunked(
+                    config,
+                    provider,
+                    fallback_repair_model,
+                    unit_key=unit_key,
+                    source_text=raw_text,
+                    translated_text=merged,
+                    force_repair_without_han=True,
+                    forbidden_terms=blocked_targets,
+                )
+                merged = post_process(merged, translation_cfg.post_replacements)
+                merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+                blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
+        if blocked_targets:
+            raise InputTranslationError(
+                f"Blocked glossary targets detected after cleanup: {unit_key} examples={', '.join(blocked_targets[:8])}"
+            )
+    if translate_progress_key:
+        clear_progress(config, translate_progress_key)
+    _clear_translated_stage(config, unit_key)
+    _clear_placeholders_snapshot(config, unit_key)
     return merged
 
 
 def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, force: bool = False) -> Path:
     chapter_map = load_chapter_map(config, source_path)
     if chapter_num not in chapter_map:
-        raise ValueError(f"Chapter {chapter_num} not found in {source_path.name}")
+        raise InputTranslationError(f"Chapter {chapter_num} not found in {source_path.name}")
     part_path = chapter_part_path(config, source_path, chapter_num)
     marker_path = glossary_marker_path(config, source_path, chapter_num)
     pending_glossary = is_glossary_pending(config, source_path, chapter_num)
@@ -2153,6 +2647,7 @@ def translate_chapter(config: NovelConfig, source_path: Path, chapter_num: str, 
     if force:
         clear_progress(config, unit_key)
         _clear_repair_progress_prefix(config, "translate", unit_key)
+        _clear_translated_stage(config, unit_key)
         _clear_placeholders_snapshot(config, unit_key)
         # Also clear repair-stage progress so we don't mix old windows with new masking.
         _clear_repair_progress_prefix(config, "repair_placeholders", unit_key)

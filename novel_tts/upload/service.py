@@ -17,6 +17,7 @@ LOGGER = get_logger(__name__)
 
 YOUTUBE_BULK_UPDATE_BATCH_SIZE = 5
 YOUTUBE_BULK_UPDATE_SLEEP_SECONDS = 2.0
+YOUTUBE_PLAYLIST_REORDER_SLEEP_SECONDS = 1.0
 YOUTUBE_RATE_LIMIT_REASONS = {
     "rateLimitExceeded",
     "uploadRateLimitExceeded",
@@ -767,6 +768,28 @@ def _list_playlist_videos(youtube, playlist_id: str) -> list[dict[str, object]]:
     ]
 
 
+def _delete_youtube_video(youtube, video_id: str, cfg) -> None:
+    normalized_id = str(video_id or "").strip()
+    if not normalized_id:
+        raise ValueError("Video id is empty")
+    _execute_youtube_request(
+        youtube.videos().delete(id=normalized_id),
+        cfg,
+        operation_name=f"videos.delete {normalized_id}",
+    )
+
+
+def _delete_playlist_item(youtube, playlist_item_id: str, cfg) -> None:
+    normalized_id = str(playlist_item_id or "").strip()
+    if not normalized_id:
+        raise ValueError("Playlist item id is empty")
+    _execute_youtube_request(
+        youtube.playlistItems().delete(id=normalized_id),
+        cfg,
+        operation_name=f"playlistItems.delete {normalized_id}",
+    )
+
+
 def _find_playlist_video_by_title(youtube, playlist_id: str, title: str) -> dict[str, object] | None:
     title_key = _normalize_title(title)
     if not title_key:
@@ -775,6 +798,27 @@ def _find_playlist_video_by_title(youtube, playlist_id: str, title: str) -> dict
         if _normalize_title(str(video.get("title", ""))) == title_key:
             return video
     return None
+
+
+def _update_playlist_item_position(youtube, playlist_id: str, playlist_item_id: str, video_id: str, position: int, cfg):
+    return _execute_youtube_request(
+        youtube.playlistItems().update(
+            part="snippet",
+            body={
+                "id": playlist_item_id,
+                "snippet": {
+                    "playlistId": playlist_id,
+                    "resourceId": {
+                        "kind": "youtube#video",
+                        "videoId": video_id,
+                    },
+                    "position": int(position),
+                },
+            },
+        ),
+        cfg,
+        operation_name=f"playlistItems.update {video_id}",
+    )
 
 
 def list_youtube_videos() -> list[dict[str, object]]:
@@ -1028,6 +1072,292 @@ def update_uploaded_youtube_playlist_index_descriptions(
         _selected_youtube_accounts_from_defaults(),
         None,
         operation_name="videos.bulk-update-description",
+        action=_action,
+    )
+
+
+def update_uploaded_youtube_playlist_positions(
+    config: NovelConfig,
+    *,
+    log_summary: bool = True,
+) -> list[dict[str, object]]:
+    cfg = config.upload.youtube
+    accounts = _select_youtube_accounts(_youtube_accounts_from_config(config), project_selector=cfg.project)
+
+    def _action(youtube, _account: YouTubeAccountPaths) -> list[dict[str, object]]:
+        playlist_id = _read_playlist_id(config)
+        LOGGER.warning(
+            "YouTube API does not expose playlist sort mode. If playlist %s is using an auto-sort mode "
+            "(for example Older first), switch it to Manual in the YouTube UI before running reorder.",
+            playlist_id,
+        )
+        current_videos = _list_playlist_videos(youtube, playlist_id)
+        if not current_videos:
+            if log_summary:
+                LOGGER.info("Playlist %s has no uploaded videos to reorder", playlist_id)
+            return []
+
+        initial_positions: dict[str, int] = {}
+        playlist_item_by_video_id: dict[str, str] = {}
+        title_by_video_id: dict[str, str] = {}
+        episode_by_video_id: dict[str, int | None] = {}
+        sortable_videos: list[dict[str, object]] = []
+        for index, video in enumerate(current_videos):
+            video_id = str(video.get("id", "")).strip()
+            if not video_id:
+                continue
+            playlist_item_id = str(video.get("playlist_item_id", "")).strip()
+            title = str(video.get("title", "") or "")
+            current_position = video.get("playlist_position")
+            try:
+                normalized_position = int(current_position) if current_position is not None else index
+            except Exception:
+                normalized_position = index
+            episode = _extract_episode_number(title)
+            initial_positions[video_id] = normalized_position
+            if playlist_item_id:
+                playlist_item_by_video_id[video_id] = playlist_item_id
+            title_by_video_id[video_id] = title
+            episode_by_video_id[video_id] = episode
+            sortable_videos.append(
+                {
+                    "video_id": video_id,
+                    "episode": episode,
+                    "current_position": normalized_position,
+                    "original_index": index,
+                }
+            )
+
+        sortable_videos.sort(
+            key=lambda item: (
+                item["episode"] is None,
+                item["episode"] if item["episode"] is not None else 10**12,
+                item["current_position"],
+                item["original_index"],
+            )
+        )
+
+        matched_count = sum(1 for item in sortable_videos if item["episode"] is not None)
+        desired_order = [str(item["video_id"]) for item in sortable_videos]
+
+        move_count = 0
+        for desired_position, target_video_id in enumerate(desired_order):
+            if desired_position >= len(current_videos):
+                break
+            current_video = current_videos[desired_position]
+            current_video_id = str(current_video.get("id", "")).strip()
+            if current_video_id == target_video_id:
+                continue
+
+            playlist_item_id = playlist_item_by_video_id.get(target_video_id, "")
+            if not playlist_item_id:
+                LOGGER.warning(
+                    "Skipping playlist reorder for video %s because playlist_item_id is missing",
+                    target_video_id,
+                )
+                continue
+
+            _update_playlist_item_position(
+                youtube,
+                playlist_id,
+                playlist_item_id,
+                target_video_id,
+                desired_position,
+                cfg,
+            )
+            move_count += 1
+
+            if YOUTUBE_PLAYLIST_REORDER_SLEEP_SECONDS > 0:
+                LOGGER.info(
+                    "YouTube playlist reorder cooldown: sleeping %.1fs after move %s",
+                    YOUTUBE_PLAYLIST_REORDER_SLEEP_SECONDS,
+                    move_count,
+                )
+                time.sleep(YOUTUBE_PLAYLIST_REORDER_SLEEP_SECONDS)
+
+            # Reload after each move because YouTube reindexes adjacent items automatically.
+            current_videos = _list_playlist_videos(youtube, playlist_id)
+            playlist_item_by_video_id = {
+                str(video.get("id", "")).strip(): str(video.get("playlist_item_id", "")).strip()
+                for video in current_videos
+                if str(video.get("id", "")).strip()
+            }
+
+        final_videos = _list_playlist_videos(youtube, playlist_id)
+        final_positions: dict[str, int] = {}
+        final_playlist_item_by_video_id: dict[str, str] = {}
+        for index, video in enumerate(final_videos):
+            video_id = str(video.get("id", "")).strip()
+            if not video_id:
+                continue
+            position = video.get("playlist_position")
+            try:
+                final_positions[video_id] = int(position) if position is not None else index
+            except Exception:
+                final_positions[video_id] = index
+            final_playlist_item_by_video_id[video_id] = str(video.get("playlist_item_id", "")).strip()
+
+        results: list[dict[str, object]] = []
+        updated_count = 0
+        unchanged_count = 0
+        skipped_count = 0
+        for desired_position, target_video_id in enumerate(desired_order):
+            title = title_by_video_id.get(target_video_id, "")
+            episode = episode_by_video_id.get(target_video_id)
+            old_position = initial_positions.get(target_video_id)
+            new_position = final_positions.get(target_video_id)
+            playlist_item_id = final_playlist_item_by_video_id.get(target_video_id, "")
+
+            if not playlist_item_id:
+                results.append(
+                    {
+                        "title": title,
+                        "video_id": target_video_id,
+                        "episode": episode,
+                        "old_position": old_position,
+                        "new_position": new_position,
+                        "desired_position": desired_position,
+                        "status": "skipped",
+                        "reason": "missing_playlist_item_id",
+                    }
+                )
+                skipped_count += 1
+                continue
+
+            status = "updated" if old_position != new_position else "unchanged"
+            if status == "updated":
+                updated_count += 1
+            else:
+                unchanged_count += 1
+            results.append(
+                {
+                    "title": title,
+                    "video_id": target_video_id,
+                    "episode": episode,
+                    "old_position": old_position,
+                    "new_position": new_position,
+                    "desired_position": desired_position,
+                    "status": status,
+                }
+            )
+
+        if log_summary:
+            LOGGER.info("Playlist %s uploaded video count: %s", playlist_id, len(final_videos))
+            LOGGER.info("Playlist %s videos with detected tap number: %s", playlist_id, matched_count)
+            LOGGER.info("Playlist %s correct position count: %s", playlist_id, unchanged_count)
+            LOGGER.info("Playlist %s updated position count: %s", playlist_id, updated_count)
+            LOGGER.info("Playlist %s skipped position count: %s", playlist_id, skipped_count)
+        return results
+
+    return _run_with_youtube_accounts(
+        accounts,
+        cfg,
+        operation_name="playlistItems.bulk-update-position",
+        action=_action,
+    )
+
+
+def remove_duplicated_uploaded_youtube_videos(
+    config: NovelConfig,
+    *,
+    execute: bool = True,
+    log_summary: bool = True,
+) -> list[dict[str, object]]:
+    cfg = config.upload.youtube
+    accounts = _select_youtube_accounts(_youtube_accounts_from_config(config), project_selector=cfg.project)
+
+    def _action(youtube, _account: YouTubeAccountPaths) -> list[dict[str, object]]:
+        playlist_id = _read_playlist_id(config)
+        current_videos = _list_playlist_videos(youtube, playlist_id)
+        groups: dict[str, list[dict[str, object]]] = {}
+        for video in current_videos:
+            title_key = _normalize_title(str(video.get("title", "")))
+            if not title_key:
+                continue
+            groups.setdefault(title_key, []).append(video)
+
+        results: list[dict[str, object]] = []
+        duplicate_group_count = 0
+        delete_count = 0
+        kept_count = 0
+
+        def _video_sort_key(video: dict[str, object]) -> tuple[str, str]:
+            return (
+                str(video.get("published_at", "") or ""),
+                str(video.get("id", "") or ""),
+            )
+
+        for videos in groups.values():
+            if len(videos) <= 1:
+                continue
+            duplicate_group_count += 1
+            ordered_videos = sorted(videos, key=_video_sort_key)
+            kept_video = ordered_videos[-1]
+            kept_video_id = str(kept_video.get("id", "")).strip()
+            kept_title = str(kept_video.get("title", "") or "")
+            kept_published_at = str(kept_video.get("published_at", "") or "")
+
+            results.append(
+                {
+                    "title": kept_title,
+                    "video_id": kept_video_id,
+                    "published_at": kept_published_at,
+                    "status": "kept" if execute else "would_keep",
+                    "reason": "latest_upload",
+                    "playlist_id": playlist_id,
+                }
+            )
+            kept_count += 1
+
+            for video in ordered_videos[:-1]:
+                video_id = str(video.get("id", "")).strip()
+                playlist_item_id = str(video.get("playlist_item_id", "")).strip()
+                if not video_id:
+                    results.append(
+                        {
+                            "title": kept_title,
+                            "video_id": "",
+                            "published_at": str(video.get("published_at", "") or ""),
+                            "status": "skipped",
+                            "reason": "missing_video_id",
+                            "playlist_id": playlist_id,
+                        }
+                    )
+                    continue
+                if execute:
+                    if playlist_item_id:
+                        _delete_playlist_item(youtube, playlist_item_id, cfg)
+                    _delete_youtube_video(youtube, video_id, cfg)
+                results.append(
+                    {
+                        "title": str(video.get("title", "") or ""),
+                        "video_id": video_id,
+                        "playlist_item_id": playlist_item_id,
+                        "published_at": str(video.get("published_at", "") or ""),
+                        "status": "deleted" if execute else "would_delete",
+                        "reason": "older_duplicate",
+                        "kept_video_id": kept_video_id,
+                        "playlist_id": playlist_id,
+                    }
+                )
+                delete_count += 1
+
+        if log_summary:
+            LOGGER.info("Playlist %s uploaded video count: %s", playlist_id, len(current_videos))
+            LOGGER.info("Playlist %s duplicate title groups: %s", playlist_id, duplicate_group_count)
+            LOGGER.info("Playlist %s kept latest duplicate videos: %s", playlist_id, kept_count)
+            LOGGER.info(
+                "Playlist %s %s older duplicate videos: %s",
+                playlist_id,
+                "deleted" if execute else "would delete",
+                delete_count,
+            )
+        return results
+
+    return _run_with_youtube_accounts(
+        accounts,
+        cfg,
+        operation_name="videos.bulk-delete-duplicates",
         action=_action,
     )
 

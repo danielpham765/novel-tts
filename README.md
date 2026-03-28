@@ -525,6 +525,7 @@ Default audience/visibility:
 uv run novel-tts upload <novel_id> --platform youtube --range 1-10
 uv run novel-tts upload <novel_id> --platform youtube --range 1-10 --dry-run
 uv run novel-tts upload <novel_id> --platform tiktok --range 1-10
+uv run novel-tts upload <novel_id> --platform youtube --remove-duplicated
 ```
 
 YouTube upload pacing can be tuned with:
@@ -606,6 +607,12 @@ uv run novel-tts youtube video update --id xxxxxxxx
 # Rewrite playlist links in uploaded video descriptions
 uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index
 uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index --range 1-150
+
+# Reorder videos inside the configured playlist by episode number in title
+uv run novel-tts upload <novel_id> --platform youtube --update-playlist-position
+
+# Remove duplicated videos in the configured playlist, keeping the latest uploaded copy per title
+uv run novel-tts upload <novel_id> --platform youtube --remove-duplicated
 ```
 
 ### Pipeline
@@ -619,6 +626,7 @@ Use:
 - `--skip-upload` to disable upload
 - `--upload-platform` to override platform
 - `--from-stage` / `--to-stage` to run only a contiguous slice of stages
+- `--force` to force supported stages to rerun existing work
 
 ```bash
 uv run novel-tts pipeline run <novel_id> --range 1-10
@@ -628,6 +636,7 @@ uv run novel-tts pipeline run <novel_id> --range 1-10 --upload-platform tiktok
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-translate --skip-tts
 uv run novel-tts pipeline run <novel_id> --range 1-10 --from-stage tts
 uv run novel-tts pipeline run <novel_id> --range 1-10 --from-stage translate --to-stage video
+uv run novel-tts pipeline run <novel_id> --range 1-10 --force
 ```
 
 `pipeline watch` is continuous orchestration for ongoing serialized novels:

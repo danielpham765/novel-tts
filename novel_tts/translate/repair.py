@@ -11,12 +11,14 @@ from novel_tts.translate.novel import (
     chapter_part_path,
     chapter_source_changed,
     count_han_chars,
+    find_blocked_glossary_targets,
+    find_romanized_artifacts,
     has_han,
     load_source_chapters,
 )
 
 LOGGER = get_logger(__name__)
-CHAPTER_HEADING_RE = re.compile(r"(?m)^Chương\s+(\d+):")
+CHAPTER_HEADING_RE = re.compile(r"(?m)^Chương\s+(\d+)(?::\s+.*)?$")
 
 
 def _count_duplicate_paragraphs(text: str, *, min_len: int = 120) -> int:
@@ -50,6 +52,25 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def _source_path_for_job(config: NovelConfig, job: RepairJob) -> Path:
+    return config.storage.origin_dir / job.file_name
+
+
+def _delete_repair_parts(config: NovelConfig, jobs: list[RepairJob]) -> int:
+    deleted = 0
+    for job in jobs:
+        source_path = _source_path_for_job(config, job)
+        part_path = chapter_part_path(config, source_path, str(job.chapter_num))
+        if not part_path.exists():
+            continue
+        try:
+            part_path.unlink()
+            deleted += 1
+        except Exception as exc:
+            LOGGER.warning("Unable to delete repair part %s: %s", part_path, exc)
+    return deleted
 
 
 def find_repair_jobs_in_range(config: NovelConfig, start: int, end: int) -> list[RepairJob]:
@@ -87,6 +108,12 @@ def find_repair_jobs_in_range(config: NovelConfig, start: int, end: int) -> list
                     reasons.append("empty-part")
                 if PLACEHOLDER_TOKEN_RE.search(text):
                     reasons.append("placeholder-token")
+                blocked_targets = find_blocked_glossary_targets(config, text)
+                if blocked_targets:
+                    reasons.append(f"blocked-glossary-targets:{len(blocked_targets)}")
+                romanized = find_romanized_artifacts(text)
+                if romanized:
+                    reasons.append(f"romanized-artifacts:{len(romanized)}")
                 if has_han(text):
                     # Even a few Han chars means the translation is incomplete or has residue.
                     reasons.append(f"han-residue:{count_han_chars(text)}")
@@ -139,6 +166,12 @@ def find_repair_jobs_all(config: NovelConfig) -> list[RepairJob]:
                     reasons.append("empty-part")
                 if PLACEHOLDER_TOKEN_RE.search(text):
                     reasons.append("placeholder-token")
+                blocked_targets = find_blocked_glossary_targets(config, text)
+                if blocked_targets:
+                    reasons.append(f"blocked-glossary-targets:{len(blocked_targets)}")
+                romanized = find_romanized_artifacts(text)
+                if romanized:
+                    reasons.append(f"romanized-artifacts:{len(romanized)}")
                 if has_han(text):
                     reasons.append(f"han-residue:{count_han_chars(text)}")
                 heading_count = len(CHAPTER_HEADING_RE.findall(text))
@@ -167,6 +200,10 @@ def enqueue_repair_jobs(config: NovelConfig, jobs: list[RepairJob], *, label: st
 
     # Import locally to avoid import cycles at module import time.
     from novel_tts.queue.translation_queue import add_job_ids_to_queue
+
+    deleted_parts = _delete_repair_parts(config, jobs)
+    if deleted_parts:
+        LOGGER.info("Deleted %s broken part(s) before enqueueing repair jobs", deleted_parts)
 
     job_ids = [job.job_id for job in jobs]
     return add_job_ids_to_queue(config, job_ids, force=True, label=label)

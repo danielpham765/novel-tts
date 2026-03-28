@@ -103,6 +103,7 @@ class TranslationConfig:
     chapter_regex: str
     base_rules: str
     glossary: dict[str, str] = field(default_factory=dict)
+    blocked_glossary_targets: list[str] = field(default_factory=list)
     polish_replacements: dict[str, str] = field(default_factory=dict)
     post_replacements: dict[str, str] = field(default_factory=dict)
     han_fallback_replacements: dict[str, str] = field(default_factory=dict)

@@ -394,11 +394,59 @@ def _force_fold_heading_from_next_line(text: str, chapter_num: str) -> str:
     return folded
 
 
-def _rebalance_paragraph(line: str, max_len: int = 360) -> list[str]:
+def _split_sentence_units(line: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    idx = 0
+    length = len(line)
+    while idx < length:
+        if not line[idx].isspace():
+            idx += 1
+            continue
+        end_ws = idx
+        while end_ws < length and line[end_ws].isspace():
+            end_ws += 1
+        prev_idx = idx - 1
+        next_idx = end_ws
+        if prev_idx < 0 or next_idx >= length:
+            idx = end_ws
+            continue
+
+        prev_char = line[prev_idx]
+        prev_prev_char = line[prev_idx - 1] if prev_idx >= 1 else ""
+        next_char = line[next_idx]
+        sentence_end = prev_char in ".!?…" or (
+            prev_char in {'"', "”"} and prev_prev_char in ".!?…"
+        )
+        next_is_boundary = next_char in {'"', "“"} or next_char.isupper()
+        if sentence_end and next_is_boundary:
+            chunk = line[start:idx].strip()
+            if chunk:
+                parts.append(chunk)
+            start = end_ws
+        idx = end_ws
+    tail = line[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts or [line.strip()]
+
+
+def _split_multi_turn_dialogue_line(line: str) -> list[str]:
+    sentences = _split_sentence_units(line)
+    if len(sentences) <= 1:
+        return [line.strip()]
+    if line.count(": “") < 2 and line.count(': "') < 2:
+        return sentences
+    return sentences
+
+
+def _rebalance_paragraph(line: str, max_len: int = 220) -> list[str]:
     line = line.strip()
-    if len(line) <= max_len:
+    sentence_units = _split_multi_turn_dialogue_line(line)
+    force_split = len(line) > max_len or len(sentence_units) > 1 and line.count("“") >= 2 and line.count(":") >= 2
+    if len(line) <= max_len and not force_split:
         return [line]
-    sentences = re.split(r'(?<=[.!?…])\s+(?=[“"A-ZÀ-Ỵ])', line)
+    sentences = sentence_units
     if len(sentences) == 1:
         sentences = re.split(r'(?=\s*[“"])|(?<=[:;])\s+', line)
     chunks: list[str] = []
@@ -450,18 +498,44 @@ def _merge_broken_paragraphs(lines: list[str]) -> list[str]:
             merged.append(line)
             continue
         prev = merged[-1]
+        starts_lowercase = bool(line[:1]) and line[:1].islower()
         if re.fullmatch(r"Chương\s+\d+(?::\s+.+)?", prev):
             merged.append(line)
             continue
         if (
             prev.endswith((":", ",", "“", "(", "-", "…"))
-            or re.match(r"^[a-zà-ỹ]", line)
+            or starts_lowercase
             or (len(line) < 70 and not re.match(r"^[“\"A-ZÀ-Ỵ]", line))
         ):
             merged[-1] = f"{prev} {line}"
         else:
             merged.append(line)
     return merged
+
+
+def _normalize_dialogue_quotes(text: str) -> str:
+    # Normalize curly/ASCII quote mismatches that frequently slip through translation output.
+    text = text.replace("”", '"')
+
+    # Dialogue lines should consistently use Vietnamese opening curly quotes.
+    text = re.sub(r'(?m)^([ \t]*)"', r"\1“", text)
+    text = re.sub(r'(?m)^([ \t]*)“\s+', r"\1“", text)
+
+    # Remove stray spaces before closing quotes and move punctuation inside the closing quote.
+    text = re.sub(r'\s+"', '"', text)
+    text = re.sub(r'([.!?…])\s*"', r'\1"', text)
+    text = re.sub(r'"([.!?…])', r'\1"', text)
+
+    # If text contains an opening dialogue quote and an ASCII quote later,
+    # treat that later quote as the closing quote for the same utterance.
+    text = re.sub(r'“([^”\n"]*?)"', r'“\1”', text)
+
+    # Convert narration-introduced dialogue from ASCII quotes to curly quotes.
+    text = re.sub(r'(:\s*)"([^"\n]+)"', r"\1“\2”", text)
+    text = re.sub(r'(:\s*)“([^”\n"]*?)"', r"\1“\2”", text)
+    text = re.sub(r":\s*“", r": “", text)
+
+    return text
 
 
 def normalize_text(
@@ -487,6 +561,7 @@ def normalize_text(
     text = re.sub(r'([.!?…])"([A-ZÀ-Ỵ])', r'\1"\n\n\2', text)
     text = re.sub(r'([.!?…])”([“"])', r'\1”\n\n\2', text)
     text = re.sub(r'([.!?…])"([“"])', r'\1"\n\n\2', text)
+    text = _normalize_dialogue_quotes(text)
     text = _split_glued_camelcase(text)
     text = _dedupe_immediate_repeats(text)
 

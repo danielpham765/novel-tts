@@ -34,6 +34,20 @@ def test_probe_gemini_429_false(monkeypatch) -> None:
     assert tq._probe_gemini_429(config=config, api_key="k", model="m", key_index=2) is False
 
 
+def test_probe_gemini_429_unknown_on_proxy_503(monkeypatch) -> None:
+    cfg = ProxyGatewayConfig(enabled=True, auto_discovery=False, base_url="http://gw", mode="direct", proxies=["cloud-node-1"])
+    config = SimpleNamespace(proxy_gateway=cfg, queue=SimpleNamespace(redis=RedisConfig()))
+    monkeypatch.setattr(tq.proxy_gateway_mod.requests, "post", lambda *args, **kwargs: _Resp(503))
+    assert tq._probe_gemini_429(config=config, api_key="k", model="m", key_index=2) is None
+
+
+def test_probe_gemini_429_unknown_on_proxy_403(monkeypatch) -> None:
+    cfg = ProxyGatewayConfig(enabled=True, auto_discovery=False, base_url="http://gw", mode="direct", proxies=["cloud-node-1"])
+    config = SimpleNamespace(proxy_gateway=cfg, queue=SimpleNamespace(redis=RedisConfig()))
+    monkeypatch.setattr(tq.proxy_gateway_mod.requests, "post", lambda *args, **kwargs: _Resp(403))
+    assert tq._probe_gemini_429(config=config, api_key="k", model="m", key_index=2) is None
+
+
 def test_probe_gemini_429_unknown_on_exception(monkeypatch) -> None:
     cfg = ProxyGatewayConfig(enabled=True, auto_discovery=False, base_url="http://gw", mode="direct", proxies=["cloud-node-1"])
     config = SimpleNamespace(proxy_gateway=cfg, queue=SimpleNamespace(redis=RedisConfig()))
