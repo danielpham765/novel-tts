@@ -215,6 +215,38 @@ def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[di
     return menu_path
 
 
+def regenerate_menu(config: NovelConfig, start: int, end: int, range_key: str | None = None) -> Path:
+    output_range_key = range_key or _range_key(start, end)
+    menu_path = config.storage.subtitle_dir / f"{output_range_key}_menu.txt"
+    if not menu_path.exists():
+        LOGGER.warning("TTS menu not found, skipping regeneration | path=%s", menu_path)
+        return menu_path
+
+    existing_lines = menu_path.read_text(encoding="utf-8").splitlines()
+    timestamps = [line.split(" ", 1)[0] for line in existing_lines if line.strip()]
+
+    source_path = _translated_text_path(config, start, end, range_key)
+    text = source_path.read_text(encoding="utf-8")
+    _, chapter_info = split_text_into_chunks(text)
+    chapter_info = [c for c in chapter_info if start <= int(c["number"]) <= end]
+
+    if len(timestamps) != len(chapter_info):
+        raise ValueError(
+            f"Menu has {len(timestamps)} entries but translated text has {len(chapter_info)} chapters in range {start}-{end}"
+        )
+
+    lines: list[str] = []
+    for ts, chapter in zip(timestamps, chapter_info):
+        label = f"Chương {chapter['number']}"
+        if chapter.get("title"):
+            label += f" - {chapter['title']}"
+        lines.append(f"{ts} {label}")
+
+    menu_path.write_text("\n".join(lines), encoding="utf-8")
+    LOGGER.info("TTS menu regenerated | path=%s entries=%s", menu_path, len(lines))
+    return menu_path
+
+
 def _remove_incomplete_merged_artifacts(output_dir: Path, parts_dir: Path, merged_path: Path) -> None:
     try:
         merged_path.unlink(missing_ok=True)

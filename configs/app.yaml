@@ -75,8 +75,8 @@ upload:
   default_platform: youtube
   youtube:
     enabled: true
-    # project: rotate
-    project: 1
+    project: rotate
+    # project: 1
     credentials_path:
       - .secrets/youtube/client_secrets-1.json
       - .secrets/youtube/client_secrets-2.json

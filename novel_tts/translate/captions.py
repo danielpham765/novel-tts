@@ -30,38 +30,6 @@ def collect_subtitle_text_line_indices(lines: list[str]) -> list[int]:
     return indices
 
 
-def _srt_time_to_menu_time(ts: str) -> str:
-    hh, mm, rest = ts.split(":")
-    ss = rest.split(",")[0]
-    if int(hh) > 0:
-        return f"{int(hh)}:{mm.zfill(2)}:{ss.zfill(2)}"
-    return f"{int(mm)}:{ss.zfill(2)}"
-
-
-def _write_chapter_menu_from_srt(config: NovelConfig, srt_lines: list[str], output_name: str) -> Path | None:
-    blocks = "\n".join(srt_lines).split("\n\n")
-    seen: set[str] = set()
-    items: list[str] = []
-    for block in blocks:
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if len(lines) < 3:
-            continue
-        time_line = next((line for line in lines if "-->" in line), "")
-        if not time_line:
-            continue
-        title_line = next((line for line in lines if re.match(r"^Chương\s+\d+", line, flags=re.I)), "")
-        if not title_line or title_line in seen:
-            continue
-        seen.add(title_line)
-        start = time_line.split("-->")[0].strip()
-        items.append(f"{_srt_time_to_menu_time(start)} - {title_line}")
-    if not items:
-        return None
-    config.storage.subtitle_dir.mkdir(parents=True, exist_ok=True)
-    menu_path = config.storage.subtitle_dir / f"{output_name}_menu.txt"
-    menu_path.write_text("\n".join(items), encoding="utf-8")
-    return menu_path
-
 
 def translate_captions(config: NovelConfig) -> Path:
     caption_cfg = config.captions
@@ -121,7 +89,6 @@ def translate_captions(config: NovelConfig) -> Path:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(eol.join(lines), encoding="utf-8")
-    _write_chapter_menu_from_srt(config, lines, output_path.stem)
     if config.translation.auto_update_glossary and not is_queue_worker_env():
         update_glossary_from_chapter(
             config,

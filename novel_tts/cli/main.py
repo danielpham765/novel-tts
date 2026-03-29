@@ -485,7 +485,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     tts_parser = subparsers.add_parser("tts")
     tts_parser.add_argument("novel_id")
-    tts_parser.add_argument("--range", required=True)
+    tts_parser.add_argument("--range")
     tts_parser.add_argument(
         "--tts-server-name",
         help="Override tts.server_name for this run only.",
@@ -498,6 +498,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Regenerate per-chapter audio even if cached (also refreshes cache when translated text changes).",
+    )
+    tts_parser.add_argument(
+        "--re-generate-menu",
+        action="store_true",
+        help="Keep timestamps from the existing menu file, replace chapter labels with current translated text.",
+    )
+    tts_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="With --re-generate-menu: regenerate every menu found in the subtitle directory.",
     )
 
     visual_parser = subparsers.add_parser("visual")
@@ -1399,16 +1409,39 @@ def main(argv: list[str] | None = None) -> int:
                 return requeue_untranslated_exhausted_jobs(config)
 
         if args.command == "tts":
-            from novel_tts.tts import run_tts
+            from novel_tts.tts import regenerate_menu, run_tts
 
             config = load_novel_config(args.novel_id)
             config = _apply_tts_cli_overrides(config, args)
+            re_gen_menu = getattr(args, "re_generate_menu", False)
+            all_ranges = getattr(args, "all", False)
+            if re_gen_menu and all_ranges:
+                menu_pattern = re.compile(r"^chuong_(\d+)-(\d+)_menu\.txt$")
+                subtitle_dir = config.storage.subtitle_dir
+                found = sorted(subtitle_dir.glob("*_menu.txt")) if subtitle_dir.exists() else []
+                if not found:
+                    LOGGER.warning("No menu files found in %s", subtitle_dir)
+                    return 0
+                for menu_file in found:
+                    m = menu_pattern.match(menu_file.name)
+                    if not m:
+                        continue
+                    c_start, c_end = int(m.group(1)), int(m.group(2))
+                    r_key = f"chuong_{c_start}-{c_end}"
+                    LOGGER.info("Menu regenerated: %s", regenerate_menu(config, c_start, c_end, range_key=r_key))
+                return 0
+            if not args.range:
+                tts_parser.error("--range is required unless --re-generate-menu --all is used")
             start, end = parse_range(args.range)
-            for c_start, c_end, r_key in get_translated_ranges(config, start, end):
-                LOGGER.info(
-                    "Merged audio: %s",
-                    run_tts(config, c_start, c_end, range_key=r_key, force=bool(getattr(args, "force", False))),
-                )
+            if re_gen_menu:
+                for c_start, c_end, r_key in get_translated_ranges(config, start, end):
+                    LOGGER.info("Menu regenerated: %s", regenerate_menu(config, c_start, c_end, range_key=r_key))
+            else:
+                for c_start, c_end, r_key in get_translated_ranges(config, start, end):
+                    LOGGER.info(
+                        "Merged audio: %s",
+                        run_tts(config, c_start, c_end, range_key=r_key, force=bool(getattr(args, "force", False))),
+                    )
             return 0
 
         if args.command == "visual":

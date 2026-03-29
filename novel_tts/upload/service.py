@@ -4,6 +4,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -189,12 +191,6 @@ class UploadSpec:
     playlist_id: str
 
 
-@dataclass
-class PlaylistIndexTarget:
-    range_key: str
-    title: str
-    playlist_id: str
-
 
 @dataclass(frozen=True)
 class YouTubeAccountPaths:
@@ -337,7 +333,7 @@ def get_youtube_quota_redis(*, session_slot: int) -> dict[str, object]:
     return payload
 
 
-def get_all_youtube_quota_redis(*, sync_missing: bool = True) -> dict[str, object]:
+def get_all_youtube_quota_redis() -> dict[str, object]:
     app_raw = _load_app_config()
     upload_raw = app_raw.get("upload", {}) or {}
     youtube_raw = upload_raw.get("youtube", {}) or {}
@@ -345,34 +341,45 @@ def get_all_youtube_quota_redis(*, sync_missing: bool = True) -> dict[str, objec
     results: list[dict[str, object]] = []
     for account in accounts:
         try:
-            payload = get_youtube_quota_redis(session_slot=account.index)
+            payload = _get_or_refresh_youtube_quota_for_slot(account.index)
+            payload = dict(payload)
             payload["label"] = account.label
-            results.append(payload)
-        except Exception:
-            if sync_missing:
-                try:
-                    payload = _get_or_refresh_youtube_quota_for_slot(account.index)
-                    payload = dict(payload)
-                    payload["label"] = account.label
-                    payload["session_slot"] = account.index
-                    payload["reset_policy"] = "midnight Pacific Time (PT)"
-                    results.append(payload)
-                    continue
-                except Exception as exc:
-                    LOGGER.warning(
-                        "Unable to auto-sync YouTube quota for slot %s while building Redis snapshot list: %s",
-                        account.index,
-                        exc,
-                    )
-            results.append(
-                {
-                    "session_slot": account.index,
-                    "label": account.label,
-                    "status": "missing",
-                    "estimated_uploads_remaining": 0,
-                    "reset_policy": "midnight Pacific Time (PT)",
-                }
+            payload["session_slot"] = account.index
+            payload["reset_policy"] = "midnight Pacific Time (PT)"
+            payload["estimated_uploads_remaining"] = (
+                int(int(payload.get("remaining", 0) or 0) // YOUTUBE_QUOTA_UPLOAD_COMMIT_COST)
+                if YOUTUBE_QUOTA_UPLOAD_COMMIT_COST > 0
+                else 0
             )
+            results.append(payload)
+        except Exception as exc:
+            LOGGER.error(
+                "Failed to refetch YouTube quota for slot %s: %s. Falling back to Redis cache.",
+                account.index,
+                exc,
+            )
+            cached = _read_cached_youtube_quota(account.index)
+            if cached is not None:
+                payload = dict(cached)
+                payload["label"] = account.label
+                payload["session_slot"] = account.index
+                payload["reset_policy"] = "midnight Pacific Time (PT)"
+                payload["estimated_uploads_remaining"] = (
+                    int(int(payload.get("remaining", 0) or 0) // YOUTUBE_QUOTA_UPLOAD_COMMIT_COST)
+                    if YOUTUBE_QUOTA_UPLOAD_COMMIT_COST > 0
+                    else 0
+                )
+                results.append(payload)
+            else:
+                results.append(
+                    {
+                        "session_slot": account.index,
+                        "label": account.label,
+                        "status": "missing",
+                        "estimated_uploads_remaining": 0,
+                        "reset_policy": "midnight Pacific Time (PT)",
+                    }
+                )
     total_estimated_uploads_remaining = sum(int(item.get("estimated_uploads_remaining", 0) or 0) for item in results)
     return {
         "projects": results,
@@ -561,6 +568,79 @@ def _extract_quota_summary(response_payload: object) -> dict[str, object]:
     }
 
 
+_CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+]
+
+
+def _find_chrome_binary() -> str | None:
+    for candidate in _CHROME_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def _ensure_chrome_debug_running(remote_debugging_url: str) -> subprocess.Popen | None:
+    """Start Chrome with remote debugging if nothing is listening on the debug port.
+
+    Returns the Popen handle if Chrome was launched (caller should terminate it),
+    or None if a browser was already running.
+    """
+    from urllib.parse import urlparse as _urlparse
+    from urllib.request import urlopen as _urlopen
+
+    parsed = _urlparse(remote_debugging_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 9222
+    probe_url = f"http://{host}:{port}/json/version"
+
+    try:
+        _urlopen(probe_url, timeout=2)
+        return None  # already running
+    except Exception:
+        pass
+
+    binary = _find_chrome_binary()
+    if not binary:
+        return None
+
+    user_data_dir = Path.home() / ".novel_tts_chrome_debug"
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        binary,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    LOGGER.info("Launching Chrome for remote debugging on port %s: %s", port, binary)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    # Wait until the debug endpoint is ready (up to 10 s)
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            _urlopen(probe_url, timeout=1)
+            LOGGER.info("Chrome remote debugging is ready on port %s", port)
+            return proc
+        except Exception:
+            time.sleep(0.5)
+    LOGGER.warning("Chrome launched but debug endpoint did not become ready within 10 s")
+    return proc
+
+
 def _capture_quota_request_from_browser(
     *,
     project_id: str,
@@ -576,6 +656,8 @@ def _capture_quota_request_from_browser(
 
     quota_url = YOUTUBE_QUOTA_CONSOLE_URL.format(project_id=project_id)
     captured: dict[str, object] = {}
+
+    chrome_proc = _ensure_chrome_debug_running(remote_debugging_url)
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(remote_debugging_url)
@@ -639,6 +721,11 @@ def _capture_quota_request_from_browser(
                 browser.close()
             except Exception:
                 pass
+            if chrome_proc is not None:
+                try:
+                    chrome_proc.terminate()
+                except Exception:
+                    pass
 
 
 def capture_youtube_quota_session(
@@ -762,6 +849,11 @@ def _get_youtube_quota_live(
     summary["project_id"] = str(session_payload.get("project_id", "")).strip()
     summary["captured_at"] = str(session_payload.get("captured_at", "")).strip()
     summary["session_slot"] = session_slot
+    # Replace {project} placeholder in the id field with actual project_id
+    if summary.get("project_id"):
+        id_str = str(summary.get("id", "")).strip()
+        summary["id"] = id_str.replace("{project}", summary["project_id"])
+        summary["usage_url"] = YOUTUBE_QUOTA_CONSOLE_URL.format(project_id=summary["project_id"])
     if session_slot is not None:
         _write_cached_youtube_quota(
             int(session_slot),
@@ -790,6 +882,11 @@ def get_youtube_quota(
         summary["project_id"] = str(summary.get("project_id", "") or "").strip()
         summary["captured_at"] = str(summary.get("captured_at", "") or "").strip()
         summary["used_cached_quota"] = True
+        # Replace {project} placeholder in the id field with actual project_id
+        if summary.get("project_id"):
+            id_str = str(summary.get("id", "")).strip()
+            summary["id"] = id_str.replace("{project}", summary["project_id"])
+            summary["usage_url"] = YOUTUBE_QUOTA_CONSOLE_URL.format(project_id=summary["project_id"])
     if raw:
         return {"summary": summary, "raw": payload}
     return summary
@@ -839,7 +936,12 @@ def _sync_or_estimate_after_spend(slot: int, *, spent_units: int, reason: str) -
     if int(slot or 0) <= 0:
         return None
     try:
-        return get_youtube_quota(session_slot=slot)
+        result = get_youtube_quota(session_slot=slot)
+        if result.get("used_cached_quota"):
+            # Live sync failed; get_youtube_quota returned stale cache without raising.
+            # Apply estimated spend so local Redis reflects the cost.
+            return _apply_estimated_quota_spend(slot, spent_units=spent_units, reason=reason)
+        return result
     except Exception:
         return _apply_estimated_quota_spend(slot, spent_units=spent_units, reason=reason)
 
@@ -1197,21 +1299,6 @@ def _build_upload_spec(config: NovelConfig, start: int, end: int, *, require_med
     )
 
 
-def _build_playlist_index_target(config: NovelConfig, start: int, end: int) -> PlaylistIndexTarget:
-    range_key = _range_key(start, end)
-    playlist_path = _resolve_output_file(
-        config,
-        config.upload.youtube.playlist_file,
-        field_name="upload.youtube.playlist_file",
-    )
-    title_raw = _read_title_template(config)
-    title = _resolve_title_with_index(title_raw, start, end)
-    playlist_raw = _read_required_text(playlist_path, field_name="playlist")
-    playlist_line = next((line.strip() for line in playlist_raw.splitlines() if line.strip()), "")
-    playlist_id = _parse_playlist_id(playlist_line or playlist_raw)
-    return PlaylistIndexTarget(range_key=range_key, title=title, playlist_id=playlist_id)
-
-
 def _read_playlist_id(config: NovelConfig) -> str:
     playlist_path = _resolve_output_file(
         config,
@@ -1223,41 +1310,110 @@ def _read_playlist_id(config: NovelConfig) -> str:
     return _parse_playlist_id(playlist_line or playlist_raw)
 
 
-def _iter_translated_playlist_index_targets(
-    config: NovelConfig,
-    *,
-    from_chapter: int | None = None,
-    to_chapter: int | None = None,
-) -> list[PlaylistIndexTarget]:
-    specs: list[PlaylistIndexTarget] = []
-    pattern = re.compile(r"^chuong_(\d+)-(\d+)\.txt$")
+def _find_range_key_for_episode(config: NovelConfig, episode_index: int) -> str | None:
+    """Return range_key (e.g. 'chuong_1-10') whose episode index matches the given index, or None."""
     if not config.storage.translated_dir.exists():
-        return specs
-    for file_path in sorted(config.storage.translated_dir.iterdir()):
-        if not file_path.is_file():
-            continue
+        return None
+    pattern = re.compile(r"^chuong_(\d+)-(\d+)\.txt$")
+    for file_path in config.storage.translated_dir.iterdir():
         match = pattern.match(file_path.name)
         if not match:
             continue
         start = int(match.group(1))
         end = int(match.group(2))
-        if from_chapter is not None and end < from_chapter:
-            continue
-        if to_chapter is not None and start > to_chapter:
-            continue
-        specs.append(_build_playlist_index_target(config, start, end))
-    return specs
+        batch_size = max(1, end - start + 1)
+        idx = ((start - 1) // batch_size) + 1
+        if idx == episode_index:
+            return _range_key(start, end)
+    return None
 
 
-def _update_playlist_line(description: str, *, video_id: str, playlist_id: str) -> str:
-    desired_line = f"Danh sách phát: https://www.youtube.com/watch?v={video_id}&list={playlist_id}"
+def _video_in_chapter_range(video_title: str, config: NovelConfig, from_chapter: int, to_chapter: int) -> bool:
+    """Return True if the video's episode index corresponds to a translated range that overlaps [from_chapter, to_chapter]."""
+    m = re.search(r"\bT(?:ập|ap)\s+(\d+)\b", video_title, re.IGNORECASE)
+    if not m:
+        return False
+    episode_index = int(m.group(1))
+    range_key = _find_range_key_for_episode(config, episode_index)
+    if range_key is None:
+        return False
+    rk_match = re.match(r"chuong_(\d+)-(\d+)", range_key)
+    if not rk_match:
+        return False
+    start = int(rk_match.group(1))
+    end = int(rk_match.group(2))
+    return start <= to_chapter and end >= from_chapter
+
+
+def _extract_menu_from_description(description: str) -> str:
+    """Extract the timestamp chapter-menu block from the end of a description."""
+    timestamp_re = re.compile(r"^\d{2}:\d{2}:\d{2}\b")
     lines = str(description or "").splitlines()
-    if lines:
-        first = lines[0].strip()
-        if first.startswith("Danh sách phát:"):
-            lines[0] = desired_line
-            return "\n".join(lines)
-    return desired_line if not description else f"{desired_line}\n{description}"
+    i = len(lines) - 1
+    while i >= 0 and not lines[i].strip():
+        i -= 1
+    if i < 0 or not timestamp_re.match(lines[i].strip()):
+        return ""
+    while i >= 0 and (timestamp_re.match(lines[i].strip()) or not lines[i].strip()):
+        i -= 1
+    menu_start = i + 1
+    while menu_start < len(lines) and not lines[menu_start].strip():
+        menu_start += 1
+    return "\n".join(lines[menu_start:]).strip()
+
+
+def _build_expected_description(
+    config: NovelConfig,
+    video_id: str,
+    playlist_id: str,
+    video_title: str,
+    current_description: str,
+) -> str:
+    """Build the expected full description for an uploaded video.
+
+    Composes three parts:
+    1. Header (2 lines) — video watch URL + playlist link, with up-to-date video_id.
+    2. Description body — from description.txt (everything after the 2 header lines).
+       Falls back to the current body when the file is missing.
+    3. Menu — from subtitle/<range_key>_menu.txt for the video's episode.
+       Preserved from current_description when the file does not exist.
+    """
+    # Part 1: header lines (2 lines)
+    line1 = f"Xem trong danh sách phát: https://www.youtube.com/watch?v={video_id}&list={playlist_id}"
+    line2 = f"Link danh sách phát: https://www.youtube.com/playlist?list={playlist_id}"
+
+    # Part 2: description body from description.txt (skip first 2 header lines)
+    try:
+        desc_path = _resolve_output_file(
+            config, config.upload.youtube.description_file, field_name="upload.youtube.description_file"
+        )
+        raw = _read_required_text(desc_path, field_name="description")
+        lines = raw.splitlines()
+        if len(lines) > 2:
+            body_suffix = "\n" + "\n".join(lines[2:])
+        else:
+            body_suffix = ""
+    except Exception:
+        current_lines = str(current_description or "").splitlines()
+        if len(current_lines) > 2:
+            body_suffix = "\n" + "\n".join(current_lines[2:])
+        else:
+            body_suffix = ""
+
+    # Part 3: menu from subtitle file; fall back to current menu if file absent
+    menu: str | None = None
+    episode_index = _extract_episode_number(video_title)
+    if episode_index is not None:
+        range_key = _find_range_key_for_episode(config, episode_index)
+        if range_key is not None:
+            menu_path = config.storage.subtitle_dir / f"{range_key}_menu.txt"
+            if menu_path.exists():
+                menu = menu_path.read_text(encoding="utf-8").strip()
+    if menu is None:
+        menu = _extract_menu_from_description(current_description)
+
+    base = f"{line1}\n{line2}{body_suffix}"
+    return f"{base}\n\n{menu}" if menu else base
 
 
 def _novel_title_signals(config: NovelConfig) -> list[str]:
@@ -1816,90 +1972,41 @@ def update_uploaded_youtube_playlist_index_descriptions(
     youtube_cfg = _youtube_upload_cfg_from_defaults()
 
     def _action(youtube, account: YouTubeAccountPaths) -> list[dict[str, object]]:
-        target_playlist_id = _read_playlist_id(config)
-        remote_videos = _list_playlist_videos(youtube, target_playlist_id, youtube_cfg, slot=account.index)
+        playlist_id = _read_playlist_id(config)
+        remote_videos = _list_playlist_videos(youtube, playlist_id, youtube_cfg, slot=account.index)
         results: list[dict[str, object]] = []
         updated_in_batch = 0
         matched_uploaded_count = 0
         unchanged_count = 0
         updated_count = 0
-        if from_chapter is None and to_chapter is None:
-            playlist_id = target_playlist_id
-            matched_videos = [video for video in remote_videos if _video_matches_novel(config, str(video.get("title", "")))]
-            for idx, remote_video in enumerate(matched_videos):
-                matched_uploaded_count += 1
-                remote_video_id = str(remote_video.get("id", "")).strip()
-                current_title = str(remote_video.get("title", "") or "")
-                current_description = str(remote_video.get("description", "") or "")
-                updated_description = _update_playlist_line(
-                    current_description,
-                    video_id=remote_video_id,
-                    playlist_id=playlist_id,
-                )
-                if updated_description == current_description:
-                    results.append({"title": current_title, "video_id": remote_video_id, "status": "unchanged"})
-                    unchanged_count += 1
-                else:
-                    _update_youtube_video_description_only(
-                        youtube, remote_video, updated_description, cfg=youtube_cfg, slot=account.index
-                    )
-                    results.append({"title": current_title, "video_id": remote_video_id, "status": "updated"})
-                    updated_count += 1
-                    updated_in_batch += 1
-                    if updated_in_batch >= YOUTUBE_BULK_UPDATE_BATCH_SIZE and idx < len(matched_videos) - 1:
-                        LOGGER.info(
-                            "YouTube bulk description update cooldown: sleeping %.1fs after %s updates",
-                            YOUTUBE_BULK_UPDATE_SLEEP_SECONDS,
-                            updated_in_batch,
-                        )
-                        time.sleep(YOUTUBE_BULK_UPDATE_SLEEP_SECONDS)
-                        updated_in_batch = 0
-        else:
-            remote_by_title: dict[str, dict[str, object]] = {}
-            for video in remote_videos:
-                key = _normalize_title(str(video.get("title", "")))
-                if key and key not in remote_by_title:
-                    remote_by_title[key] = video
-
-            specs = _iter_translated_playlist_index_targets(config, from_chapter=from_chapter, to_chapter=to_chapter)
-            for idx, spec in enumerate(specs):
-                title_key = _normalize_title(spec.title)
-                remote_video = remote_by_title.get(title_key)
-                if remote_video is None:
-                    continue
-                matched_uploaded_count += 1
-
-                remote_video_id = str(remote_video.get("id", "")).strip()
-                current_description = str(remote_video.get("description", "") or "")
-                updated_description = _update_playlist_line(
-                    current_description,
-                    video_id=remote_video_id,
-                    playlist_id=spec.playlist_id,
-                )
-                if updated_description == current_description:
-                    results.append(
-                        {
-                            "title": spec.title,
-                            "video_id": remote_video_id,
-                            "status": "unchanged",
-                        }
-                    )
-                    unchanged_count += 1
-                    continue
-
+        matched_videos = [video for video in remote_videos if _video_matches_novel(config, str(video.get("title", "")))]
+        if from_chapter is not None or to_chapter is not None:
+            fc = from_chapter if from_chapter is not None else 1
+            tc = to_chapter if to_chapter is not None else 2**31
+            matched_videos = [v for v in matched_videos if _video_in_chapter_range(str(v.get("title", "")), config, fc, tc)]
+        for idx, remote_video in enumerate(matched_videos):
+            matched_uploaded_count += 1
+            remote_video_id = str(remote_video.get("id", "")).strip()
+            current_title = str(remote_video.get("title", "") or "")
+            current_description = str(remote_video.get("description", "") or "")
+            updated_description = _build_expected_description(
+                config,
+                remote_video_id,
+                playlist_id,
+                current_title,
+                current_description,
+            )
+            if updated_description == current_description:
+                results.append({"title": current_title, "video_id": remote_video_id, "status": "unchanged"})
+                unchanged_count += 1
+            else:
                 _update_youtube_video_description_only(
                     youtube, remote_video, updated_description, cfg=youtube_cfg, slot=account.index
                 )
-                results.append(
-                    {
-                        "title": spec.title,
-                        "video_id": remote_video_id,
-                        "status": "updated",
-                    }
-                )
+                results.append({"title": current_title, "video_id": remote_video_id, "status": "updated"})
                 updated_count += 1
                 updated_in_batch += 1
-                if updated_in_batch >= YOUTUBE_BULK_UPDATE_BATCH_SIZE and idx < len(specs) - 1:
+                if updated_in_batch >= YOUTUBE_BULK_UPDATE_BATCH_SIZE and idx < len(matched_videos) - 1:
                     LOGGER.info(
                         "YouTube bulk description update cooldown: sleeping %.1fs after %s updates",
                         YOUTUBE_BULK_UPDATE_SLEEP_SECONDS,

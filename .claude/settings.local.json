@@ -6,8 +6,7 @@
       "Bash(/tmp/detailed_analysis.sh:*)",
       "Bash(__NEW_LINE_e1cb99492e0df920__ chmod:*)",
       "Bash(/tmp/detailed_analysis.sh)",
-      "Bash(sed -n '115,120p' /Users/danielpham/sync-workspace/05_Stories/novel-tts/input/thai-hu-chi-ton/.parts/chuong_1001-1010/1001.txt)",
-      "Bash(sed -n '115,120p' /Users/danielpham/sync-workspace/05_Stories/novel-tts/input/thai-hu-chi-ton/translated/chuong_1001-1010.txt)"
+      "Bash(rsync:*)"
     ]
   }
 }
