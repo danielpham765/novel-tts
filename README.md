@@ -567,12 +567,17 @@ How to get `token.json`:
 
 Multi-account note:
 
-- `upload.youtube.project` supports `rotate`, `1`, `2`, `3`, ...
-- `rotate` tries account 1, then 2, then 3 when a request hits `quotaExceeded`.
-- `1`, `2`, `3`, ... force a specific configured account instead of rotating.
+- upload video now auto-selects across all configured YouTube project slots based on remaining daily quota
+- the uploader estimates quota for duplicate-check + upload + thumbnail + playlist insert before choosing a slot
+- `upload.youtube.project` is still used by some admin/read-only YouTube commands, but upload selection itself is now quota-driven
 - `upload.youtube.credentials_path` and `upload.youtube.token_path` are parallel arrays.
 - Entry `0` in `credentials_path` is paired with entry `0` in `token_path`, and so on.
 - When a YouTube request fails with `quotaExceeded`, upload rotates to the next configured account automatically.
+- before upload, the CLI estimates quota for duplicate-check + upload + thumbnail + playlist insert and prefers a configured project slot with enough remaining quota
+- if a saved quota session is missing or expired for a slot, upload automatically re-captures that slot's quota session via the attached debug browser before checking usage
+- each slot's last known YouTube quota snapshot is also stored in Redis with `last_sync_time`
+- if live quota sync fails, upload temporarily falls back to Redis + estimated spend since the last sync
+- if the cached snapshot crosses YouTube's daily quota reset boundary while live sync is unavailable, the Redis snapshot resets itself to the new day before estimating further spend
 
 ### YouTube admin commands
 
@@ -604,6 +609,26 @@ uv run novel-tts youtube video update --id xxxxxxxx --made_for_kids true
 uv run novel-tts youtube video update --id xxxxxxxx --playlist_position 7
 uv run novel-tts youtube video update --id xxxxxxxx
 
+# Quota usage
+# 1) Capture browser-derived session secrets
+uv run novel-tts youtube quota capture --session-slot 1
+uv run novel-tts youtube quota capture --session-slot 2
+uv run novel-tts youtube quota capture --session-slot 3
+uv run novel-tts youtube quota capture --session-slot 1 --remote-debugging-url http://127.0.0.1:9222
+uv run novel-tts youtube quota capture --project-id your-gcp-project-id --session-slot 1
+
+# 2) Call HTTP directly using the saved session secret file
+uv run novel-tts youtube quota --session-slot 1
+uv run novel-tts youtube quota --session-slot 2
+uv run novel-tts youtube quota --session-slot 3
+uv run novel-tts youtube quota --session-file .secrets/youtube/quota_session-1.json
+uv run novel-tts youtube quota --raw
+
+# 3) Inspect shared Redis quota snapshots
+uv run novel-tts youtube quota redis --session-slot 1
+uv run novel-tts youtube quota redis --session-slot 2
+uv run novel-tts youtube all --redis
+
 # Rewrite playlist links in uploaded video descriptions
 uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index
 uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index --range 1-150
@@ -614,6 +639,26 @@ uv run novel-tts upload <novel_id> --platform youtube --update-playlist-position
 # Remove duplicated videos in the configured playlist, keeping the latest uploaded copy per title
 uv run novel-tts upload <novel_id> --platform youtube --remove-duplicated
 ```
+
+`youtube quota` notes:
+
+- `youtube quota capture` attaches to an existing Chrome/Chromium debug browser via CDP
+- it captures the Cloud Console quota request secrets and stores them at `.secrets/youtube/quota_session-<slot>.json`
+- `youtube quota` then calls HTTP directly using the saved secret file
+- `youtube quota redis --session-slot N` reads the shared Redis snapshot for one slot
+- `youtube all --redis` reads Redis snapshots for all configured slots
+- it prints normalized summary fields including `current_usage`, `effective_limit`, and `remaining`
+- if the saved session expires, rerun `youtube quota capture`
+- if the attached browser is not logged into Google Cloud Console, sign in there first and retry
+- YouTube daily quota reset is treated as `midnight Pacific Time (PT)`, matching the YouTube docs
+
+How to get the required secrets safely:
+
+1. Start Chrome or Chromium with remote debugging enabled and log into Google Cloud Console in that browser profile.
+2. Run `uv run novel-tts youtube quota capture --session-slot <1|2|3>`.
+3. If needed, override the inferred project id with `--project-id <your-project-id>`.
+4. The command saves the required request headers/body into `.secrets/youtube/quota_session-<slot>.json`.
+5. Future quota reads use `uv run novel-tts youtube quota --session-slot <1|2|3>` without needing browser interaction until the session expires.
 
 ### Pipeline
 

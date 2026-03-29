@@ -614,6 +614,48 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Updated position in the authenticated channel uploads playlist.",
     )
+    youtube_quota_parser = youtube_sub.add_parser("quota")
+    youtube_quota_parser.add_argument(
+        "quota_action",
+        nargs="?",
+        choices=["capture", "redis"],
+        help='Optional subcommand. Use "capture" to save browser-derived quota session secrets or "redis" to read the shared Redis quota snapshot.',
+    )
+    youtube_quota_parser.add_argument(
+        "--project-id",
+        help="Google Cloud project id used for YouTube Data API quota. Defaults to NOVEL_TTS_YOUTUBE_GCP_PROJECT_ID, or can be inferred from client_secrets-<slot>.json when --session-slot is set.",
+    )
+    youtube_quota_parser.add_argument(
+        "--remote-debugging-url",
+        help="Existing Chrome/Chromium remote debugging URL. Defaults to NOVEL_TTS_BROWSER_DEBUG_URL or http://127.0.0.1:9222",
+    )
+    youtube_quota_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=180.0,
+        help="How long to wait for quota data from the attached debug browser.",
+    )
+    youtube_quota_parser.add_argument(
+        "--session-file",
+        default=None,
+        help="Path to the saved quota session secret file.",
+    )
+    youtube_quota_parser.add_argument(
+        "--session-slot",
+        type=int,
+        help="Session slot number. When set and --session-file is omitted, uses .secrets/youtube/quota_session-<slot>.json",
+    )
+    youtube_quota_parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Include the raw quota response alongside the normalized summary.",
+    )
+    youtube_all_parser = youtube_sub.add_parser("all")
+    youtube_all_parser.add_argument(
+        "--redis",
+        action="store_true",
+        help="Read shared Redis quota snapshots for all configured YouTube slots.",
+    )
 
     pipeline_parser = subparsers.add_parser("pipeline")
     pipeline_sub = pipeline_parser.add_subparsers(dest="pipeline_command", required=True)
@@ -1507,7 +1549,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "youtube":
             from novel_tts.upload import (
+                capture_youtube_quota_session,
+                get_all_youtube_quota_redis,
                 get_youtube_playlist,
+                get_youtube_quota,
+                get_youtube_quota_redis,
                 get_youtube_video,
                 list_youtube_playlists,
                 list_youtube_videos,
@@ -1607,6 +1653,30 @@ def main(argv: list[str] | None = None) -> int:
                     result = list_youtube_videos()
                     if getattr(args, "title_only", False):
                         result = [{"id": item.get("id", ""), "title": item.get("title", "")} for item in result]
+            elif args.youtube_command == "quota":
+                if getattr(args, "quota_action", None) == "capture":
+                    result = capture_youtube_quota_session(
+                        project_id=str(getattr(args, "project_id", "") or ""),
+                        remote_debugging_url=str(getattr(args, "remote_debugging_url", "") or ""),
+                        timeout_seconds=float(getattr(args, "timeout_seconds", 180.0) or 180.0),
+                        session_file=getattr(args, "session_file", None),
+                        session_slot=getattr(args, "session_slot", None),
+                    )
+                elif getattr(args, "quota_action", None) == "redis":
+                    session_slot = getattr(args, "session_slot", None)
+                    if session_slot is None:
+                        parser.error("youtube quota redis requires --session-slot")
+                    result = get_youtube_quota_redis(session_slot=int(session_slot))
+                else:
+                    result = get_youtube_quota(
+                        raw=bool(getattr(args, "raw", False)),
+                        session_file=getattr(args, "session_file", None),
+                        session_slot=getattr(args, "session_slot", None),
+                    )
+            elif args.youtube_command == "all":
+                if not bool(getattr(args, "redis", False)):
+                    parser.error("youtube all currently supports only --redis")
+                result = get_all_youtube_quota_redis()
             else:
                 parser.error("youtube: unsupported subcommand")
             LOGGER.info("YouTube %s result: %s", args.youtube_command, json.dumps(result, ensure_ascii=False))

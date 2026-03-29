@@ -1,5 +1,5 @@
 proxy_gateway:
-  enabled: true
+  enabled: false
   base_url: http://localhost:8888
   mode: socket
   auto_discovery: true

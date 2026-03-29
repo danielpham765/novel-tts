@@ -1,5 +1,9 @@
 from .service import (
+    capture_youtube_quota_session,
+    get_all_youtube_quota_redis,
     get_youtube_playlist,
+    get_youtube_quota,
+    get_youtube_quota_redis,
     get_youtube_video,
     list_youtube_playlists,
     list_youtube_videos,
@@ -13,7 +17,11 @@ from .service import (
 )
 
 __all__ = [
+    "capture_youtube_quota_session",
+    "get_all_youtube_quota_redis",
     "get_youtube_playlist",
+    "get_youtube_quota",
+    "get_youtube_quota_redis",
     "get_youtube_video",
     "list_youtube_playlists",
     "list_youtube_videos",

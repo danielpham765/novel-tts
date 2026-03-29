@@ -30,6 +30,25 @@ ROMANIZED_ARTIFACT_RE = re.compile(
     r"vi hà hội như vậy|bình nhiễu|phủ tắc đáng bất trụ|vạn niên tuế nguyệt",
     re.I,
 )
+VIRTUAL_FISHING_ROD_TARGET = "cần câu Hư Không"
+VIRTUAL_FISHING_ROD_TARGET_CAP = "Cần câu Hư Không"
+VIRTUAL_FISHING_ROD_SOURCE_TERMS = ("虚空鱼竿", "虛空魚竿")
+VIRTUAL_FISHING_ROD_CONTEXT_HINTS = (
+    "chiếc",
+    "cây",
+    "lấy ra",
+    "rút ra",
+    "thu hồi",
+    "vung",
+    "quăng",
+    "ném",
+    "móc",
+    "câu",
+    "cực phẩm",
+    "pháp bảo",
+    "trong tay",
+    "kỳ diệu",
+)
 GLOSSARY_STATUS_PENDING = "pending"
 GLOSSARY_STATUS_DONE = "done"
 
@@ -635,7 +654,137 @@ def find_blocked_glossary_targets(config: NovelConfig, text: str, *, source_text
             continue
         hits.append(target)
         seen.add(target)
+    if find_fake_virtual_fishing_rod_lines(text, source_text=source_text):
+        normalized = normalize_glossary_text(VIRTUAL_FISHING_ROD_TARGET)
+        if normalized and normalized not in seen:
+            hits.append(normalized)
+            seen.add(normalized)
     return hits
+
+
+def _count_virtual_fishing_rod_mentions_in_source(source_text: str) -> int:
+    if not source_text:
+        return 0
+    return sum(source_text.count(term) for term in VIRTUAL_FISHING_ROD_SOURCE_TERMS)
+
+
+def _virtual_fishing_rod_line_score(line: str) -> int:
+    lowered = normalize_glossary_text(line).lower()
+    score = 0
+    for hint in VIRTUAL_FISHING_ROD_CONTEXT_HINTS:
+        if hint in lowered:
+            score += 1
+    if "chiếc cần câu hư không" in lowered or "cây cần câu hư không" in lowered:
+        score += 3
+    if re.search(r"(lấy ra|rút ra|thu hồi)\s+cần câu hư không", lowered):
+        score += 2
+    if re.search(r"cần câu hư không\s+(kỳ diệu|cực phẩm|trong tay)", lowered):
+        score += 2
+    return score
+
+
+def find_fake_virtual_fishing_rod_lines(text: str, *, source_text: str = "") -> list[int]:
+    """
+    Return 1-based line numbers where `cần câu Hư Không` is likely a poisoned artifact.
+
+    Legitimate mentions are capped by the number of real `虚空鱼竿`/`虛空魚竿` mentions in source.
+    When both real and fake mentions coexist in a chapter, keep the most rod-like translated lines.
+    """
+    lines = (text or "").splitlines()
+    candidates: list[tuple[int, int]] = []
+    for idx, line in enumerate(lines, 1):
+        if VIRTUAL_FISHING_ROD_TARGET not in line and VIRTUAL_FISHING_ROD_TARGET_CAP not in line:
+            continue
+        candidates.append((idx, _virtual_fishing_rod_line_score(line)))
+    if not candidates:
+        return []
+
+    allowed_count = _count_virtual_fishing_rod_mentions_in_source(source_text)
+    if allowed_count <= 0:
+        return [idx for idx, _score in candidates]
+
+    keep: set[int] = set()
+    for idx, _score in sorted(candidates, key=lambda item: (-item[1], item[0]))[:allowed_count]:
+        keep.add(idx)
+    return [idx for idx, _score in candidates if idx not in keep]
+
+
+def _repair_fake_virtual_fishing_rod_line(line: str) -> str:
+    fixed = line
+    replacements = (
+        (r"\b[Nn]ếu có cần câu Hư Không giúp đỡ\b", "Nếu có gì cần giúp đỡ"),
+        (r"\b[Cc]ó cần câu Hư Không gì\b", "có gì cần"),
+        (r"\b[Cc]ó cần câu Hư Không thì\b", "Có gì cần thì"),
+        (r"\b[Kk]hông cần câu Hư Không\b", "không cần"),
+        (r"\b[Kk]hông cần câu Hư Không ngươi\b", "không cần ngươi"),
+        (r"\b[Kk]hông cần câu Hư Không ta\b", "không cần ta"),
+        (r"\b[Kk]hông cần câu Hư Không hắn\b", "không cần hắn"),
+        (r"\b[Kk]hông cần câu Hư Không nàng\b", "không cần nàng"),
+        (r"\b[Cc]hỉ cần câu Hư Không\b", "chỉ cần"),
+        (r"Ta chỉ cần câu Hư Không,\s*ngươi\b", "Ta chỉ cần ngươi"),
+        (r"\b[Tt]a chỉ cần câu Hư Không,\s*ngươi\b", "Ta chỉ cần ngươi"),
+        (r"\b[Tt]a chỉ cần câu Hư Không\b", "Ta chỉ cần"),
+        (r"\b[Tt]a chỉ cần,\s*ngươi\b", "Ta chỉ cần ngươi"),
+        (r"\bta cần câu Hư Không muốn\b", "ta cần"),
+        (r"\bTa cần câu Hư Không muốn\b", "Ta cần"),
+        (r"\bcần câu Hư Không phải\b", "cần phải"),
+        (r"\bCần câu Hư Không phải\b", "Cần phải"),
+        (r"\bcần câu Hư Không dùng\b", "cần dùng"),
+        (r"\bCần câu Hư Không dùng\b", "Cần dùng"),
+        (r"\bcần câu Hư Không có\b", "cần có"),
+        (r"\bCần câu Hư Không có\b", "Cần có"),
+        (r"\bcần câu Hư Không một\b", "cần một"),
+        (r"\bCần câu Hư Không một\b", "Cần một"),
+        (r"\bcần câu Hư Không (ta|ngươi|hắn|nàng|nó|họ|người|chúng ta|các ngươi)\b", r"cần \1"),
+        (r"\bCần câu Hư Không (ta|ngươi|hắn|nàng|nó|họ|người|chúng ta|các ngươi)\b", r"Cần \1"),
+        (r"\bcần câu Hư Không (một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười|nửa|ít|nhiều)\b", r"cần \1"),
+        (r"\bCần câu Hư Không (một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười|nửa|ít|nhiều)\b", r"Cần \1"),
+        (r"\blấy cần câu Hư Không ra\b", "lấy ra"),
+        (r"\blấy cần câu Hư Không\b", "lấy"),
+        (r"\bthu hồi cần câu Hư Không\b", "thu hồi"),
+        (r"\bdùng cần câu Hư Không để\b", "dùng để"),
+        (r"\bvới cần câu Hư Không\b", ""),
+        (r"\bbằng cần câu Hư Không\b", ""),
+        (r"\bcần câu Hư Không của\b", "của"),
+        (r"\bcần câu Hư Không này\b", "này"),
+        (r"\bcần câu Hư Không rồi\b", "rồi"),
+        (r"\s+cần câu Hư Không([.!?…](?:[\"”])?)", r"\1"),
+    )
+    for pattern, replacement in replacements:
+        fixed = re.sub(pattern, replacement, fixed)
+    if fixed.startswith("không cần "):
+        fixed = "Không cần " + fixed[len("không cần ") :]
+    fixed = re.sub(r"([“\"(\[])\s*không cần", r"\1Không cần", fixed)
+    fixed = fixed.replace(VIRTUAL_FISHING_ROD_TARGET_CAP, "Cần")
+    fixed = fixed.replace(VIRTUAL_FISHING_ROD_TARGET, "cần")
+    fixed = re.sub(r"\s{2,}", " ", fixed)
+    fixed = re.sub(r"\s+([,.;:!?])", r"\1", fixed)
+    fixed = re.sub(r"([(\[\"“])\s+", r"\1", fixed)
+    fixed = re.sub(r"\s+([)\]\"”])", r"\1", fixed)
+    return fixed.strip()
+
+
+def repair_fake_virtual_fishing_rod_artifacts(text: str, *, source_text: str = "") -> str:
+    flagged_lines = set(find_fake_virtual_fishing_rod_lines(text, source_text=source_text))
+    if not flagged_lines:
+        return text
+
+    lines = (text or "").splitlines()
+    for idx in sorted(flagged_lines):
+        if 1 <= idx <= len(lines):
+            lines[idx - 1] = _repair_fake_virtual_fishing_rod_line(lines[idx - 1])
+    repaired = "\n".join(lines)
+
+    remaining = set(find_fake_virtual_fishing_rod_lines(repaired, source_text=source_text))
+    if remaining:
+        lines = repaired.splitlines()
+        for idx in sorted(remaining):
+            if 1 <= idx <= len(lines):
+                lines[idx - 1] = lines[idx - 1].replace(VIRTUAL_FISHING_ROD_TARGET_CAP, "Cần")
+                lines[idx - 1] = lines[idx - 1].replace(VIRTUAL_FISHING_ROD_TARGET, "cần")
+                lines[idx - 1] = re.sub(r"\s{2,}", " ", lines[idx - 1]).strip()
+        repaired = "\n".join(lines)
+    return repaired
 
 
 def _strip_json_wrappers(text: str) -> str:
@@ -2529,6 +2678,16 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
     merged = restore_placeholders(merged, mapping)
     merged = post_process(merged, translation_cfg.post_replacements)
     merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+    fake_rod_lines = find_fake_virtual_fishing_rod_lines(merged, source_text=raw_text)
+    if fake_rod_lines:
+        LOGGER.warning(
+            "Fake virtual fishing rod artifacts detected; applying local cleanup | unit=%s lines=%s",
+            unit_key,
+            ",".join(str(num) for num in fake_rod_lines[:20]),
+        )
+        merged = repair_fake_virtual_fishing_rod_artifacts(merged, source_text=raw_text)
+        merged = post_process(merged, translation_cfg.post_replacements)
+        merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
     if PLACEHOLDER_TOKEN_RE.search(merged):
         remaining = sorted(set(PLACEHOLDER_TOKEN_RE.findall(merged)))
         LOGGER.warning(

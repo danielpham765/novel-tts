@@ -107,7 +107,7 @@ Important subcommands:
 - `crawl run`, `crawl verify`, `crawl repair`
 - `translate novel`, `translate chapter`, `translate polish`, `translate captions`
 - `queue launch`, `queue add`, `queue worker`, `queue supervisor`, `queue monitor`, `queue ps`, `queue ps-all`, `queue repair`, `queue reset-key`, `queue stop`
-- `youtube playlist`, `youtube playlist update`, `youtube video`, `youtube video update`
+- `youtube playlist`, `youtube playlist update`, `youtube video`, `youtube video update`, `youtube quota`
 - `pipeline run`
 - `pipeline watch`
 

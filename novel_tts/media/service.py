@@ -165,8 +165,10 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
             f"drawtext=text='{_esc_drawtext(config.visual.line3)}'{font_arg}:fontcolor=white:fontsize=30:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-60",
         ]
     )
+    render_width = int(config.visual.render_width)
     filter_complex = (
-        f"[0:v]{drawtext_filters}[base];"
+        f"[0:v]scale={render_width}:-2[scaled];"
+        f"[scaled]{drawtext_filters}[base];"
         f"[1:v]scale=-1:80[channel];"
         f"[base][channel]overlay=x=W-w-5:y=10[v]"
     )
