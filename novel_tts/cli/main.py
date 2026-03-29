@@ -549,6 +549,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Upload even if the target YouTube playlist already contains a video with the same title.",
     )
+    upload_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip confirmation prompts (e.g. when deleting duplicated videos).",
+    )
 
     youtube_parser = subparsers.add_parser("youtube")
     youtube_sub = youtube_parser.add_subparsers(dest="youtube_command", required=True)
@@ -1508,7 +1514,10 @@ def main(argv: list[str] | None = None) -> int:
                     print("No duplicated videos to delete.")
                     return 0
 
-                confirm = input("Execute delete? [y/N]: ").strip().lower()
+                if getattr(args, "yes", False):
+                    confirm = "y"
+                else:
+                    confirm = input("Execute delete? [y/N]: ").strip().lower()
                 if confirm not in {"y", "yes"}:
                     print("Delete cancelled.")
                     return 0
