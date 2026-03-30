@@ -76,12 +76,13 @@ def _patch_pipeline_deps(monkeypatch, uploads: list[tuple[int, int, str]]) -> No
     monkeypatch.setattr(translate, "translate_novel", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(translate, "translate_captions", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tts, "run_tts", lambda *_args, **_kwargs: Path("/tmp/dummy.mp3"))
+    monkeypatch.setattr(tts, "create_menu", lambda *_args, **_kwargs: Path("/tmp/menu.txt"))
     monkeypatch.setattr(media, "generate_visual", lambda *_args, **_kwargs: (Path("/tmp/v.mp4"), Path("/tmp/t.png")))
     monkeypatch.setattr(media, "create_video", lambda *_args, **_kwargs: Path("/tmp/out.mp4"))
     monkeypatch.setattr(
         upload,
         "run_uploads",
-        lambda _cfg, ranges, *, platform, dry_run=False: [
+        lambda _cfg, ranges, *, platform, dry_run=False, force=False: [
             uploads.append((start, end, f"{platform}:{dry_run}")) or {} for start, end in ranges
         ],
     )
@@ -99,6 +100,11 @@ def _patch_pipeline_order_deps(monkeypatch, calls: list[str]) -> None:
         lambda _cfg, start, end, range_key=None, **_kwargs: calls.append(f"tts:{start}-{end}:{range_key}") or Path("/tmp/dummy.mp3"),
     )
     monkeypatch.setattr(
+        tts,
+        "create_menu",
+        lambda _cfg, start, end, range_key=None: calls.append(f"create-menu:{start}-{end}:{range_key}") or Path("/tmp/menu.txt"),
+    )
+    monkeypatch.setattr(
         media,
         "generate_visual",
         lambda _cfg, start, end, **_kwargs: calls.append(f"visual:{start}-{end}") or (Path("/tmp/v.mp4"), Path("/tmp/t.png")),
@@ -111,7 +117,7 @@ def _patch_pipeline_order_deps(monkeypatch, calls: list[str]) -> None:
     monkeypatch.setattr(
         upload,
         "run_uploads",
-        lambda _cfg, ranges, *, platform, dry_run=False: [
+        lambda _cfg, ranges, *, platform, dry_run=False, force=False: [
             calls.append(f"upload:{start}-{end}:{platform}:{dry_run}") or {} for start, end in ranges
         ],
     )
@@ -132,8 +138,8 @@ def test_pipeline_runs_upload_with_default_platform(tmp_path: Path, monkeypatch)
             "1-10",
             "--skip-crawl",
             "--skip-translate",
-            "--skip-captions",
             "--skip-tts",
+            "--skip-create-menu",
             "--skip-visual",
         ]
     )
@@ -157,7 +163,7 @@ def test_pipeline_skip_upload_flag(tmp_path: Path, monkeypatch) -> None:
             "1-10",
             "--skip-crawl",
             "--skip-translate",
-            "--skip-captions",
+            "--skip-create-menu",
             "--skip-tts",
             "--skip-visual",
             "--skip-upload",
@@ -183,7 +189,7 @@ def test_pipeline_upload_platform_override(tmp_path: Path, monkeypatch) -> None:
             "1-10",
             "--skip-crawl",
             "--skip-translate",
-            "--skip-captions",
+            "--skip-create-menu",
             "--skip-tts",
             "--skip-visual",
             "--upload-platform",
@@ -206,18 +212,17 @@ def test_pipeline_per_video_mode_runs_media_steps_in_video_order(tmp_path: Path,
     )
     _patch_pipeline_order_deps(monkeypatch, calls)
 
-    rc = cli_main.main(["pipeline", "run", "novel", "--range", "1-20", "--mode", "per-video"])
+    rc = cli_main.main(["pipeline", "run", "novel", "--range", "1-20", "--mode", "per-video", "--skip-crawl", "--skip-translate"])
 
     assert rc == 0
     assert calls == [
-        "crawl",
-        "translate",
-        "captions",
         "tts:1-10:chuong_1-10",
+        "create-menu:1-10:chuong_1-10",
         "visual:1-10",
         "video:1-10",
         "upload:1-10:youtube:False",
         "tts:11-20:chuong_11-20",
+        "create-menu:11-20:chuong_11-20",
         "visual:11-20",
         "video:11-20",
         "upload:11-20:youtube:False",

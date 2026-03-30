@@ -19,7 +19,7 @@ from novel_tts.config.models import (
     VideoConfig,
     VisualConfig,
 )
-from novel_tts.tts import service as tts_service
+from novel_tts.tts import service as tts_service, create_menu
 from novel_tts.tts.providers import TtsAudioResult
 
 
@@ -120,6 +120,7 @@ def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypa
 
     translated_path.write_text("Chương 1: A\nXin chào\n", encoding="utf-8")
     tts_service.run_tts(config, 1, 1)
+    create_menu(config, 1, 1)
     assert provider.calls == 1
     assert len(ffmpeg_calls) == 1
     # Writes per-chapter assets into .parts and keeps the range folder clean.
@@ -146,10 +147,12 @@ def test_tts_cache_invalidates_on_text_change_and_force(tmp_path: Path, monkeypa
     # Change translated text => cache invalidated, re-synthesize.
     translated_path.write_text("Chương 1: A\nXin chào!!!\n", encoding="utf-8")
     tts_service.run_tts(config, 1, 1)
+    create_menu(config, 1, 1)
     assert provider.calls == 2
     assert len(ffmpeg_calls) == 2
 
     # Force => always re-synthesize.
     tts_service.run_tts(config, 1, 1, force=True)
+    create_menu(config, 1, 1)
     assert provider.calls == 3
     assert len(ffmpeg_calls) == 3

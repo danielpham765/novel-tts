@@ -215,6 +215,63 @@ def _generate_menu(config: NovelConfig, files: list[Path], chapter_info: list[di
     return menu_path
 
 
+def create_menu(config: NovelConfig, start: int, end: int, range_key: str | None = None) -> Path:
+    """Create or refresh the chapter menu file.
+
+    If the menu file already exists, its timestamps are reused and chapter
+    headings are refreshed from the translated text (no audio files needed).
+    If the menu file does not exist, audio parts under .parts/ are required
+    to compute timestamps via ffprobe.
+    """
+    output_range_key = range_key or _range_key(start, end)
+    menu_path = config.storage.subtitle_dir / f"{output_range_key}_menu.txt"
+
+    source_path = _translated_text_path(config, start, end, range_key)
+    text = source_path.read_text(encoding="utf-8")
+    _, all_chapter_info = split_text_into_chunks(text)
+    chapter_info = [c for c in all_chapter_info if start <= int(c["number"]) <= end]
+
+    if menu_path.exists():
+        existing_lines = menu_path.read_text(encoding="utf-8").splitlines()
+        timestamps = [line.split(" ", 1)[0] for line in existing_lines if line.strip()]
+        if len(timestamps) != len(chapter_info):
+            LOGGER.warning(
+                "Menu entry count mismatch, skipping | path=%s menu_entries=%s translated_chapters=%s range=%s-%s",
+                menu_path,
+                len(timestamps),
+                len(chapter_info),
+                start,
+                end,
+            )
+            return menu_path
+        lines: list[str] = []
+        for ts, chapter in zip(timestamps, chapter_info):
+            label = f"Chương {chapter['number']}"
+            if chapter.get("title"):
+                label += f" - {chapter['title']}"
+            lines.append(f"{ts} {label}")
+        menu_path.write_text("\n".join(lines), encoding="utf-8")
+        LOGGER.info("Menu refreshed | path=%s entries=%s", menu_path, len(lines))
+        return menu_path
+
+    output_dir = config.storage.audio_dir / output_range_key
+    parts_dir = _chapter_parts_dir(output_dir)
+    audio_files: list[Path] = []
+    filtered_chapter_info: list[dict[str, object]] = []
+    for info in chapter_info:
+        f = _chapter_audio_path(parts_dir, int(info["number"]))
+        if f.exists() and f.stat().st_size > 0:
+            audio_files.append(f)
+            filtered_chapter_info.append(info)
+
+    if not audio_files:
+        raise FileNotFoundError(f"No audio chapter files found for range {start}-{end} in {parts_dir}")
+
+    menu_path = _generate_menu(config, audio_files, filtered_chapter_info, output_range_key)
+    LOGGER.info("Menu created | path=%s entries=%s", menu_path, len(filtered_chapter_info))
+    return menu_path
+
+
 def regenerate_menu(config: NovelConfig, start: int, end: int, range_key: str | None = None) -> Path:
     output_range_key = range_key or _range_key(start, end)
     menu_path = config.storage.subtitle_dir / f"{output_range_key}_menu.txt"
@@ -469,6 +526,4 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         if cached_merged_hash != expected_merged_hash:
             _write_merged_cached_hash(parts_dir, expected_merged_hash)
         LOGGER.info("TTS merge cached | output=%s size_bytes=%s", merged_path, merged_path.stat().st_size)
-    menu_path = _generate_menu(config, audio_files, chapter_info, output_range_key)
-    LOGGER.info("TTS menu generated | path=%s", menu_path)
     return merged_path

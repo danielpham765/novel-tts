@@ -291,6 +291,7 @@ def _process_novel(
     skip_repair: bool,
     skip_polish: bool,
     skip_tts: bool,
+    skip_create_menu: bool,
     skip_visual: bool,
     skip_video: bool,
     skip_upload: bool,
@@ -389,6 +390,10 @@ def _process_novel(
         if not skip_tts:
             run_tts(source_bound_config, start, end, range_key=_range_key(start, end))
             changed = True
+        if not skip_create_menu:
+            from novel_tts.tts import create_menu
+            create_menu(source_bound_config, start, end, range_key=_range_key(start, end))
+            changed = True
         media_changed = _run_media_if_ready(
             source_bound_config,
             start=start,
@@ -421,6 +426,7 @@ def run_watch_pipeline(
     skip_repair: bool,
     skip_polish: bool,
     skip_tts: bool,
+    skip_create_menu: bool,
     skip_visual: bool,
     skip_video: bool,
     skip_upload: bool,
@@ -453,6 +459,7 @@ def run_watch_pipeline(
                     skip_repair=skip_repair,
                     skip_polish=skip_polish,
                     skip_tts=skip_tts,
+                    skip_create_menu=skip_create_menu,
                     skip_visual=skip_visual,
                     skip_video=skip_video,
                     skip_upload=skip_upload,

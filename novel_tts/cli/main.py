@@ -214,6 +214,7 @@ def _run_pipeline_per_stage(
     *,
     translated_ranges: list[tuple[int, int, str]],
     skip_tts: bool,
+    skip_create_menu: bool,
     skip_visual: bool,
     skip_video: bool,
     skip_upload: bool,
@@ -221,12 +222,15 @@ def _run_pipeline_per_stage(
     force: bool,
 ) -> None:
     from novel_tts.media import create_video, generate_visual
-    from novel_tts.tts import run_tts
+    from novel_tts.tts import create_menu, run_tts
     from novel_tts.upload import run_uploads
 
     if not skip_tts:
         for c_start, c_end, range_key in translated_ranges:
             run_tts(config, c_start, c_end, range_key, force=force)
+    if not skip_create_menu:
+        for c_start, c_end, range_key in translated_ranges:
+            create_menu(config, c_start, c_end, range_key)
     if not skip_visual:
         for c_start, c_end, _ in translated_ranges:
             generate_visual(config, c_start, c_end, force=force)
@@ -243,6 +247,7 @@ def _run_pipeline_per_video(
     *,
     translated_ranges: list[tuple[int, int, str]],
     skip_tts: bool,
+    skip_create_menu: bool,
     skip_visual: bool,
     skip_video: bool,
     skip_upload: bool,
@@ -250,12 +255,14 @@ def _run_pipeline_per_video(
     force: bool,
 ) -> None:
     from novel_tts.media import create_video, generate_visual
-    from novel_tts.tts import run_tts
+    from novel_tts.tts import create_menu, run_tts
     from novel_tts.upload import run_uploads
 
     for c_start, c_end, range_key in translated_ranges:
         if not skip_tts:
             run_tts(config, c_start, c_end, range_key, force=force)
+        if not skip_create_menu:
+            create_menu(config, c_start, c_end, range_key)
         if not skip_visual:
             generate_visual(config, c_start, c_end, force=force)
         if not skip_video:
@@ -530,6 +537,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Regenerate final video even if the cached output already matches the current visual/audio inputs.",
     )
 
+    create_menu_parser = subparsers.add_parser("create-menu")
+    create_menu_parser.add_argument("novel_id")
+    create_menu_parser.add_argument("--range", required=True)
+
     upload_parser = subparsers.add_parser("upload")
     upload_parser.add_argument("novel_id")
     upload_parser.add_argument("--platform", choices=["youtube", "tiktok"], required=True)
@@ -683,6 +694,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_run.add_argument("--skip-crawl", action="store_true")
     pipeline_run.add_argument("--skip-translate", action="store_true")
     pipeline_run.add_argument("--skip-tts", action="store_true")
+    pipeline_run.add_argument("--skip-create-menu", action="store_true")
     pipeline_run.add_argument("--skip-visual", action="store_true")
     pipeline_run.add_argument("--skip-video", action="store_true")
     pipeline_run.add_argument("--skip-upload", action="store_true")
@@ -693,12 +705,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     pipeline_run.add_argument(
         "--from-stage",
-        choices=["crawl", "translate", "tts", "visual", "video", "upload"],
+        choices=["crawl", "translate", "tts", "create-menu", "visual", "video", "upload"],
         help="Start pipeline execution at this stage and skip all earlier stages.",
     )
     pipeline_run.add_argument(
         "--to-stage",
-        choices=["crawl", "translate", "tts", "visual", "video", "upload"],
+        choices=["crawl", "translate", "tts", "create-menu", "visual", "video", "upload"],
         help="Stop pipeline execution after this stage and skip all later stages.",
     )
     pipeline_run.add_argument(
@@ -751,17 +763,18 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_watch.add_argument("--skip-repair", action="store_true")
     pipeline_watch.add_argument("--skip-polish", action="store_true")
     pipeline_watch.add_argument("--skip-tts", action="store_true")
+    pipeline_watch.add_argument("--skip-create-menu", action="store_true")
     pipeline_watch.add_argument("--skip-visual", action="store_true")
     pipeline_watch.add_argument("--skip-video", action="store_true")
     pipeline_watch.add_argument("--skip-upload", action="store_true")
     pipeline_watch.add_argument(
         "--from-stage",
-        choices=["crawl", "translate", "repair", "polish", "tts", "visual", "video", "upload"],
+        choices=["crawl", "translate", "repair", "polish", "tts", "create-menu", "visual", "video", "upload"],
         help="Start watch execution at this stage and skip all earlier stages.",
     )
     pipeline_watch.add_argument(
         "--to-stage",
-        choices=["crawl", "translate", "repair", "polish", "tts", "visual", "video", "upload"],
+        choices=["crawl", "translate", "repair", "polish", "tts", "create-menu", "visual", "video", "upload"],
         help="Stop watch execution after this stage and skip all later stages.",
     )
 
@@ -873,12 +886,13 @@ def _resolve_watch_stage_flags(args, parser: argparse.ArgumentParser) -> dict[st
         "repair",
         "polish",
         "tts",
+        "create-menu",
         "visual",
         "video",
         "upload",
     ]
     explicit_skip = {
-        stage: bool(getattr(args, f"skip_{stage}", False))
+        stage: bool(getattr(args, f"skip_{stage.replace('-', '_')}", False))
         for stage in stage_order
     }
     return _resolve_stage_window_flags(
@@ -921,12 +935,13 @@ def _resolve_run_stage_flags(args, parser: argparse.ArgumentParser) -> dict[str,
         "crawl",
         "translate",
         "tts",
+        "create-menu",
         "visual",
         "video",
         "upload",
     ]
     explicit_skip = {
-        stage: bool(getattr(args, f"skip_{stage}", False))
+        stage: bool(getattr(args, f"skip_{stage.replace('-', '_')}", False))
         for stage in stage_order
     }
     return _resolve_stage_window_flags(
@@ -1444,6 +1459,15 @@ def main(argv: list[str] | None = None) -> int:
                     )
             return 0
 
+        if args.command == "create-menu":
+            from novel_tts.tts import create_menu
+
+            config = load_novel_config(args.novel_id)
+            start, end = parse_range(args.range)
+            for c_start, c_end, r_key in get_translated_ranges(config, start, end):
+                LOGGER.info("Menu: %s", create_menu(config, c_start, c_end, range_key=r_key))
+            return 0
+
         if args.command == "visual":
             from novel_tts.media import generate_visual, generate_visual_for_chapter
 
@@ -1746,6 +1770,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_repair=watch_stage_flags["repair"],
                     skip_polish=watch_stage_flags["polish"],
                     skip_tts=watch_stage_flags["tts"],
+                    skip_create_menu=watch_stage_flags["create-menu"],
                     skip_visual=watch_stage_flags["visual"],
                     skip_video=watch_stage_flags["video"],
                     skip_upload=watch_stage_flags["upload"],
@@ -1776,6 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                     translated_ranges=translated_ranges,
                     skip_tts=run_stage_flags["tts"],
+                    skip_create_menu=run_stage_flags["create-menu"],
                     skip_visual=run_stage_flags["visual"],
                     skip_video=run_stage_flags["video"],
                     skip_upload=run_stage_flags["upload"],
@@ -1787,6 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                     translated_ranges=translated_ranges,
                     skip_tts=run_stage_flags["tts"],
+                    skip_create_menu=run_stage_flags["create-menu"],
                     skip_visual=run_stage_flags["visual"],
                     skip_video=run_stage_flags["video"],
                     skip_upload=run_stage_flags["upload"],
