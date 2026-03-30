@@ -594,7 +594,10 @@ def _has_suspicious_target_context(text: str, target: str) -> bool:
 
 def find_source_mismatched_proper_targets(config: NovelConfig, text: str, *, source_text: str = "") -> list[str]:
     source_norm = normalize_glossary_text(source_text)
-    if not source_norm:
+    # Only enforce source-to-target licensing when we actually have Han-bearing source text.
+    # Synthetic fallbacks and malformed/non-Chinese inputs otherwise trigger
+    # broad false positives against legitimate Vietnamese names in the translated output.
+    if not source_norm or not has_han(source_norm):
         return []
     hits: list[str] = []
     seen: set[str] = set()
