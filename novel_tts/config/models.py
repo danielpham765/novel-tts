@@ -177,7 +177,8 @@ class TtsConfig:
     temperature: float = 1.0
     max_chars_chunk: int = 512
     tempo: float = 1.15
-    bitrate: str = "128k"
+    bitrate: str = "96k"
+    merge_workers: int = 1
 
 
 @dataclass
@@ -196,10 +197,13 @@ class VisualConfig:
 class VideoConfig:
     video_codec: str = "libx264"
     audio_codec: str = "aac"
+    audio_bitrate: str = "128k"
     preset: str = "veryfast"
     crf: int = 28
-    audio_bitrate: str = "96k"
     episode_batch_size: int = 10
+    use_gpu: bool = False
+    media_workers: int = 1
+    pipeline_mode: str = "per-stage"
 
 
 @dataclass

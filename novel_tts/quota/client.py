@@ -53,9 +53,29 @@ class CentralQuotaClient:
     def _key_prefix_candidates_for_same_novel(self, *, key_prefix: str) -> list[str]:
         """
         Enumerate other key_prefixes for the same novel, based on:
-          - current key_prefix format: <prefix>:<novel_id>:k<idx>
-          - env NOVEL_TTS_KEY_COUNT set by queue worker
+          - env NOVEL_TTS_ALL_KEY_PREFIXES_JSON set by queue worker
+          - legacy key_prefix format: <prefix>:<novel_id>:k<idx> + NOVEL_TTS_KEY_COUNT
         """
+
+        raw_prefixes = os.environ.get("NOVEL_TTS_ALL_KEY_PREFIXES_JSON", "").strip()
+        if raw_prefixes:
+            try:
+                payload = json.loads(raw_prefixes)
+            except Exception:
+                payload = []
+            if isinstance(payload, list):
+                out: list[str] = []
+                seen: set[str] = set()
+                for item in payload:
+                    value = str(item or "").strip()
+                    if not value or value in seen:
+                        continue
+                    seen.add(value)
+                    out.append(value)
+                if key_prefix and key_prefix in seen:
+                    out.sort(key=lambda s: 0 if s == key_prefix else 1)
+                if out:
+                    return out
 
         parts = [p for p in str(key_prefix).split(":") if p]
         if len(parts) < 3 or not parts[-1].startswith("k"):

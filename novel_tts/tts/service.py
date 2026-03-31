@@ -323,6 +323,73 @@ def _remove_incomplete_merged_artifacts(output_dir: Path, parts_dir: Path, merge
         pass
 
 
+def _encode_chapter_aac(wav_path: Path, aac_path: Path, tempo: float, bitrate: str) -> None:
+    run_ffmpeg(
+        [
+            "-y",
+            "-i", str(wav_path),
+            "-filter:a", f"atempo={tempo}",
+            "-acodec", "aac",
+            "-b:a", bitrate,
+            "-f", "adts",
+            str(aac_path),
+        ]
+    )
+
+
+def _merge_audio(
+    *,
+    audio_files: list[Path],
+    merged_path: Path,
+    tempo: float,
+    bitrate: str,
+    workers: int,
+    tmp_dir: Path,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if workers <= 1 or len(audio_files) <= 1:
+        # Single-pass: concat all WAVs then apply atempo + encode in one ffmpeg call.
+        file_list = tmp_dir.parent / "file-list.txt"
+        run_ffmpeg(
+            [
+                "-y",
+                "-f", "concat", "-safe", "0", "-i", str(file_list),
+                "-filter:a", f"atempo={tempo}",
+                "-acodec", "aac",
+                "-b:a", bitrate,
+                "-f", "adts",
+                str(merged_path),
+            ]
+        )
+        return
+
+    # Parallel: encode each chapter WAV → AAC (ADTS) concurrently, then concat with copy.
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    aac_parts: list[Path] = [tmp_dir / f"{wav.stem}.aac" for wav in audio_files]
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_encode_chapter_aac, wav, aac, tempo, bitrate): i
+                for i, (wav, aac) in enumerate(zip(audio_files, aac_parts))
+            }
+            for fut in as_completed(futures):
+                fut.result()
+
+        # ADTS is a raw byte-streamable format — frames are self-synchronizing,
+        # so direct binary concatenation produces a valid stream without DTS issues.
+        with merged_path.open("wb") as out:
+            for aac in aac_parts:
+                out.write(aac.read_bytes())
+    finally:
+        for p in aac_parts:
+            p.unlink(missing_ok=True)
+        try:
+            tmp_dir.rmdir()
+        except Exception:
+            pass
+
+
 def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = None, force: bool = False) -> Path:
     translated_range_key = range_key
     source_path = _translated_text_path(config, start, end, translated_range_key)
@@ -476,7 +543,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         legacy_file_list_path.unlink(missing_ok=True)
     except Exception:
         pass
-    merged_path = output_dir / f"{output_range_key}.mp3"
+    merged_path = output_dir / f"{output_range_key}.aac"
     expected_parts = max(1, end - start + 1)
     available_parts = len(audio_files)
     if available_parts < expected_parts:
@@ -501,24 +568,15 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
     if (not should_merge) and cached_merged_hash is not None and cached_merged_hash != expected_merged_hash:
         should_merge = True
     if should_merge:
-        LOGGER.info("TTS merge start | inputs=%s file_list=%s output=%s", len(audio_files), file_list_path, merged_path)
-        run_ffmpeg(
-            [
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(file_list_path),
-                "-filter:a",
-                f"atempo={config.tts.tempo}",
-                "-acodec",
-                "libmp3lame",
-                "-b:a",
-                config.tts.bitrate,
-                str(merged_path),
-            ]
+        LOGGER.info("TTS merge start | inputs=%s output=%s", len(audio_files), merged_path)
+        merge_workers = max(1, int(config.tts.merge_workers or 1))
+        _merge_audio(
+            audio_files=audio_files,
+            merged_path=merged_path,
+            tempo=config.tts.tempo,
+            bitrate=config.tts.bitrate,
+            workers=merge_workers,
+            tmp_dir=parts_dir / ".merge_tmp",
         )
         _write_merged_cached_hash(parts_dir, expected_merged_hash)
         LOGGER.info("TTS merge done | output=%s size_bytes=%s", merged_path, merged_path.stat().st_size)

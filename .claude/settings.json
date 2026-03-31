@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile novel_tts/queue/translation_queue.py novel_tts/cli/main.py)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader)"
+    ]
+  }
+}

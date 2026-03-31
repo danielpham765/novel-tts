@@ -848,6 +848,7 @@ def _get_youtube_quota_live(
     summary = _extract_quota_summary(payload)
     summary["project_id"] = str(session_payload.get("project_id", "")).strip()
     summary["captured_at"] = str(session_payload.get("captured_at", "")).strip()
+    summary["last_sync_time"] = _utcnow().isoformat()
     summary["session_slot"] = session_slot
     # Replace {project} placeholder in the id field with actual project_id
     if summary.get("project_id"):
@@ -871,12 +872,18 @@ def get_youtube_quota(
     payload: object | None = None
     try:
         summary, payload = _get_youtube_quota_live(session_file=session_file, session_slot=session_slot)
-    except Exception:
+    except Exception as exc:
         if session_slot is None:
             raise
         cached = _read_cached_youtube_quota(int(session_slot))
         if cached is None:
             raise
+        LOGGER.warning(
+            "YouTube quota live fetch failed for slot %s, using Redis cache (captured_at=%s). Reason: %s",
+            session_slot,
+            cached.get("captured_at", "unknown"),
+            exc,
+        )
         summary = dict(cached)
         summary["session_slot"] = session_slot
         summary["project_id"] = str(summary.get("project_id", "") or "").strip()

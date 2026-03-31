@@ -10,6 +10,7 @@ import redis
 import yaml
 
 from novel_tts.config.models import ProxyGatewayConfig
+from novel_tts.key_identity import key_token_from_raw
 from novel_tts.net.proxy_gateway import select_proxy_for_key_index
 
 @dataclass(frozen=True)
@@ -20,18 +21,18 @@ class RedisCfg:
     prefix: str
 
 
-_KEY_INDEX_RE = re.compile(r":k(?P<idx>\d+):")
-_KEY_MODEL_429_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):api:429$")
-_KEY_MODEL_API_CALLS_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):api:calls$")
-_KEY_MODEL_API_REQS_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):api:reqs$")
-_KEY_MODEL_LLM_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):llm:reqs$")
-_KEY_MODEL_QUOTA_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:reqs$")
-_KEY_MODEL_TPM_FREEZED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:tpm:freezed$")
-_KEY_MODEL_TPM_LOCKED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:tpm:locked$")
-_KEY_MODEL_RPM_FREEZED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpm:freezed$")
-_KEY_MODEL_RPM_LOCKED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpm:locked$")
-_KEY_MODEL_RPD_FREEZED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpd:freezed$")
-_KEY_MODEL_RPD_LOCKED_RE = re.compile(r":k(?P<idx>\d+):(?P<model>[^:]+):quota:rpd:locked$")
+_KEY_TOKEN_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):")
+_KEY_MODEL_429_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):api:429$")
+_KEY_MODEL_API_CALLS_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):api:calls$")
+_KEY_MODEL_API_REQS_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):api:reqs$")
+_KEY_MODEL_LLM_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):llm:reqs$")
+_KEY_MODEL_QUOTA_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):quota:reqs$")
+_KEY_MODEL_TPM_FREEZED_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):quota:tpm:freezed$")
+_KEY_MODEL_TPM_LOCKED_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):quota:tpm:locked$")
+_KEY_MODEL_RPM_FREEZED_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):quota:rpm:freezed$")
+_KEY_MODEL_RPM_LOCKED_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):quota:rpm:locked$")
+_KEY_MODEL_RPD_FREEZED_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):quota:rpd:freezed$")
+_KEY_MODEL_RPD_LOCKED_RE = re.compile(r":(?P<token>k\d+|key_[0-9a-f]{16}):(?P<model>[^:]+):quota:rpd:locked$")
 
 
 def _repo_root() -> Path:
@@ -257,43 +258,33 @@ def _parse_filter_values(values: list[str]) -> list[str]:
     return out
 
 
-def _extract_key_index(redis_key: str) -> int | None:
-    match = _KEY_INDEX_RE.search(redis_key or "")
+def _extract_key_token(redis_key: str) -> str:
+    match = _KEY_TOKEN_RE.search(redis_key or "")
     if not match:
-        return None
-    try:
-        value = int(match.group("idx"))
-    except Exception:
-        return None
-    return value if value > 0 else None
+        return ""
+    return str(match.group("token") or "").strip()
 
 
-def _extract_key_index_and_model_for_429(redis_key: str) -> tuple[int | None, str]:
+def _extract_key_token_and_model_for_429(redis_key: str) -> tuple[str, str]:
     match = _KEY_MODEL_429_RE.search(redis_key or "")
     if not match:
-        return None, ""
-    try:
-        idx = int(match.group("idx"))
-    except Exception:
-        return None, ""
+        return "", ""
+    token = str(match.group("token") or "").strip()
     model = (match.group("model") or "").strip()
-    if idx <= 0 or not model:
-        return None, ""
-    return idx, model
+    if not token or not model:
+        return "", ""
+    return token, model
 
 
-def _extract_key_index_and_model(redis_key: str, *, pattern: re.Pattern[str]) -> tuple[int | None, str]:
+def _extract_key_token_and_model(redis_key: str, *, pattern: re.Pattern[str]) -> tuple[str, str]:
     match = pattern.search(redis_key or "")
     if not match:
-        return None, ""
-    try:
-        idx = int(match.group("idx"))
-    except Exception:
-        return None, ""
+        return "", ""
+    token = str(match.group("token") or "").strip()
     model = (match.group("model") or "").strip()
-    if idx <= 0 or not model:
-        return None, ""
-    return idx, model
+    if not token or not model:
+        return "", ""
+    return token, model
 
 
 def _select_indices(
@@ -383,7 +374,7 @@ def _zcount_window(client, key: str, now: float, *, window_seconds: float) -> in
 
 
 def _scan_counts(
-    client, *, prefix: str
+    client, *, prefix: str, key_token_to_index: dict[str, int]
 ) -> tuple[
     dict[int, int],
     dict[int, int],
@@ -412,17 +403,17 @@ def _scan_counts(
 
     # LLM metric should represent *attempts* (including retries), so prefer :llm:reqs.
     # Fallbacks exist for older workers that didn't emit :llm:reqs.
-    api_calls_pattern = f"{prefix}:*:k*:*:api:calls"
-    llm_pattern = f"{prefix}:*:k*:*:llm:reqs"
-    quota_pattern = f"{prefix}:*:k*:*:quota:reqs"
-    api_pattern = f"{prefix}:*:k*:*:api:reqs"
-    api_429_pattern = f"{prefix}:*:k*:*:api:429"
-    tpm_freezed_pattern = f"{prefix}:*:k*:*:quota:tpm:freezed"
-    tpm_locked_pattern = f"{prefix}:*:k*:*:quota:tpm:locked"
-    rpm_freezed_pattern = f"{prefix}:*:k*:*:quota:rpm:freezed"
-    rpm_locked_pattern = f"{prefix}:*:k*:*:quota:rpm:locked"
-    rpd_freezed_pattern = f"{prefix}:*:k*:*:quota:rpd:freezed"
-    rpd_locked_pattern = f"{prefix}:*:k*:*:quota:rpd:locked"
+    api_calls_pattern = f"{prefix}:*:*:*:api:calls"
+    llm_pattern = f"{prefix}:*:*:*:llm:reqs"
+    quota_pattern = f"{prefix}:*:*:*:quota:reqs"
+    api_pattern = f"{prefix}:*:*:*:api:reqs"
+    api_429_pattern = f"{prefix}:*:*:*:api:429"
+    tpm_freezed_pattern = f"{prefix}:*:*:*:quota:tpm:freezed"
+    tpm_locked_pattern = f"{prefix}:*:*:*:quota:tpm:locked"
+    rpm_freezed_pattern = f"{prefix}:*:*:*:quota:rpm:freezed"
+    rpm_locked_pattern = f"{prefix}:*:*:*:quota:rpm:locked"
+    rpd_freezed_pattern = f"{prefix}:*:*:*:quota:rpd:freezed"
+    rpd_locked_pattern = f"{prefix}:*:*:*:quota:rpd:locked"
 
     llm_keys: set[str] = set()
     llm_bases: set[str] = set()
@@ -432,9 +423,14 @@ def _scan_counts(
         by_model = store.setdefault(idx, {})
         by_model[model] = by_model.get(model, 0) + int(count or 0)
 
+    def _resolve_idx(token: str) -> int | None:
+        idx = key_token_to_index.get(token)
+        return int(idx) if idx is not None else None
+
     # Preferred API attempt metric: :api:reqs (HTTP attempts including retries).
     for key in client.scan_iter(match=api_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_API_REQS_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_API_REQS_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         base = str(key).removesuffix(":api:reqs")
@@ -449,7 +445,8 @@ def _scan_counts(
 
     # Preferred: llm:reqs (attempts, including retries)
     for key in client.scan_iter(match=llm_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_LLM_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_LLM_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         base = str(key).removesuffix(":llm:reqs")
@@ -470,7 +467,8 @@ def _scan_counts(
     # Fallback: api:calls (logical calls). This undercounts when retries happen, but is better than 0
     # when :llm:reqs isn't available.
     for key in client.scan_iter(match=api_calls_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_API_CALLS_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_API_CALLS_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         base = str(key).removesuffix(":api:calls")
@@ -490,7 +488,8 @@ def _scan_counts(
 
     # Backward-compatible fallback: older workers only wrote :quota:reqs.
     for key in client.scan_iter(match=quota_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_QUOTA_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_QUOTA_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         base = str(key).removesuffix(":quota:reqs")
@@ -530,7 +529,8 @@ def _scan_counts(
 
     # Central quota v2 preferred: TPM is split across freezed + locked.
     for key in client.scan_iter(match=tpm_freezed_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_TPM_FREEZED_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_TPM_FREEZED_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         token_key = f"{str(key).removesuffix(':quota:tpm:freezed')}:quota:tpm:freezed_tokens"
@@ -540,7 +540,8 @@ def _scan_counts(
         _add_model_count(quota_tokens_by_model, idx, model, total_tokens)
 
     for key in client.scan_iter(match=tpm_locked_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_TPM_LOCKED_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_TPM_LOCKED_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         token_key = f"{str(key).removesuffix(':quota:tpm:locked')}:quota:tpm:locked_tokens"
@@ -553,7 +554,8 @@ def _scan_counts(
 
     # Backward-compatible fallback: older workers used :quota:reqs + :quota:tokens.
     for key in client.scan_iter(match=quota_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_QUOTA_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_QUOTA_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         token_key = f"{str(key).removesuffix(':quota:reqs')}:quota:tokens"
@@ -568,7 +570,8 @@ def _scan_counts(
 
     # Central quota v2: RPM and RPD usage.
     for key in client.scan_iter(match=rpm_freezed_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPM_FREEZED_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_RPM_FREEZED_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=60.0)
@@ -577,7 +580,8 @@ def _scan_counts(
         _add_model_count(rpm_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=rpm_locked_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPM_LOCKED_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_RPM_LOCKED_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=60.0)
@@ -586,7 +590,8 @@ def _scan_counts(
         _add_model_count(rpm_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=rpd_freezed_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPD_FREEZED_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_RPD_FREEZED_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=86400.0)
@@ -595,7 +600,8 @@ def _scan_counts(
         _add_model_count(rpd_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=rpd_locked_pattern, count=1000):
-        idx, model = _extract_key_index_and_model(key, pattern=_KEY_MODEL_RPD_LOCKED_RE)
+        token, model = _extract_key_token_and_model(key, pattern=_KEY_MODEL_RPD_LOCKED_RE)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         count = _zcount_window(client, str(key), now, window_seconds=86400.0)
@@ -604,7 +610,8 @@ def _scan_counts(
         _add_model_count(rpd_used_by_model, idx, model, count)
 
     for key in client.scan_iter(match=api_429_pattern, count=1000):
-        idx, model = _extract_key_index_and_model_for_429(key)
+        token, model = _extract_key_token_and_model_for_429(key)
+        idx = _resolve_idx(token)
         if idx is None or not model:
             continue
         count = _zcount_1m(client, key, now)
@@ -629,6 +636,10 @@ def _scan_counts(
 
 def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None = None) -> int:
     keys = _load_keys()
+    key_token_to_index: dict[str, int] = {}
+    for idx, raw in enumerate(keys, start=1):
+        key_token_to_index[key_token_from_raw(raw)] = idx
+        key_token_to_index[f"k{idx}"] = idx
     cfg = _load_redis_cfg()
     client = _client(cfg)
     enabled_models = _load_enabled_models()
@@ -651,7 +662,7 @@ def ai_key_ps(*, filters: list[str] | None = None, filters_raw: list[str] | None
         rpm_used_by_model,
         rpd_used_by_model,
         api_daily_by_model,
-    ) = _scan_counts(client, prefix=cfg.prefix)
+    ) = _scan_counts(client, prefix=cfg.prefix, key_token_to_index=key_token_to_index)
 
     all_indices: set[int] = set(range(1, len(keys) + 1))
     all_indices.update(api_counts.keys())

@@ -16,7 +16,9 @@ from pathlib import Path
 
 from novel_tts.common.logging import get_logger, get_novel_log_path
 from novel_tts.config.models import NovelConfig
+from novel_tts.key_identity import build_key_prefix
 from novel_tts.net import proxy_gateway as proxy_gateway_mod
+from novel_tts.quota import keys as quota_keys
 from novel_tts.translate.novel import (
     chapter_part_path,
     chapter_source_changed,
@@ -79,14 +81,32 @@ def _rate_limit_requeue_delay_seconds(consecutive_releases: int) -> float:
     return max(1.0, float(base))
 
 
+def _worker_key_prefix(config: NovelConfig, *, raw_key: str) -> str:
+    return build_key_prefix(
+        prefix=str(config.queue.redis.prefix or "").strip() or "novel_tts",
+        novel_id=config.novel_id,
+        raw_key=raw_key,
+    )
+
+
+def _worker_key_prefix_for_index(config: NovelConfig, *, key_index: int) -> str:
+    keys = _load_keys(config)
+    idx = int(key_index)
+    if idx <= 0 or idx > len(keys):
+        raise ValueError(f"Invalid key index: {key_index}")
+    return _worker_key_prefix(config, raw_key=keys[idx - 1])
+
+
 def _rate_limit_cooldown_key(config: NovelConfig, *, key_index: int, model: str) -> str:
     safe_model = (model or "").strip() or "unknown"
-    return _key(config, f"rate_limit_cooldown:k{int(key_index)}:{safe_model}")
+    key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
+    return f"{key_prefix}:{safe_model}:rate_limit_cooldown"
 
 
 def _out_of_quota_cooldown_key(config: NovelConfig, *, key_index: int, model: str) -> str:
     safe_model = (model or "").strip() or "unknown"
-    return _key(config, f"out_of_quota_cooldown:k{int(key_index)}:{safe_model}")
+    key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
+    return f"{key_prefix}:{safe_model}:out_of_quota_cooldown"
 
 
 def _ip_ban_429_key(config: NovelConfig, *, model: str) -> str:
@@ -531,28 +551,37 @@ def _interruptible_sleep(
     check_remaining_seconds,
     step_seconds: float = 1.0,
     min_sleep_seconds: float = 0.25,
-) -> None:
+    should_stop=None,
+) -> bool:
     """
     Sleep up to max_seconds, but wake early when the wait condition clears.
 
     Used so operator actions (e.g. `queue reset-key` clearing Redis keys) can unblock workers promptly,
     instead of waiting for a long `time.sleep()` to finish.
+
+    Returns True when interrupted by `should_stop`, else False.
     """
     deadline = time.monotonic() + max(0.0, float(max_seconds or 0.0))
     step = max(0.05, float(step_seconds or 0.0))
     min_sleep = max(0.01, float(min_sleep_seconds or 0.0))
     while True:
+        if should_stop is not None:
+            try:
+                if bool(should_stop()):
+                    return True
+            except Exception:
+                pass
         remaining_gate = 0.0
         try:
             remaining_gate = float(check_remaining_seconds() or 0.0)
         except Exception:
             remaining_gate = 0.0
         if remaining_gate <= 0.05:
-            return
+            return False
 
         remaining_budget = deadline - time.monotonic()
         if remaining_budget <= 0:
-            return
+            return False
 
         sleep_seconds = min(remaining_budget, remaining_gate, step)
         time.sleep(max(min_sleep, sleep_seconds))
@@ -642,6 +671,23 @@ def _parse_quota_blocked_model(text: str) -> str | None:
         value = (match.group(1) or "").strip()
         return value or None
     return None
+
+
+def _parse_quota_reason_tokens(text: str) -> set[str]:
+    if not text:
+        return set()
+    match = re.search(r"\breasons\s*=\s*([A-Za-z0-9_,.-]+)", text, flags=re.I)
+    if not match:
+        return set()
+    raw = (match.group(1) or "").strip()
+    if not raw:
+        return set()
+    out: set[str] = set()
+    for token in raw.split(","):
+        value = (token or "").strip().upper()
+        if value:
+            out.add(value)
+    return out
 
 
 def _parse_quota_estimated_tokens(text: str) -> int | None:
@@ -873,7 +919,7 @@ def _reset_queue_key_state(client, config: NovelConfig, *, key_indices: list[int
             deleted += int(client.delete(_minute_token_key(config, key_index, model)) or 0)
             deleted += int(client.delete(_daily_quota_key(config, key_index, model)) or 0)
             # Central quota v2 keys (freezed/locked, alloc queue).
-            key_prefix = f"{config.queue.redis.prefix}:{config.novel_id}:k{int(key_index)}"
+            key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
             deleted += int(client.delete(f"{key_prefix}:{model}:quota:alloc:queue") or 0)
             deleted += int(client.delete(f"{key_prefix}:{model}:quota:tpm:freezed") or 0)
             deleted += int(client.delete(f"{key_prefix}:{model}:quota:tpm:freezed_tokens") or 0)
@@ -883,6 +929,17 @@ def _reset_queue_key_state(client, config: NovelConfig, *, key_indices: list[int
             deleted += int(client.delete(f"{key_prefix}:{model}:quota:rpm:locked") or 0)
             deleted += int(client.delete(f"{key_prefix}:{model}:quota:rpd:freezed") or 0)
             deleted += int(client.delete(f"{key_prefix}:{model}:quota:rpd:locked") or 0)
+            # Legacy index-based keys from before stable raw-key identity.
+            legacy_prefix = f"{config.queue.redis.prefix}:{config.novel_id}:k{int(key_index)}"
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:alloc:queue") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:tpm:freezed") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:tpm:freezed_tokens") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:tpm:locked") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:tpm:locked_tokens") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:rpm:freezed") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:rpm:locked") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:rpd:freezed") or 0)
+            deleted += int(client.delete(f"{legacy_prefix}:{model}:quota:rpd:locked") or 0)
     return deleted
 
 
@@ -1181,6 +1238,35 @@ def _pending_total_len(config: NovelConfig, client) -> int:
     return int(client.llen(_pending_priority_key(config)) or 0) + int(client.llen(_key(config, "pending")) or 0)
 
 
+# ---------------------------------------------------------------------------
+# Graceful-shutdown ("stopping") signal
+# ---------------------------------------------------------------------------
+
+
+def _stopping_key(config: NovelConfig) -> str:
+    return _key(config, "stopping")
+
+
+def _is_stopping(config: NovelConfig, client) -> bool:
+    """Return True if a graceful-stop signal has been set."""
+    return bool(client.exists(_stopping_key(config)))
+
+
+def _set_stopping(config: NovelConfig, client) -> None:
+    """Fire the graceful-stop signal.  Workers will finish their current job
+    then exit; the supervisor will stop spawning new workers."""
+    client.set(
+        _stopping_key(config),
+        json.dumps({"requested_at": time.time(), "pid": os.getpid()}),
+    )
+    LOGGER.info("Graceful-stop signal set | novel=%s", config.novel_id)
+
+
+def _clear_stopping(config: NovelConfig, client) -> None:
+    """Remove the graceful-stop signal (e.g. after all workers have drained)."""
+    client.delete(_stopping_key(config))
+
+
 _PICK_THROTTLE_POP_LUA = r"""
 -- KEYS[1] = pending_priority list
 -- KEYS[2] = pending list
@@ -1223,7 +1309,8 @@ return { job, "0" }
 
 def _pick_last_ms_key(config: NovelConfig, key_index: int) -> str:
     # Per-key throttle: all workers for the same key_index will serialize picks.
-    return _key(config, f"last_pick_ms:k{int(key_index)}")
+    key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
+    return f"{key_prefix}:last_pick_ms"
 
 
 def _throttled_pick_job_id(
@@ -1442,6 +1529,24 @@ def _any_idle_worker(config: NovelConfig) -> bool:
         if state == "idle":
             return True
     return False
+
+
+def _worker_is_recently_picking(config: NovelConfig, client, *, key_index: int) -> bool:
+    try:
+        raw = client.get(_pick_last_ms_key(config, key_index))
+        last_ms = float(raw or 0.0)
+    except Exception:
+        return False
+    if last_ms <= 0:
+        return False
+    try:
+        min_interval = float(getattr(config.queue, "min_pick_interval_seconds", 0.0) or 0.0)
+    except Exception:
+        min_interval = 0.0
+    # Keep the UI hint short-lived: enough to cover the throttle/handoff window, but not a steady state.
+    recent_window_ms = max(1500.0, min(5000.0, max(min_interval * 1500.0, 1500.0)))
+    now_ms = time.time() * 1000.0
+    return (now_ms - last_ms) <= recent_window_ms
 
 def _key_file(config: NovelConfig) -> Path:
     return config.storage.root / ".secrets" / "gemini-keys.txt"
@@ -2181,15 +2286,18 @@ def _write_status_line(
 
 
 def _daily_quota_key(config: NovelConfig, key_index: int, model: str) -> str:
-    return f"{config.queue.redis.prefix}:{config.novel_id}:k{key_index}:{model}:quota:daily_reqs"
+    key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
+    return f"{key_prefix}:{model}:quota:daily_reqs"
 
 
 def _minute_quota_key(config: NovelConfig, key_index: int, model: str) -> str:
-    return f"{config.queue.redis.prefix}:{config.novel_id}:k{key_index}:{model}:quota:reqs"
+    key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
+    return f"{key_prefix}:{model}:quota:reqs"
 
 
 def _minute_token_key(config: NovelConfig, key_index: int, model: str) -> str:
-    return f"{config.queue.redis.prefix}:{config.novel_id}:k{key_index}:{model}:quota:tokens"
+    key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
+    return f"{key_prefix}:{model}:quota:tokens"
 
 
 def _estimate_tokens_from_chars(char_count: int) -> int:
@@ -2248,14 +2356,79 @@ def _estimated_request_tokens_for_model(config: NovelConfig, model: str) -> int:
 
 
 def _model_rpd_exhausted(config: NovelConfig, client, key_index: int, model: str) -> bool:
+    return _model_rpd_wait_seconds(config, client, key_index, model) > 0.0
+
+
+def _model_rpd_wait_seconds(config: NovelConfig, client, key_index: int, model: str) -> float:
     model_cfg = config.queue.model_configs.get(model)
     if model_cfg is None or model_cfg.rpd_limit <= 0:
-        return False
+        return 0.0
     now = time.time()
     day_window_start = now - 86400.0
-    daily_key = _daily_quota_key(config, key_index, model)
-    client.zremrangebyscore(daily_key, 0, day_window_start)
-    return client.zcount(daily_key, day_window_start, "+inf") >= model_cfg.rpd_limit
+    rpd_limit = int(model_cfg.rpd_limit)
+    waits: list[float] = []
+
+    try:
+        daily_key = _daily_quota_key(config, key_index, model)
+        client.zremrangebyscore(daily_key, 0, day_window_start)
+        daily_count = int(client.zcount(daily_key, day_window_start, "+inf") or 0)
+        if daily_count >= rpd_limit:
+            need_drop = daily_count - (rpd_limit - 1)
+            scored = client.zrangebyscore(
+                daily_key,
+                day_window_start,
+                "+inf",
+                start=max(0, need_drop - 1),
+                num=1,
+                withscores=True,
+            )
+            if scored:
+                waits.append(max(1.0, (float(scored[0][1]) + 86400.0) - now + 0.05))
+            else:
+                waits.append(60.0)
+    except Exception:
+        pass
+
+    try:
+        key_prefix = _worker_key_prefix_for_index(config, key_index=int(key_index))
+        freezed_key = quota_keys.rpd_freezed_key(key_prefix=key_prefix, model=model)
+        locked_key = quota_keys.rpd_locked_key(key_prefix=key_prefix, model=model)
+        client.zremrangebyscore(freezed_key, 0, day_window_start)
+        client.zremrangebyscore(locked_key, 0, day_window_start)
+        freezed = client.zrangebyscore(freezed_key, day_window_start, "+inf", withscores=True) or []
+        locked = client.zrangebyscore(locked_key, day_window_start, "+inf", withscores=True) or []
+        combined = sorted(
+            [float(score) for _member, score in list(freezed) + list(locked)],
+        )
+        if len(combined) >= rpd_limit:
+            need_drop = len(combined) - (rpd_limit - 1)
+            idx = max(0, min(len(combined) - 1, need_drop - 1))
+            waits.append(max(1.0, (combined[idx] + 86400.0) - now + 0.05))
+    except Exception:
+        pass
+
+    return max(waits) if waits else 0.0
+
+
+def _normalize_quota_wait_seconds(
+    config: NovelConfig,
+    client,
+    key_index: int,
+    model: str,
+    *,
+    proposed_wait_seconds: float,
+    text: str = "",
+) -> tuple[float, bool]:
+    wait_seconds = max(0.0, float(proposed_wait_seconds or 0.0))
+    if wait_seconds <= 0:
+        return 0.0, False
+    rpd_wait = _model_rpd_wait_seconds(config, client, key_index, model)
+    if rpd_wait > 0:
+        return max(wait_seconds, rpd_wait), True
+    reasons = _parse_quota_reason_tokens(text)
+    if "RPD" in reasons and wait_seconds >= 3600.0:
+        return wait_seconds, True
+    return min(wait_seconds, 60.0), False
 
 
 def _model_short_quota_wait_seconds(config: NovelConfig, client, key_index: int, model: str) -> float:
@@ -2402,15 +2575,18 @@ def _quota_wait_seconds_for_request(config: NovelConfig, client, key_index: int,
 
 
 def _worker_should_pause_for_quota(config: NovelConfig, client, key_index: int, model: str) -> tuple[bool, str, float]:
-    if _model_rpd_exhausted(config, client, key_index, model):
-        return True, model, 60.0
+    rpd_wait = _model_rpd_wait_seconds(config, client, key_index, model)
+    if rpd_wait > 0:
+        return True, model, rpd_wait
     short_wait = _model_short_quota_wait_seconds(config, client, key_index, model)
     if short_wait > 0:
         return True, model, short_wait
     model_cfg = config.queue.model_configs.get(model)
     repair_model = model_cfg.repair_model if model_cfg else ""
-    if repair_model and _model_rpd_exhausted(config, client, key_index, repair_model):
-        return True, repair_model, 60.0
+    if repair_model:
+        repair_rpd_wait = _model_rpd_wait_seconds(config, client, key_index, repair_model)
+        if repair_rpd_wait > 0:
+            return True, repair_model, repair_rpd_wait
     if repair_model:
         repair_wait = _model_short_quota_wait_seconds(config, client, key_index, repair_model)
         if repair_wait > 0:
@@ -2476,7 +2652,22 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
     cooldown_key = _rate_limit_cooldown_key(config, key_index=key_index, model=model)
     out_of_quota_key = _out_of_quota_cooldown_key(config, key_index=key_index, model=model)
     max_429_cooldown_seconds = 65.0
+
+    def _stop_requested() -> bool:
+        return _is_stopping(config, client)
+
     while True:
+        # Fast-exit path: if we are in a cooldown/sleep and the stop signal
+        # arrives, there is no in-flight job — exit immediately.
+        if _is_stopping(config, client):
+            LOGGER.info(
+                "Worker exiting (graceful stop, idle) | novel=%s key_index=%s model=%s worker=%s",
+                config.novel_id,
+                key_index,
+                model,
+                worker_id,
+            )
+            return 0
         # Suspected IP-level throttling: pause all workers for this model (per novel), with spaced probing.
         if _ip_ban_is_active(client, config, model=model):
             _ip_ban_probe_if_due(client, config, key_index=key_index, model=model, api_key=api_key)
@@ -2497,12 +2688,22 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                     model,
                     sleep_seconds,
                 )
-                _interruptible_sleep(
+                interrupted = _interruptible_sleep(
                     max_seconds=sleep_seconds,
                     check_remaining_seconds=lambda: _ip_ban_next_probe_in_seconds(client, config, model=model),
                     step_seconds=2.0,
                     min_sleep_seconds=0.5,
+                    should_stop=_stop_requested,
                 )
+                if interrupted:
+                    LOGGER.info(
+                        "Worker exiting during IP-ban cooldown (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                        config.novel_id,
+                        key_index,
+                        model,
+                        worker_id,
+                    )
+                    return 0
                 continue
 
         out_remaining = _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key)
@@ -2515,12 +2716,22 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 model,
                 sleep_seconds,
             )
-            _interruptible_sleep(
+            interrupted = _interruptible_sleep(
                 max_seconds=sleep_seconds,
                 check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key),
                 step_seconds=2.0,
                 min_sleep_seconds=0.5,
+                should_stop=_stop_requested,
             )
+            if interrupted:
+                LOGGER.info(
+                    "Worker exiting during out-of-quota cooldown (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    worker_id,
+                )
+                return 0
             continue
         remaining = _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key)
         if remaining > 0.05:
@@ -2532,12 +2743,22 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 model,
                 sleep_seconds,
             )
-            _interruptible_sleep(
+            interrupted = _interruptible_sleep(
                 max_seconds=sleep_seconds,
                 check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key),
                 step_seconds=1.0,
                 min_sleep_seconds=0.25,
+                should_stop=_stop_requested,
             )
+            if interrupted:
+                LOGGER.info(
+                    "Worker exiting during rate-limit cooldown (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    worker_id,
+                )
+                return 0
             continue
         should_pause, blocked_model, wait_seconds = _worker_should_pause_for_quota(config, client, key_index, model)
         if should_pause:
@@ -2555,13 +2776,33 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 pause, _blocked, seconds = _worker_should_pause_for_quota(config, client, key_index, model)
                 return max(0.0, float(seconds or 0.0)) if pause else 0.0
 
-            _interruptible_sleep(
+            interrupted = _interruptible_sleep(
                 max_seconds=planned,
                 check_remaining_seconds=_quota_remaining,
                 step_seconds=1.0,
                 min_sleep_seconds=0.5,
+                should_stop=_stop_requested,
             )
+            if interrupted:
+                LOGGER.info(
+                    "Worker exiting during quota pause (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    worker_id,
+                )
+                return 0
             continue
+        # Graceful shutdown: stop picking new jobs and exit cleanly.
+        if _is_stopping(config, client):
+            LOGGER.info(
+                "Worker exiting (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                config.novel_id,
+                key_index,
+                model,
+                worker_id,
+            )
+            return 0
         job_id = _throttled_pick_job_id(config, client, key_index=key_index, model=model, timeout_seconds=5.0)
         if not job_id:
             continue
@@ -2615,9 +2856,13 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
         env["NOVEL_TTS_QUOTA_MAX_WAIT_SECONDS"] = "0"
         env["NOVEL_TTS_CENTRAL_QUOTA"] = "1"
         env["NOVEL_TTS_CENTRAL_QUOTA_NONBLOCKING"] = "1"
+        env["NOVEL_TTS_ALL_KEY_PREFIXES_JSON"] = json.dumps(
+            [_worker_key_prefix(config, raw_key=raw) for raw in keys],
+            ensure_ascii=False,
+        )
         if not is_captions:
             env["NOVEL_TTS_GLOSSARY_STRICT"] = "1"
-        env["GEMINI_RATE_LIMIT_KEY_PREFIX"] = f"{config.queue.redis.prefix}:{config.novel_id}:k{key_index}"
+        env["GEMINI_RATE_LIMIT_KEY_PREFIX"] = _worker_key_prefix(config, raw_key=api_key)
         env["GEMINI_REDIS_HOST"] = config.queue.redis.host
         env["GEMINI_REDIS_PORT"] = str(config.queue.redis.port)
         env["GEMINI_REDIS_DB"] = str(config.queue.redis.database)
@@ -2704,6 +2949,16 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 if not should_pause:
                     wait_seconds = 0.0
                     blocked_model = model
+            else:
+                blocked_model = _parse_quota_blocked_model(combined) or model
+            wait_seconds, _is_rpd_wait = _normalize_quota_wait_seconds(
+                config,
+                client,
+                key_index,
+                blocked_model or model,
+                proposed_wait_seconds=float(wait_seconds or 0.0),
+                text=combined,
+            )
             if 0 < float(wait_seconds) < _INLINE_QUOTA_WAIT_MAX_SECONDS and (
                 inline_budget_seconds <= 0 or (inline_waited_seconds + float(wait_seconds) <= inline_budget_seconds)
             ):
@@ -2718,6 +2973,17 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                     float(inline_waited_seconds),
                 )
                 sleep_seconds = max(0.25, float(wait_seconds))
+                if _stop_requested():
+                    LOGGER.info(
+                        "Worker exiting before retry after inline quota wait (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                        config.novel_id,
+                        key_index,
+                        model,
+                        worker_id,
+                    )
+                    client.hdel(_key(config, "inflight"), job_id)
+                    _requeue_job_priority(config, client, job_id)
+                    return 0
                 time.sleep(sleep_seconds)
                 inline_waited_seconds += sleep_seconds
                 continue
@@ -2740,6 +3006,18 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                     estimated_tokens = _parse_quota_estimated_tokens(combined) or _estimated_request_tokens_for_model(config, model)
                     started_hold = time.time()
                     while True:
+                        if _stop_requested():
+                            LOGGER.info(
+                                "Worker exiting while holding quota-gated job (graceful stop) | job=%s novel=%s key_index=%s model=%s worker=%s",
+                                job_id,
+                                config.novel_id,
+                                key_index,
+                                model,
+                                worker_id,
+                            )
+                            client.hdel(_key(config, "inflight"), job_id)
+                            _requeue_job_priority(config, client, job_id)
+                            return 0
                         waited = time.time() - started_hold
                         if hold_budget_seconds > 0 and (hold_waited_seconds + waited) > hold_budget_seconds:
                             break
@@ -2819,14 +3097,26 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                         seconds=float(cooldown_seconds),
                         max_seconds=max_429_cooldown_seconds,
                     )
-                    _interruptible_sleep(
+                    interrupted = _interruptible_sleep(
                         max_seconds=float(cooldown_seconds),
                         check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, cooldown_key),
                         step_seconds=1.0,
                         min_sleep_seconds=0.25,
+                        should_stop=_stop_requested,
                     )
+                    if interrupted:
+                        LOGGER.info(
+                            "Worker exiting during probe cooldown (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                            config.novel_id,
+                            key_index,
+                            model,
+                            worker_id,
+                        )
+                        return 0
                 else:
-                    cooldown_seconds = 3600.0
+                    rpd_wait_seconds = _model_rpd_wait_seconds(config, client, key_index, model)
+                    is_rpd_wait = rpd_wait_seconds > 0.0
+                    cooldown_seconds = min(rpd_wait_seconds, 3600.0) if is_rpd_wait else 60.0
                     probe_text = "probe=429" if probe_429 is True else "probe=unknown"
                     LOGGER.warning(
                         "Worker entering out-of-quota cooldown | out_of_quota=1 novel=%s key_index=%s model=%s wait_seconds=%.2f %s",
@@ -2837,12 +3127,22 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                         probe_text,
                     )
                     _extend_rate_limit_cooldown(client, out_of_quota_key, seconds=float(cooldown_seconds))
-                    _interruptible_sleep(
+                    interrupted = _interruptible_sleep(
                         max_seconds=float(cooldown_seconds),
                         check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key),
                         step_seconds=2.0,
                         min_sleep_seconds=0.5,
+                        should_stop=_stop_requested,
                     )
+                    if interrupted:
+                        LOGGER.info(
+                            "Worker exiting during out-of-quota cooldown after 429 (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                            config.novel_id,
+                            key_index,
+                            model,
+                            worker_id,
+                        )
+                        return 0
                 consecutive_rate_limit_releases = 0
             continue
         # Quota gating (RPM/TPM/RPD) without necessarily any HTTP 429.
@@ -2864,9 +3164,94 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 model,
             )
             if force_requeue:
-                # Central quota redirect: immediately requeue so another key can pick it up.
+                # Central quota redirect: requeue so another key can pick it up.
                 _requeue_job_priority(config, client, job_id)
-                time.sleep(0.5)
+                suggested_wait_fr = _parse_quota_suggested_wait_seconds(combined)
+                blocked_model = _parse_quota_blocked_model(combined) or model
+                normalized_wait = 0.0
+                is_rpd_wait = False
+                if suggested_wait_fr is not None and suggested_wait_fr > 0:
+                    normalized_wait, is_rpd_wait = _normalize_quota_wait_seconds(
+                        config,
+                        client,
+                        key_index,
+                        blocked_model,
+                        proposed_wait_seconds=float(suggested_wait_fr),
+                        text=combined,
+                    )
+                if normalized_wait >= 3600.0 and is_rpd_wait:
+                    # RPD-level exhaustion: this worker's key is depleted for hours.
+                    # Enter out-of-quota cooldown so we don't hot-loop picking up jobs
+                    # that will always be redirected back.
+                    cooldown_seconds = min(float(normalized_wait), 3600.0)
+                    LOGGER.warning(
+                        "Worker entering out-of-quota cooldown (quota redirect with RPD-level wait) "
+                        "| out_of_quota=1 novel=%s key_index=%s model=%s wait_seconds=%.2f",
+                        config.novel_id,
+                        key_index,
+                        model,
+                        cooldown_seconds,
+                    )
+                    _extend_rate_limit_cooldown(client, out_of_quota_key, seconds=float(cooldown_seconds))
+                    interrupted = _interruptible_sleep(
+                        max_seconds=float(cooldown_seconds),
+                        check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key),
+                        step_seconds=2.0,
+                        min_sleep_seconds=0.5,
+                        should_stop=_stop_requested,
+                    )
+                    if interrupted:
+                        LOGGER.info(
+                            "Worker exiting during out-of-quota cooldown after quota redirect (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                            config.novel_id,
+                            key_index,
+                            model,
+                            worker_id,
+                        )
+                        return 0
+                elif normalized_wait > 0:
+                    wait_seconds = max(1.0, float(normalized_wait))
+                    LOGGER.warning(
+                        "Worker quota wait | novel=%s key_index=%s model=%s blocked_model=%s wait_seconds=%.2f",
+                        config.novel_id,
+                        key_index,
+                        model,
+                        blocked_model,
+                        wait_seconds,
+                    )
+                    interrupted = _interruptible_sleep(
+                        max_seconds=wait_seconds,
+                        check_remaining_seconds=lambda: wait_seconds,
+                        step_seconds=1.0,
+                        min_sleep_seconds=0.25,
+                        should_stop=_stop_requested,
+                    )
+                    if interrupted:
+                        LOGGER.info(
+                            "Worker exiting during quota wait after quota redirect (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                            config.novel_id,
+                            key_index,
+                            model,
+                            worker_id,
+                        )
+                        return 0
+                else:
+                    interrupted = _interruptible_sleep(
+                        max_seconds=0.5,
+                        check_remaining_seconds=lambda: 0.5,
+                        step_seconds=0.25,
+                        min_sleep_seconds=0.1,
+                        should_stop=_stop_requested,
+                    )
+                    if interrupted:
+                        LOGGER.info(
+                            "Worker exiting during short retry wait after quota redirect (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                            config.novel_id,
+                            key_index,
+                            model,
+                            worker_id,
+                        )
+                        return 0
                 continue
             suggested_wait = _parse_quota_suggested_wait_seconds(combined)
             parsed_blocked_model = _parse_quota_blocked_model(combined) or ""
@@ -2877,6 +3262,14 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             if not should_pause and (suggested_wait is None):
                 wait_seconds = 1.0
                 blocked_model = parsed_blocked_model or model
+            wait_seconds, is_rpd_wait = _normalize_quota_wait_seconds(
+                config,
+                client,
+                key_index,
+                blocked_model or model,
+                proposed_wait_seconds=float(wait_seconds or 0.0),
+                text=combined,
+            )
             LOGGER.warning(
                 "Worker quota wait | novel=%s key_index=%s model=%s blocked_model=%s wait_seconds=%.2f",
                 config.novel_id,
@@ -2894,8 +3287,52 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 # Delay the job until the quota window should have cleared.
                 _delay_job(config, client, job_id, float(wait_seconds))
             # Sleep so this worker doesn't keep pulling jobs that will likely be quota-gated too.
-            # Cap at 60s (minute quota window); RPD exhaustion is handled by the top-of-loop pause.
-            time.sleep(max(1.0, min(float(wait_seconds), 60.0)))
+            # For RPD-level waits (>= 1h), enter out-of-quota cooldown; otherwise cap at 60s.
+            if is_rpd_wait and float(wait_seconds) >= 3600.0:
+                cooldown_seconds = min(float(wait_seconds), 3600.0)
+                LOGGER.warning(
+                    "Worker entering out-of-quota cooldown (quota gate with RPD-level wait) "
+                    "| out_of_quota=1 novel=%s key_index=%s model=%s wait_seconds=%.2f",
+                    config.novel_id,
+                    key_index,
+                    model,
+                    cooldown_seconds,
+                )
+                _extend_rate_limit_cooldown(client, out_of_quota_key, seconds=float(cooldown_seconds))
+                interrupted = _interruptible_sleep(
+                    max_seconds=float(cooldown_seconds),
+                    check_remaining_seconds=lambda: _get_rate_limit_cooldown_remaining_seconds(client, out_of_quota_key),
+                    step_seconds=2.0,
+                    min_sleep_seconds=0.5,
+                    should_stop=_stop_requested,
+                )
+                if interrupted:
+                    LOGGER.info(
+                        "Worker exiting during out-of-quota cooldown after quota gate (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                        config.novel_id,
+                        key_index,
+                        model,
+                        worker_id,
+                    )
+                    return 0
+            else:
+                sleep_seconds = max(1.0, min(float(wait_seconds), 60.0))
+                interrupted = _interruptible_sleep(
+                    max_seconds=sleep_seconds,
+                    check_remaining_seconds=lambda: sleep_seconds,
+                    step_seconds=1.0,
+                    min_sleep_seconds=0.25,
+                    should_stop=_stop_requested,
+                )
+                if interrupted:
+                    LOGGER.info(
+                        "Worker exiting during short quota wait (graceful stop) | novel=%s key_index=%s model=%s worker=%s",
+                        config.novel_id,
+                        key_index,
+                        model,
+                        worker_id,
+                    )
+                    return 0
             continue
         if proc.returncode == 0:
             client.hdel(_key(config, "inflight"), job_id)
@@ -2975,18 +3412,34 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
 def run_supervisor(config: NovelConfig) -> int:
     client = _client(config)
     while True:
-        launched = _ensure_worker_processes(config)
-        drained = _drain_delayed_jobs(config, client)
-        _requeue_stale_inflight(config, client)
-        LOGGER.info(
-            "queue pending=%s queued=%s inflight=%s done=%s launched_workers=%s drained_delayed=%s",
-            _pending_total_len(config, client),
-            client.scard(_key(config, "queued")),
-            client.hlen(_key(config, "inflight")),
-            client.hlen(_key(config, "done")),
-            launched,
-            drained,
-        )
+        stopping = _is_stopping(config, client)
+        if stopping:
+            # Do NOT spawn new workers.  Wait for existing ones to drain.
+            inflight = client.hlen(_key(config, "inflight"))
+            alive_workers = _count_alive_worker_processes(config)
+            LOGGER.info(
+                "Supervisor stopping | novel=%s inflight=%s alive_workers=%s",
+                config.novel_id,
+                inflight,
+                alive_workers,
+            )
+            if alive_workers == 0 and inflight == 0:
+                _clear_stopping(config, client)
+                LOGGER.info("Supervisor exiting (all workers drained) | novel=%s", config.novel_id)
+                return 0
+        else:
+            launched = _ensure_worker_processes(config)
+            drained = _drain_delayed_jobs(config, client)
+            _requeue_stale_inflight(config, client)
+            LOGGER.info(
+                "queue pending=%s queued=%s inflight=%s done=%s launched_workers=%s drained_delayed=%s",
+                _pending_total_len(config, client),
+                client.scard(_key(config, "queued")),
+                client.hlen(_key(config, "inflight")),
+                client.hlen(_key(config, "done")),
+                launched,
+                drained,
+            )
         time.sleep(config.queue.supervisor_interval_seconds)
 
 
@@ -3078,6 +3531,22 @@ def _matching_worker_pids(config: NovelConfig, key_index: int, model: str) -> li
         except ValueError:
             continue
     return pids
+
+
+def _count_alive_worker_processes(config: NovelConfig) -> int:
+    """Return the number of worker processes currently alive for this novel."""
+    pattern = f"queue worker {config.novel_id}"
+    proc = subprocess.run(
+        ["pgrep", "-fc", pattern],
+        cwd=str(config.storage.root),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return int((proc.stdout or "").strip())
+    except ValueError:
+        return 0
 
 
 def _reap_unwanted_worker_processes(config: NovelConfig, *, max_key_index: int, worker_models: list[str]) -> int:
@@ -3214,6 +3683,20 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False, *, add_queue:
     worker_keys, worker_cap_reason = _effective_worker_key_limit(config, total_keys=len(keys))
     client = _client(config)
     if restart:
+        # Graceful drain: signal workers to finish current job, then wait.
+        _set_stopping(config, client)
+        print(
+            f"Restarting: waiting for workers to finish current jobs … (novel={config.novel_id})",
+            flush=True,
+        )
+        drained = _wait_for_workers_drain(config, client, timeout_seconds=300.0)
+        if not drained:
+            print(
+                "Timeout waiting for workers — force-killing remaining processes.",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Kill supervisor, monitor (and any stragglers) after drain.
         patterns = [
             f"queue supervisor {config.novel_id}",
             f"queue monitor {config.novel_id}",
@@ -3222,6 +3705,7 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False, *, add_queue:
         ]
         for pattern in patterns:
             subprocess.run(["pkill", "-f", pattern], cwd=str(config.storage.root), check=False)
+        _clear_stopping(config, client)
         client.delete(
             _pending_priority_key(config),
             _pending_delayed_key(config),
@@ -3754,7 +4238,7 @@ def _apply_live_redis_overrides(
             pid_int = int(raw_pid)
         except Exception:
             continue
-        key_prefix = f"{config.queue.redis.prefix}:{config.novel_id}:k{int(raw_key_index)}"
+        key_prefix = _worker_key_prefix_for_index(config, key_index=int(raw_key_index))
         inflight_key = f"{key_prefix}:{raw_model}:quota:alloc:inflight:{pid_int}"
         try:
             inflight_raw = client.get(inflight_key)
@@ -3828,6 +4312,12 @@ def _apply_live_redis_overrides(
         if should_pause and float(wait_seconds or 0.0) > 0.05:
             row["state"] = "waiting-quota"
             row["countdown"] = str(int(math.ceil(float(wait_seconds))))
+            continue
+
+        if _worker_is_recently_picking(config, client, key_index=key_index):
+            # Surface the brief handoff/pick window explicitly, but only when we saw a recent pick attempt.
+            row["state"] = "picking"
+            row["countdown"] = ""
 
 
 def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
@@ -3959,12 +4449,66 @@ def list_all_queue_processes(include_all: bool = False) -> int:
     return 0
 
 
-def stop_queue_processes(config: NovelConfig, pids: list[int] | None = None, roles: list[str] | None = None) -> int:
+def _force_stop_queue_processes(config: NovelConfig, roles: set[str] | None = None) -> None:
+    """Immediately kill queue processes with SIGTERM (the old behaviour)."""
+    patterns: list[str] = []
+    if roles is None or "supervisor" in roles:
+        patterns.append(f"queue supervisor {config.novel_id}")
+    if roles is None or "monitor" in roles:
+        patterns.append(f"queue monitor {config.novel_id}")
+    if roles is None or "worker" in roles:
+        patterns.append(f"queue worker {config.novel_id}")
+    if roles is None or "translate-chapter" in roles:
+        patterns.append(f"translate chapter {config.novel_id}")
+    for pattern in patterns:
+        subprocess.run(["pkill", "-f", pattern], cwd=str(config.storage.root), check=False)
+    LOGGER.info(
+        "Force-stopped queue processes | novel=%s roles=%s",
+        config.novel_id,
+        ", ".join(sorted(roles or [])) or "all",
+    )
+
+
+def _wait_for_workers_drain(config: NovelConfig, client, *, timeout_seconds: float = 300.0) -> bool:
+    """Block until all workers have exited.  Returns True if drained, False on timeout."""
+    deadline = time.time() + timeout_seconds
+    interval = 2.0
+    while time.time() < deadline:
+        alive = _count_alive_worker_processes(config)
+        inflight = client.hlen(_key(config, "inflight"))
+        if alive == 0 and inflight == 0:
+            return True
+        LOGGER.info(
+            "Waiting for workers to drain | novel=%s alive_workers=%s inflight=%s",
+            config.novel_id,
+            alive,
+            inflight,
+        )
+        print(
+            f"  stopping: {alive} worker(s) alive, {inflight} job(s) in-flight …",
+            flush=True,
+        )
+        time.sleep(interval)
+    return False
+
+
+def stop_queue_processes(
+    config: NovelConfig,
+    pids: list[int] | None = None,
+    roles: list[str] | None = None,
+    *,
+    force: bool = False,
+) -> int:
     """Stop queue-related processes for a novel.
 
-    - If pids is provided, only those PIDs are stopped.
-    - Otherwise, processes are stopped by role(s) (or all roles if roles is None/empty).
+    Default (graceful): sets a stopping signal so workers finish their current
+    sub-phase (translate chapter, repair, glossary) then exit.  The supervisor
+    stops spawning new workers and exits once all workers have drained.
+
+    --force: immediately SIGTERM all matching processes (old behaviour).
+    --pid:   immediately SIGTERM the specified PIDs.
     """
+    # Direct PID kill — always immediate.
     if pids:
         for pid in pids:
             subprocess.run(["kill", str(pid)], cwd=str(config.storage.root), check=False)
@@ -3973,17 +4517,36 @@ def stop_queue_processes(config: NovelConfig, pids: list[int] | None = None, rol
 
     selected = {r.strip() for r in (roles or []) if r.strip()} or None
 
-    patterns: list[str] = []
-    if selected is None or "supervisor" in selected:
-        patterns.append(f"queue supervisor {config.novel_id}")
-    if selected is None or "monitor" in selected:
-        patterns.append(f"queue monitor {config.novel_id}")
-    if selected is None or "worker" in selected:
-        patterns.append(f"queue worker {config.novel_id}")
-    if selected is None or "translate-chapter" in selected:
-        patterns.append(f"translate chapter {config.novel_id}")
+    # --force: immediate kill, same as the old behaviour.
+    if force:
+        _force_stop_queue_processes(config, roles=selected)
+        return 0
 
-    for pattern in patterns:
-        subprocess.run(["pkill", "-f", pattern], cwd=str(config.storage.root), check=False)
-    LOGGER.info("Stopped queue processes for novel=%s roles=%s", config.novel_id, ", ".join(sorted(selected or [])) or "all")
+    # Graceful path ---------------------------------------------------------
+    client = _client(config)
+    _set_stopping(config, client)
+    print(
+        f"Graceful stop initiated for novel={config.novel_id}. "
+        "Workers will finish current jobs then exit …",
+        flush=True,
+    )
+
+    drained = _wait_for_workers_drain(config, client, timeout_seconds=300.0)
+    if not drained:
+        print(
+            "Timeout waiting for workers to drain. Sending SIGTERM to remaining processes.",
+            file=sys.stderr,
+            flush=True,
+        )
+        _force_stop_queue_processes(config, roles=selected)
+        _clear_stopping(config, client)
+        return 1
+
+    # Workers are gone — kill supervisor and monitor.
+    for role_pattern in (f"queue supervisor {config.novel_id}", f"queue monitor {config.novel_id}"):
+        subprocess.run(["pkill", "-f", role_pattern], cwd=str(config.storage.root), check=False)
+
+    _clear_stopping(config, client)
+    print(f"All queue processes stopped gracefully for novel={config.novel_id}.", flush=True)
+    LOGGER.info("Graceful stop complete | novel=%s", config.novel_id)
     return 0

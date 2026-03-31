@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import re
 
+from opencc import OpenCC
+
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 ALLOWED_SOURCE_PUNCT_RE = re.compile(r"[《》〈〉（）()·・「」『』、，,\s]")
 SOURCE_VARIANT_CHAR_MAP = {
     "群": "羣",
     "羣": "群",
+    "云": "雲",
+    "雲": "云",
+    "开": "開",
+    "開": "开",
 }
 
 COMMON_SOURCE_TERMS = {
@@ -90,6 +96,9 @@ COMMON_SOURCE_TERMS = {
     "宾馆",
     "賓館",
 }
+
+_OPENCC_T2S = OpenCC("t2s")
+_OPENCC_S2T = OpenCC("s2t")
 
 COMMON_TARGET_TERMS = {
     "văn phòng",
@@ -283,7 +292,12 @@ def source_text_variants(text: str) -> list[str]:
     if not normalized:
         return []
     variants = {normalized}
+    for converted in (_OPENCC_T2S.convert(normalized), _OPENCC_S2T.convert(normalized)):
+        candidate = normalize_glossary_text(converted)
+        if candidate:
+            variants.add(candidate)
     frontier = {normalized}
+    frontier.update(variants)
     while frontier:
         current = frontier.pop()
         for idx, ch in enumerate(current):

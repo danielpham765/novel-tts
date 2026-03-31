@@ -220,10 +220,23 @@ def _run_pipeline_per_stage(
     skip_upload: bool,
     upload_platform: str,
     force: bool,
+    media_workers: int = 1,
 ) -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from novel_tts.media import create_video, generate_visual
     from novel_tts.tts import create_menu, run_tts
     from novel_tts.upload import run_uploads
+
+    def _parallel(fn, items):
+        if media_workers <= 1 or len(items) <= 1:
+            for args in items:
+                fn(*args)
+            return
+        with ThreadPoolExecutor(max_workers=media_workers) as pool:
+            futures = {pool.submit(fn, *args): args for args in items}
+            for fut in as_completed(futures):
+                fut.result()
 
     if not skip_tts:
         for c_start, c_end, range_key in translated_ranges:
@@ -232,11 +245,15 @@ def _run_pipeline_per_stage(
         for c_start, c_end, range_key in translated_ranges:
             create_menu(config, c_start, c_end, range_key)
     if not skip_visual:
-        for c_start, c_end, _ in translated_ranges:
-            generate_visual(config, c_start, c_end, force=force)
+        _parallel(
+            lambda s, e: generate_visual(config, s, e, force=force),
+            [(c_start, c_end) for c_start, c_end, _ in translated_ranges],
+        )
     if not skip_video:
-        for c_start, c_end, _ in translated_ranges:
-            create_video(config, c_start, c_end, force=force)
+        _parallel(
+            lambda s, e: create_video(config, s, e, force=force),
+            [(c_start, c_end) for c_start, c_end, _ in translated_ranges],
+        )
     if not skip_upload:
         upload_ranges = [(c_start, c_end) for c_start, c_end, _ in translated_ranges]
         run_uploads(config, upload_ranges, platform=upload_platform, dry_run=False, force=force)
@@ -253,12 +270,15 @@ def _run_pipeline_per_video(
     skip_upload: bool,
     upload_platform: str,
     force: bool,
+    media_workers: int = 1,
 ) -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from novel_tts.media import create_video, generate_visual
     from novel_tts.tts import create_menu, run_tts
     from novel_tts.upload import run_uploads
 
-    for c_start, c_end, range_key in translated_ranges:
+    def _process_range(c_start: int, c_end: int, range_key: str) -> tuple[int, int]:
         if not skip_tts:
             run_tts(config, c_start, c_end, range_key, force=force)
         if not skip_create_menu:
@@ -267,8 +287,21 @@ def _run_pipeline_per_video(
             generate_visual(config, c_start, c_end, force=force)
         if not skip_video:
             create_video(config, c_start, c_end, force=force)
-        if not skip_upload:
-            run_uploads(config, [(c_start, c_end)], platform=upload_platform, dry_run=False, force=force)
+        return c_start, c_end
+
+    if media_workers <= 1:
+        for c_start, c_end, range_key in translated_ranges:
+            _process_range(c_start, c_end, range_key)
+            if not skip_upload:
+                run_uploads(config, [(c_start, c_end)], platform=upload_platform, dry_run=False, force=force)
+    else:
+        # Run media (TTS + visual + video) for N ranges in parallel; upload sequentially in order.
+        with ThreadPoolExecutor(max_workers=media_workers) as pool:
+            ordered = [(r, pool.submit(_process_range, *r)) for r in translated_ranges]
+        for (c_start, c_end, _), fut in ordered:
+            fut.result()
+            if not skip_upload:
+                run_uploads(config, [(c_start, c_end)], platform=upload_platform, dry_run=False, force=force)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -453,6 +486,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "Known roles include: supervisor, monitor, worker, translate-chapter."
         ),
     )
+    queue_stop_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Immediately SIGTERM all processes instead of waiting for current jobs to finish.",
+    )
     queue_worker_parser = queue_sub.add_parser("worker")
     queue_worker_parser.add_argument("novel_id")
     queue_worker_parser.add_argument("--key-index", type=int, required=True)
@@ -527,6 +565,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Regenerate visual assets even if the cached final outputs already match the current inputs.",
     )
+    visual_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of ranges to process in parallel (default: 1).",
+    )
 
     video_parser = subparsers.add_parser("video")
     video_parser.add_argument("novel_id")
@@ -535,6 +580,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Regenerate final video even if the cached output already matches the current visual/audio inputs.",
+    )
+    video_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of ranges to process in parallel (default: 1).",
     )
 
     create_menu_parser = subparsers.add_parser("create-menu")
@@ -723,6 +775,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--upload-platform",
         choices=["youtube", "tiktok"],
         help="Override upload platform for pipeline upload step. Defaults to upload.default_platform.",
+    )
+    pipeline_run.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of ranges to process in parallel for visual/video stages (default: from config).",
     )
     pipeline_watch = pipeline_sub.add_parser("watch")
     pipeline_watch.add_argument("novel_ids", nargs="*")
@@ -1371,10 +1430,12 @@ def main(argv: list[str] | None = None) -> int:
                             part = part.strip()
                             if part:
                                 roles.append(part)
+                force = bool(getattr(args, "force", False))
                 return stop_queue_processes(
                     config,
                     pids=pids,
                     roles=roles,
+                    force=force,
                 )
             if args.queue_command == "worker":
                 if config is None:
@@ -1469,6 +1530,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "visual":
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             from novel_tts.media import generate_visual, generate_visual_for_chapter
 
             config = load_novel_config(args.novel_id)
@@ -1479,20 +1542,39 @@ def main(argv: list[str] | None = None) -> int:
                 LOGGER.info("Thumbnail: %s", thumbnail)
                 return 0
 
+            force = bool(getattr(args, "force", False))
+            workers = max(1, int(getattr(args, "workers", None) or config.video.media_workers))
             start, end = parse_range(args.range)
-            for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                visual, thumbnail = generate_visual(config, c_start, c_end, force=bool(getattr(args, "force", False)))
-                LOGGER.info("Visual video: %s", visual)
-                LOGGER.info("Thumbnail: %s", thumbnail)
+            ranges = list(get_translated_ranges(config, start, end))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(generate_visual, config, c_start, c_end, force): (c_start, c_end)
+                    for c_start, c_end, _ in ranges
+                }
+                for fut in as_completed(futures):
+                    c_start, c_end = futures[fut]
+                    visual, thumbnail = fut.result()
+                    LOGGER.info("Visual video: %s", visual)
+                    LOGGER.info("Thumbnail: %s", thumbnail)
             return 0
 
         if args.command == "video":
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             from novel_tts.media import create_video
 
             config = load_novel_config(args.novel_id)
+            force = bool(getattr(args, "force", False))
+            workers = max(1, int(getattr(args, "workers", None) or config.video.media_workers))
             start, end = parse_range(args.range)
-            for c_start, c_end, _ in get_translated_ranges(config, start, end):
-                LOGGER.info("Video: %s", create_video(config, c_start, c_end, force=bool(getattr(args, "force", False))))
+            ranges = list(get_translated_ranges(config, start, end))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(create_video, config, c_start, c_end, force): (c_start, c_end)
+                    for c_start, c_end, _ in ranges
+                }
+                for fut in as_completed(futures):
+                    LOGGER.info("Video: %s", fut.result())
             return 0
 
         if args.command == "upload":
@@ -1794,8 +1876,9 @@ def main(argv: list[str] | None = None) -> int:
             upload_platform = str(
                 getattr(args, "upload_platform", None) or getattr(config.upload, "default_platform", "youtube")
             )
-            pipeline_mode = str(getattr(args, "mode", "per-stage") or "per-stage")
+            pipeline_mode = str(getattr(args, "mode", None) or config.video.pipeline_mode or "per-stage")
             pipeline_force = bool(getattr(args, "force", False))
+            media_workers = max(1, int(getattr(args, "workers", None) or config.video.media_workers))
             if pipeline_mode == "per-video":
                 _run_pipeline_per_video(
                     config,
@@ -1807,6 +1890,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_upload=run_stage_flags["upload"],
                     upload_platform=upload_platform,
                     force=pipeline_force,
+                    media_workers=media_workers,
                 )
             else:
                 _run_pipeline_per_stage(
@@ -1819,6 +1903,7 @@ def main(argv: list[str] | None = None) -> int:
                     skip_upload=run_stage_flags["upload"],
                     upload_platform=upload_platform,
                     force=pipeline_force,
+                    media_workers=media_workers,
                 )
             return 0
 

@@ -195,23 +195,19 @@ def _client(cfg: RedisCfg) -> redis.Redis:
     return redis.Redis(host=cfg.host, port=cfg.port, db=cfg.database, decode_responses=True)
 
 
-def _parse_alloc_queue_key(key: str) -> tuple[str, int, str] | None:
-    # Expected: {prefix}:{novel_id}:k{idx}:{model}:quota:alloc:queue
+def _parse_alloc_queue_key(key: str) -> tuple[str, str, str] | None:
+    # Expected: {prefix}:{novel_id}:{key_token}:{model}:quota:alloc:queue
     parts = [p for p in str(key).split(":") if p]
     if len(parts) < 7:
         return None
     if parts[-3:] != ["quota", "alloc", "queue"]:
         return None
-    try:
-        key_token = parts[-5]
-        if not key_token.startswith("k"):
-            return None
-        key_index = int(key_token[1:])
-    except Exception:
+    key_prefix = ":".join(parts[:-4])
+    if not key_prefix:
         return None
     model = parts[-4]
     novel_id = parts[-6]
-    return novel_id, key_index, model
+    return novel_id, key_prefix, model
 
 
 @lru_cache(maxsize=256)
@@ -223,8 +219,7 @@ def _model_limits_for(novel_id: str, model: str) -> tuple[int, int, int]:
     return int(cfg.rpm_limit or 0), int(cfg.tpm_limit or 0), int(cfg.rpd_limit or 0)
 
 
-def _script_keys_for(prefix: str, novel_id: str, key_index: int, model: str) -> list[str]:
-    key_prefix = f"{prefix}:{novel_id}:k{key_index}"
+def _script_keys_for(*, key_prefix: str, model: str) -> list[str]:
     from novel_tts.quota.client import _quota_script_keys
 
     return _quota_script_keys(key_prefix=key_prefix, model=model)
@@ -239,9 +234,7 @@ def _refresh_queue_etas(
     client: redis.Redis,
     *,
     queue_key: str,
-    prefix: str,
-    novel_id: str,
-    key_index: int,
+    key_prefix: str,
     model: str,
     rpm_limit: int,
     tpm_limit: int,
@@ -295,7 +288,7 @@ def _refresh_queue_etas(
         client.delete(_eta_key_for_queue(queue_key))
         return
 
-    script_keys = _script_keys_for(prefix, novel_id, key_index, model)
+    script_keys = _script_keys_for(key_prefix=key_prefix, model=model)
     (
         tpm_freezed_zset,
         tpm_freezed_hash,
@@ -396,7 +389,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
     client = _client(cfg)
     proxy_cfg = _load_proxy_gateway_cfg()
 
-    pattern = f"{cfg.prefix}:*:k*:*:quota:alloc:queue"
+    pattern = f"{cfg.prefix}:*:*:*:quota:alloc:queue"
     rotate_requests_key = f"{cfg.prefix}:logrotate:requests"
     LOGGER.info(
         "quota-supervisor started | redis=%s:%s db=%s prefix=%s pattern=%s",
@@ -554,7 +547,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                 # Unknown format; avoid tight loop.
                 next_check_by_queue[queue_key] = now + 1.0
                 continue
-            novel_id, key_index, model = meta
+            novel_id, key_prefix, model = meta
             try:
                 request = json.loads(head)
             except Exception:
@@ -586,9 +579,9 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                 continue
             if rpm_req != 1 or rpd_req != 1:
                 LOGGER.warning(
-                    "quota request rejected (unsupported rpm_req/rpd_req) | novel=%s key_index=%s model=%s pid=%s request_id=%s rpm_req=%s rpd_req=%s",
+                    "quota request rejected (unsupported rpm_req/rpd_req) | novel=%s key=%s model=%s pid=%s request_id=%s rpm_req=%s rpd_req=%s",
                     novel_id,
-                    key_index,
+                    key_prefix,
                     model,
                     pid,
                     request_id,
@@ -602,7 +595,6 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
             # Soft upstream backoff: when workers still see HTTP 429 even though quota was granted, they may set
             # a per key-model penalty window. Avoid granting during that window to reduce 429 storms.
             try:
-                key_prefix = f"{cfg.prefix}:{novel_id}:k{int(key_index)}"
                 penalty_key = quota_keys.penalty_until_key(key_prefix=key_prefix, model=model)
                 penalty_raw = client.get(penalty_key)
                 penalty_until = float(penalty_raw) if penalty_raw else 0.0
@@ -618,7 +610,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                     LOGGER.info(
                         "quota deny | novel=%s key=%s model=%s pid=%s | req=%s tokens=%s | wait=%.2fs reasons=%s detail=%s",
                         novel_id,
-                        key_index,
+                        key_prefix,
                         model,
                         pid,
                         "1",
@@ -637,9 +629,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                     _refresh_queue_etas(
                         client,
                         queue_key=queue_key,
-                        prefix=cfg.prefix,
-                        novel_id=novel_id,
-                        key_index=key_index,
+                        key_prefix=key_prefix,
                         model=model,
                         rpm_limit=rpm_limit,
                         tpm_limit=tpm_limit,
@@ -649,7 +639,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                     LOGGER.debug("quota supervisor: eta refresh failed | queue=%s err=%s", queue_key, exc)
                 next_eta_refresh_by_queue[queue_key] = now + 1.0
 
-            script_keys = _script_keys_for(cfg.prefix, novel_id, key_index, model)
+            script_keys = _script_keys_for(key_prefix=key_prefix, model=model)
             try:
                 result = client.eval(
                     TRY_GRANT_LUA,
@@ -733,7 +723,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                 LOGGER.info(
                     "quota grant | novel=%s key=%s model=%s pid=%s | req=%s tokens=%s | rpm=%s/%s tpm=%s/%s rpd=%s/%s",
                     novel_id,
-                    key_index,
+                    key_prefix,
                     model,
                     pid,
                     "1",
@@ -778,7 +768,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                     LOGGER.info(
                         "quota deny | novel=%s key=%s model=%s pid=%s | req=%s tokens=%s | wait=%.2fs reasons=%s detail=%s",
                         novel_id,
-                        key_index,
+                        key_prefix,
                         model,
                         pid,
                         "1",

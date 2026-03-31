@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 novel_tts/__init__.py
 novel_tts/__main__.py
+novel_tts/key_identity.py
 novel_tts.egg-info/PKG-INFO
 novel_tts.egg-info/SOURCES.txt
 novel_tts.egg-info/dependency_links.txt
@@ -25,6 +26,7 @@ novel_tts/config/models.py
 novel_tts/crawl/__init__.py
 novel_tts/crawl/base.py
 novel_tts/crawl/challenge.py
+novel_tts/crawl/playwright_worker.py
 novel_tts/crawl/registry.py
 novel_tts/crawl/repair_config.py
 novel_tts/crawl/service.py
@@ -44,6 +46,8 @@ novel_tts/media/__init__.py
 novel_tts/media/service.py
 novel_tts/net/__init__.py
 novel_tts/net/proxy_gateway.py
+novel_tts/pipeline/__init__.py
+novel_tts/pipeline/watch.py
 novel_tts/queue/__init__.py
 novel_tts/queue/translation_queue.py
 novel_tts/quota/__init__.py
@@ -92,6 +96,7 @@ tests/test_queue_lmm_jobs.py
 tests/test_queue_ps_all_inflight_count.py
 tests/test_queue_ps_countdown_format.py
 tests/test_queue_ps_follow_flag.py
+tests/test_queue_ps_picking.py
 tests/test_queue_ps_state_classifier.py
 tests/test_queue_ps_target_count.py
 tests/test_queue_ps_target_format.py
@@ -109,6 +114,7 @@ tests/test_quota_supervisor_daemon_flag.py
 tests/test_repair_config_generate_from_research.py
 tests/test_repair_config_merge.py
 tests/test_translate_captions.py
+tests/test_translate_fake_virtual_fishing_rod.py
 tests/test_translate_force_clears_progress.py
 tests/test_translate_model_selection.py
 tests/test_translate_placeholder_restore.py

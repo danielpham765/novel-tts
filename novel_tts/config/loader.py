@@ -627,7 +627,7 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         raise ValueError('Invalid novel "visual" config (expected object)')
     visual_raw.setdefault("background_video", "")
     visual_raw.setdefault("background_cover", "")
-    video_raw = raw.get("video", {})
+    video_raw = _deep_merge(app_raw.get("video", {}) or {}, raw.get("video", {}) or {})
     if video_raw is None:
         video_raw = {}
     if not isinstance(video_raw, dict):

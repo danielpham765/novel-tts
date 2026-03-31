@@ -1364,6 +1364,67 @@ def final_cleanup_chunked(config: NovelConfig, provider, model: str, *, unit_key
     return "".join(translated_chunks)
 
 
+def _build_forbidden_lines_with_hints(config: NovelConfig, forbidden_terms: list[str]) -> str:
+    """Build forbidden-terms prompt section with glossary-derived replacement hints."""
+    proper_sources = _proper_target_sources(config)
+    all_sources = _all_target_sources(config)
+    glossary = getattr(config.translation, "glossary", {}) or {}
+    # Build reverse: Chinese source -> Vietnamese target (first match)
+    source_to_target: dict[str, str] = {}
+    for src, tgt in glossary.items():
+        src_norm = normalize_glossary_text(src)
+        if src_norm and src_norm not in source_to_target:
+            source_to_target[src_norm] = normalize_glossary_text(tgt)
+
+    lines: list[str] = []
+    for term in forbidden_terms[:32]:
+        # Find the Chinese sources this term maps to
+        sources = proper_sources.get(term) or all_sources.get(term) or []
+        # Find what correct targets those sources should map to (if different from the forbidden term)
+        hints: list[str] = []
+        for src in sources:
+            correct = source_to_target.get(src, "")
+            if correct and correct != term:
+                hints.append(correct)
+        if hints:
+            lines.append(f"- \"{term}\" (sai) → nên dịch chữ Hán gốc thành: {', '.join(dict.fromkeys(hints))}")
+        else:
+            lines.append(f"- \"{term}\" (sai, không nên xuất hiện)")
+    return (
+        "\n"
+        "Tuyệt đối không dùng lại các cách gọi/dịch sai sau trong đoạn trả lời:\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
+def _load_blocked_repair_attempts(config: NovelConfig, unit_key: str) -> int:
+    """Load the number of blocked-target repair attempts for a unit."""
+    path = config.storage.progress_dir / f"blocked_repair_attempts__{unit_key}.json"
+    if not path.exists():
+        return 0
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("attempts", 0))
+    except Exception:
+        return 0
+
+
+def _save_blocked_repair_attempts(config: NovelConfig, unit_key: str, attempts: int) -> None:
+    """Save the number of blocked-target repair attempts for a unit."""
+    config.storage.progress_dir.mkdir(parents=True, exist_ok=True)
+    path = config.storage.progress_dir / f"blocked_repair_attempts__{unit_key}.json"
+    path.write_text(json.dumps({"attempts": attempts}, ensure_ascii=False), encoding="utf-8")
+
+
+def _clear_blocked_repair_attempts(config: NovelConfig, unit_key: str) -> None:
+    path = config.storage.progress_dir / f"blocked_repair_attempts__{unit_key}.json"
+    if path.exists():
+        path.unlink()
+
+
+_MAX_BLOCKED_REPAIR_ATTEMPTS = 3
+
+
 def repair_against_source_chunked(
     config: NovelConfig,
     provider,
@@ -1433,12 +1494,7 @@ def repair_against_source_chunked(
         tr_window = translated_windows[idx]
         forbidden_lines = ""
         if forbidden_terms:
-            forbidden_lines = (
-                "\n"
-                "Tuyệt đối không dùng lại các cách gọi/dịch sai sau trong đoạn trả lời:\n"
-                + "\n".join(f"- {term}" for term in forbidden_terms[:32])
-                + "\n"
-            )
+            forbidden_lines = _build_forbidden_lines_with_hints(config, forbidden_terms)
         LOGGER.info(
             "repair_against_source (chunked) fixing | unit=%s chunk=%s/%s chars=%s han=%s",
             unit_key,
@@ -2730,51 +2786,64 @@ def translate_unit(config: NovelConfig, unit_key: str, raw_text: str) -> str:
         )
     blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
     if blocked_targets:
-        LOGGER.warning(
-            "Blocked glossary targets detected after cleanup; repairing against source | unit=%s examples=%s",
-            unit_key,
-            ", ".join(blocked_targets[:8]),
-        )
-        merged = repair_against_source_chunked(
-            config,
-            provider,
-            repair_model,
-            unit_key=unit_key,
-            source_text=raw_text,
-            translated_text=merged,
-            force_repair_without_han=True,
-            forbidden_terms=blocked_targets,
-        )
-        merged = post_process(merged, translation_cfg.post_replacements)
-        merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
-        blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
-        if blocked_targets:
-            fallback_repair_model = _alternate_repair_model(config, repair_model)
-            if fallback_repair_model:
-                LOGGER.warning(
-                    "Blocked glossary targets persisted after repair with %s; retrying with %s | unit=%s examples=%s",
-                    repair_model,
-                    fallback_repair_model,
-                    unit_key,
-                    ", ".join(blocked_targets[:8]),
-                )
-                merged = repair_against_source_chunked(
-                    config,
-                    provider,
-                    fallback_repair_model,
-                    unit_key=unit_key,
-                    source_text=raw_text,
-                    translated_text=merged,
-                    force_repair_without_han=True,
-                    forbidden_terms=blocked_targets,
-                )
-                merged = post_process(merged, translation_cfg.post_replacements)
-                merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
-                blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
-        if blocked_targets:
-            raise InputTranslationError(
-                f"Blocked glossary targets detected after cleanup: {unit_key} examples={', '.join(blocked_targets[:8])}"
+        blocked_attempts = _load_blocked_repair_attempts(config, unit_key) + 1
+        _save_blocked_repair_attempts(config, unit_key, blocked_attempts)
+        if blocked_attempts > _MAX_BLOCKED_REPAIR_ATTEMPTS:
+            LOGGER.warning(
+                "Blocked glossary targets still present after %s attempts; accepting translation | unit=%s examples=%s",
+                blocked_attempts - 1,
+                unit_key,
+                ", ".join(blocked_targets[:8]),
             )
+        else:
+            LOGGER.warning(
+                "Blocked glossary targets detected after cleanup; repairing against source (attempt %s/%s) | unit=%s examples=%s",
+                blocked_attempts,
+                _MAX_BLOCKED_REPAIR_ATTEMPTS,
+                unit_key,
+                ", ".join(blocked_targets[:8]),
+            )
+            merged = repair_against_source_chunked(
+                config,
+                provider,
+                repair_model,
+                unit_key=unit_key,
+                source_text=raw_text,
+                translated_text=merged,
+                force_repair_without_han=True,
+                forbidden_terms=blocked_targets,
+            )
+            merged = post_process(merged, translation_cfg.post_replacements)
+            merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+            blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
+            if blocked_targets:
+                fallback_repair_model = _alternate_repair_model(config, repair_model)
+                if fallback_repair_model:
+                    LOGGER.warning(
+                        "Blocked glossary targets persisted after repair with %s; retrying with %s | unit=%s examples=%s",
+                        repair_model,
+                        fallback_repair_model,
+                        unit_key,
+                        ", ".join(blocked_targets[:8]),
+                    )
+                    merged = repair_against_source_chunked(
+                        config,
+                        provider,
+                        fallback_repair_model,
+                        unit_key=unit_key,
+                        source_text=raw_text,
+                        translated_text=merged,
+                        force_repair_without_han=True,
+                        forbidden_terms=blocked_targets,
+                    )
+                    merged = post_process(merged, translation_cfg.post_replacements)
+                    merged = apply_rule_based_han_fixes(merged, translation_cfg.han_fallback_replacements)
+                    blocked_targets = find_blocked_glossary_targets(config, merged, source_text=raw_text)
+            if blocked_targets:
+                raise InputTranslationError(
+                    f"Blocked glossary targets detected after cleanup: {unit_key} examples={', '.join(blocked_targets[:8])}"
+                )
+    _clear_blocked_repair_attempts(config, unit_key)
     if translate_progress_key:
         clear_progress(config, translate_progress_key)
     _clear_translated_stage(config, unit_key)

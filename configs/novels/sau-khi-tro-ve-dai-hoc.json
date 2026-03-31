@@ -1,13 +1,13 @@
 {
-  "novel_id": "sau-khi-tro-ve-dai-hoc",
+  "novel_id": "tro-lai-dai-hoc",
   "title": "Sau Khi Tro Ve Dai Hoc",
-  "slug": "sau-khi-tro-ve-dai-hoc",
+  "slug": "tro-lai-dai-hoc",
   "source_language": "zh",
   "target_language": "vi",
   "storage": {
-    "input_dir": "input/sau-khi-tro-ve-dai-hoc",
-    "output_dir": "output/sau-khi-tro-ve-dai-hoc",
-    "image_dir": "image/sau-khi-tro-ve-dai-hoc",
+    "input_dir": "input/tro-lai-dai-hoc",
+    "output_dir": "output/tro-lai-dai-hoc",
+    "image_dir": "image/tro-lai-dai-hoc",
     "logs_dir": ".logs",
     "tmp_dir": "tmp"
   },
@@ -20,7 +20,7 @@
     ]
   },
   "translation": {
-    "glossary_file": "configs/glossaries/sau-khi-tro-ve-dai-hoc.json",
+    "glossary_file": "configs/glossaries/tro-lai-dai-hoc.json",
     "line_token": "QZXBRQ",
     "post_replacements": {},
     "han_fallback_replacements": {},

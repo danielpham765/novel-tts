@@ -74,6 +74,7 @@ def _visual_cache_value(
     episode_batch_size: int,
     start: int,
     end: int,
+    use_gpu: bool = False,
 ) -> str:
     parts = [
         f"mode={mode}",
@@ -87,6 +88,7 @@ def _visual_cache_value(
         f"episode_batch_size={episode_batch_size}",
         f"start={start}",
         f"end={end}",
+        f"use_gpu={use_gpu}",
     ]
     return _cache_value(*parts)
 
@@ -96,22 +98,24 @@ def _video_cache_value(
     visual_path: Path,
     audio_path: Path,
     duration: float,
-    video_codec: str,
-    audio_codec: str,
-    preset: str,
-    crf: int,
-    audio_bitrate: str,
 ) -> str:
     return _cache_value(
         f"visual={_file_signature(visual_path)}",
         f"audio={_file_signature(audio_path)}",
         f"duration={duration}",
-        f"video_codec={video_codec}",
-        f"audio_codec={audio_codec}",
-        f"preset={preset}",
-        f"crf={crf}",
-        f"audio_bitrate={audio_bitrate}",
     )
+
+
+def _visual_encode_args(config: NovelConfig) -> list[str]:
+    if config.video.use_gpu:
+        _nvenc_preset_map = {
+            "ultrafast": "p1", "superfast": "p1", "veryfast": "p2",
+            "faster": "p3", "fast": "p4", "medium": "p5",
+            "slow": "p6", "slower": "p7", "veryslow": "p7",
+        }
+        nvenc_preset = _nvenc_preset_map.get(config.video.preset, config.video.preset)
+        return ["-c:v", "h264_nvenc", "-preset", nvenc_preset, "-cq", str(config.video.crf), "-b:v", "0"]
+    return ["-c:v", config.video.video_codec, "-preset", config.video.preset, "-crf", str(config.video.crf)]
 
 
 def generate_visual(config: NovelConfig, start: int, end: int, force: bool = False) -> tuple[Path, Path]:
@@ -144,6 +148,7 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
         episode_batch_size=episode_batch_size,
         start=start,
         end=end,
+        use_gpu=config.video.use_gpu,
     )
     cached_value = _read_cache(output_dir, range_key)
     outputs_exist = (
@@ -172,9 +177,11 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
         f"[1:v]scale=-1:80[channel];"
         f"[base][channel]overlay=x=W-w-5:y=10[v]"
     )
+    decode_args = []
     run_ffmpeg(
         [
             "-y",
+            *decode_args,
             "-i",
             str(background),
             "-i",
@@ -184,10 +191,11 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
             "-map",
             "[v]",
             "-an",
+            *_visual_encode_args(config),
             str(output_video),
         ]
     )
-    run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", str(thumbnail)])
+    run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", "-update", "1", str(thumbnail)])
     _write_cache(output_dir, range_key, expected_cache)
     return output_video, thumbnail
 
@@ -225,6 +233,7 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int, force: bool =
         episode_batch_size=max(1, int(getattr(config.video, "episode_batch_size", 10) or 10)),
         start=chapter,
         end=chapter,
+        use_gpu=config.video.use_gpu,
     )
     cached_value = _read_cache(output_dir, range_key)
     outputs_exist = (
@@ -261,14 +270,13 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int, force: bool =
             "1",
             "-r",
             "30",
-            "-c:v",
-            "libx264",
+            *_visual_encode_args(config),
             "-pix_fmt",
             "yuv420p",
             str(output_video),
         ]
     )
-    run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", str(thumbnail)])
+    run_ffmpeg(["-y", "-i", str(output_video), "-vframes", "1", "-update", "1", str(thumbnail)])
     _write_cache(output_dir, range_key, expected_cache)
     return output_video, thumbnail
 
@@ -276,7 +284,7 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int, force: bool =
 def create_video(config: NovelConfig, start: int, end: int, force: bool = False) -> Path:
     range_key = _range_key(start, end)
     visual_path = config.storage.visual_dir / f"{range_key}.mp4"
-    audio_path = config.storage.audio_dir / range_key / f"{range_key}.mp3"
+    audio_path = config.storage.audio_dir / range_key / f"{range_key}.aac"
     if not visual_path.exists():
         raise FileNotFoundError(f"Visual asset not found: {visual_path}")
     if not audio_path.exists():
@@ -288,15 +296,12 @@ def create_video(config: NovelConfig, start: int, end: int, force: bool = False)
         visual_path=visual_path,
         audio_path=audio_path,
         duration=duration,
-        video_codec=config.video.video_codec,
-        audio_codec=config.video.audio_codec,
-        preset=config.video.preset,
-        crf=config.video.crf,
-        audio_bitrate=config.video.audio_bitrate,
     )
     cached_value = _read_cache(config.storage.video_dir, range_key)
     if (not force) and output_path.exists() and output_path.stat().st_size > 0 and cached_value == expected_cache:
         return output_path
+    # Visual and audio are already encoded — copy both streams directly.
+    # -bsf:a aac_adtstoasc converts the ADTS AAC headers to MP4-compatible format (lossless).
     run_ffmpeg(
         [
             "-y",
@@ -307,15 +312,11 @@ def create_video(config: NovelConfig, start: int, end: int, force: bool = False)
             "-i",
             str(audio_path),
             "-c:v",
-            config.video.video_codec,
+            "copy",
             "-c:a",
-            config.video.audio_codec,
-            "-preset",
-            config.video.preset,
-            "-crf",
-            str(config.video.crf),
-            "-b:a",
-            config.video.audio_bitrate,
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
             "-t",
             str(duration),
             str(output_path),

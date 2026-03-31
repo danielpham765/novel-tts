@@ -46,9 +46,9 @@ models:
 tts:
   provider: gradio_vie_tts
   voice: Doan
-  # server_name: local
+  server_name: local
+  # server_name: ttsCloud
   # model_name: macos
-  server_name: ttsCloud
   model_name: gpu
   generation_mode: Standard (Một lần)
   use_batch: true
@@ -56,12 +56,13 @@ tts:
   temperature: 0.8
   max_chars_chunk: 256
   tempo: 1.15
-  bitrate: 192k
+  bitrate: 96k
+  merge_workers: 14
 
 queue:
   redis:
     host: 127.0.0.1
-    port: 6379
+    port: 16379
     database: 1
     prefix: novel_tts
   min_pick_interval_seconds: 2.0
@@ -76,15 +77,17 @@ upload:
   youtube:
     enabled: true
     project: rotate
-    # project: 1
+    # project: 4
     credentials_path:
       - .secrets/youtube/client_secrets-1.json
       - .secrets/youtube/client_secrets-2.json
       - .secrets/youtube/client_secrets-3.json
+      - .secrets/youtube/client_secrets-4.json
     token_path:
       - .secrets/youtube/token-1.json
       - .secrets/youtube/token-2.json
       - .secrets/youtube/token-3.json
+      - .secrets/youtube/token-4.json
     category_id: "22"
     privacy_status: public
     self_declared_made_for_kids: false
@@ -106,10 +109,15 @@ upload:
     title_file: title.txt
     description_file: description.txt
 
+video:
+  use_gpu: true
+  media_workers: 14
+  pipeline_mode: per-stage
+
 pipeline:
   watch:
     novels:
-      - sau-khi-tro-ve-dai-hoc
+      - tro-lai-dai-hoc
       - thai-hu-chi-ton
     interval_seconds: 86400
     restart_queue: false

@@ -10,6 +10,7 @@ Requires-Dist: google-auth-httplib2>=0.2.0
 Requires-Dist: google-auth-oauthlib>=1.2.1
 Requires-Dist: gradio-client>=1.12.1
 Requires-Dist: openai>=1.68.2
+Requires-Dist: opencc-python-reimplemented>=0.1.7
 Requires-Dist: playwright>=1.54.0
 Requires-Dist: PyYAML>=6.0.2
 Requires-Dist: redis>=5.2.1
@@ -234,8 +235,8 @@ Queue-first guidance:
 
 `pipeline run` is useful for orchestration, but note:
 
-- its translation step uses direct `translate novel`
-- if you want queue-only translation, run queue translation separately and use `pipeline run --skip-translate`
+- its translation step launches the queue stack, enqueues the requested chapter range, and waits for queue completion before downstream media
+- it does not run caption translation
 
 Examples:
 
@@ -243,7 +244,7 @@ Examples:
 # End-to-end range
 uv run novel-tts pipeline run <novel_id> --range <start>-<end>
 
-# Queue-first style: skip translate in pipeline
+# Use existing translated chapters only
 uv run novel-tts pipeline run <novel_id> --range <start>-<end> --skip-translate
 
 # Downstream media stage-by-stage across a large range
@@ -251,6 +252,12 @@ uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-stage
 
 # Process each translated batch end-to-end
 uv run novel-tts pipeline run <novel_id> --range 1-2000 --mode per-video
+
+# Watch one or more novels for new remote chapters, then crawl -> queue translate ->
+# repair -> polish -> TTS. Visual/video/upload run automatically once a full batch is ready.
+uv run novel-tts pipeline watch <novel_id>
+uv run novel-tts pipeline watch <novel_a> <novel_b> --interval-seconds 600
+uv run novel-tts pipeline watch --all
 ```
 
 ## Command reference
@@ -465,6 +472,8 @@ Behavior notes:
 
 - per-chapter WAVs are written under `output/<novel_id>/audio/<range>/.parts/`
 - per-chapter text hashes are cached under `output/<novel_id>/audio/<range>/.parts/.cache/`
+- merged MP3 cache metadata is stored at `output/<novel_id>/audio/<range>/.parts/.cache/merged.sha256`
+- if all chapter WAVs are cache hits and `output/<novel_id>/audio/<range>/<range>.mp3` already exists, merge is skipped unless `--force` is used
 - if translated text changes, the chapter will be re-synthesized even without `--force`
 
 ```bash
@@ -477,8 +486,15 @@ uv run novel-tts tts <novel_id> --range 701-800 --tts-server-name onPremise --tt
 
 Generates the visual layer under `output/<novel_id>/visual/`.
 
+Behavior notes:
+
+- final visual outputs are cached via `output/<novel_id>/visual/.cache/<range>.sha256`
+- rerender is skipped when the cached inputs still match the existing visual MP4 + thumbnail PNG
+- use `--force` to rerender even when the cache matches
+
 ```bash
 uv run novel-tts visual <novel_id> --range 1-10
+uv run novel-tts visual <novel_id> --range 1-10 --force
 uv run novel-tts visual <novel_id> --chapter 1
 ```
 
@@ -486,8 +502,15 @@ uv run novel-tts visual <novel_id> --chapter 1
 
 Writes final MP4s under `output/<novel_id>/video/`.
 
+Behavior notes:
+
+- final muxed videos are cached via `output/<novel_id>/video/.cache/<range>.sha256`
+- remux is skipped when the cached visual/audio inputs still match the existing final MP4
+- use `--force` to remux even when the cache matches
+
 ```bash
 uv run novel-tts video <novel_id> --range 1-10
+uv run novel-tts video <novel_id> --range 1-10 --force
 ```
 
 ### Upload
@@ -520,6 +543,7 @@ Default audience/visibility:
 uv run novel-tts upload <novel_id> --platform youtube --range 1-10
 uv run novel-tts upload <novel_id> --platform youtube --range 1-10 --dry-run
 uv run novel-tts upload <novel_id> --platform tiktok --range 1-10
+uv run novel-tts upload <novel_id> --platform youtube --remove-duplicated
 ```
 
 YouTube upload pacing can be tuned with:
@@ -561,12 +585,17 @@ How to get `token.json`:
 
 Multi-account note:
 
-- `upload.youtube.project` supports `rotate`, `1`, `2`, `3`, ...
-- `rotate` tries account 1, then 2, then 3 when a request hits `quotaExceeded`.
-- `1`, `2`, `3`, ... force a specific configured account instead of rotating.
+- upload video now auto-selects across all configured YouTube project slots based on remaining daily quota
+- the uploader estimates quota for duplicate-check + upload + thumbnail + playlist insert before choosing a slot
+- `upload.youtube.project` is still used by some admin/read-only YouTube commands, but upload selection itself is now quota-driven
 - `upload.youtube.credentials_path` and `upload.youtube.token_path` are parallel arrays.
 - Entry `0` in `credentials_path` is paired with entry `0` in `token_path`, and so on.
 - When a YouTube request fails with `quotaExceeded`, upload rotates to the next configured account automatically.
+- before upload, the CLI estimates quota for duplicate-check + upload + thumbnail + playlist insert and prefers a configured project slot with enough remaining quota
+- if a saved quota session is missing or expired for a slot, upload automatically re-captures that slot's quota session via the attached debug browser before checking usage
+- each slot's last known YouTube quota snapshot is also stored in Redis with `last_sync_time`
+- if live quota sync fails, upload temporarily falls back to Redis + estimated spend since the last sync
+- if the cached snapshot crosses YouTube's daily quota reset boundary while live sync is unavailable, the Redis snapshot resets itself to the new day before estimating further spend
 
 ### YouTube admin commands
 
@@ -598,10 +627,56 @@ uv run novel-tts youtube video update --id xxxxxxxx --made_for_kids true
 uv run novel-tts youtube video update --id xxxxxxxx --playlist_position 7
 uv run novel-tts youtube video update --id xxxxxxxx
 
+# Quota usage
+# 1) Capture browser-derived session secrets
+uv run novel-tts youtube quota capture --session-slot 1
+uv run novel-tts youtube quota capture --session-slot 2
+uv run novel-tts youtube quota capture --session-slot 3
+uv run novel-tts youtube quota capture --session-slot 1 --remote-debugging-url http://127.0.0.1:9222
+uv run novel-tts youtube quota capture --project-id your-gcp-project-id --session-slot 1
+
+# 2) Call HTTP directly using the saved session secret file
+uv run novel-tts youtube quota --session-slot 1
+uv run novel-tts youtube quota --session-slot 2
+uv run novel-tts youtube quota --session-slot 3
+uv run novel-tts youtube quota --session-file .secrets/youtube/quota_session-1.json
+uv run novel-tts youtube quota --raw
+
+# 3) Inspect shared Redis quota snapshots
+uv run novel-tts youtube quota redis --session-slot 1
+uv run novel-tts youtube quota redis --session-slot 2
+uv run novel-tts youtube all --redis
+
 # Rewrite playlist links in uploaded video descriptions
 uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index
 uv run novel-tts upload <novel_id> --platform youtube --update-playlist-index --range 1-150
+
+# Reorder videos inside the configured playlist by episode number in title
+uv run novel-tts upload <novel_id> --platform youtube --update-playlist-position
+
+# Remove duplicated videos in the configured playlist, keeping the latest uploaded copy per title
+uv run novel-tts upload <novel_id> --platform youtube --remove-duplicated
 ```
+
+`youtube quota` notes:
+
+- `youtube quota capture` attaches to an existing Chrome/Chromium debug browser via CDP
+- it captures the Cloud Console quota request secrets and stores them at `.secrets/youtube/quota_session-<slot>.json`
+- `youtube quota` then calls HTTP directly using the saved secret file
+- `youtube quota redis --session-slot N` reads the shared Redis snapshot for one slot
+- `youtube all --redis` reads Redis snapshots for all configured slots
+- it prints normalized summary fields including `current_usage`, `effective_limit`, and `remaining`
+- if the saved session expires, rerun `youtube quota capture`
+- if the attached browser is not logged into Google Cloud Console, sign in there first and retry
+- YouTube daily quota reset is treated as `midnight Pacific Time (PT)`, matching the YouTube docs
+
+How to get the required secrets safely:
+
+1. Start Chrome or Chromium with remote debugging enabled and log into Google Cloud Console in that browser profile.
+2. Run `uv run novel-tts youtube quota capture --session-slot <1|2|3>`.
+3. If needed, override the inferred project id with `--project-id <your-project-id>`.
+4. The command saves the required request headers/body into `.secrets/youtube/quota_session-<slot>.json`.
+5. Future quota reads use `uv run novel-tts youtube quota --session-slot <1|2|3>` without needing browser interaction until the session expires.
 
 ### Pipeline
 
@@ -613,14 +688,46 @@ Use:
 
 - `--skip-upload` to disable upload
 - `--upload-platform` to override platform
+- `--from-stage` / `--to-stage` to run only a contiguous slice of stages
+- `--force` to force supported stages to rerun existing work
 
 ```bash
 uv run novel-tts pipeline run <novel_id> --range 1-10
-uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-captions
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-translate
 uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-upload
 uv run novel-tts pipeline run <novel_id> --range 1-10 --upload-platform tiktok
-uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-translate --skip-captions --skip-tts
+uv run novel-tts pipeline run <novel_id> --range 1-10 --skip-crawl --skip-translate --skip-tts
+uv run novel-tts pipeline run <novel_id> --range 1-10 --from-stage tts
+uv run novel-tts pipeline run <novel_id> --range 1-10 --from-stage translate --to-stage video
+uv run novel-tts pipeline run <novel_id> --range 1-10 --force
+```
+
+`pipeline watch` is continuous orchestration for ongoing serialized novels:
+
+- checks the remote source for newly published chapters
+- crawls only chapters newer than the current highest local crawled chapter
+- launches queue-first translation, waits for completion, then runs repair and polish
+- reruns TTS on the affected batch range (for example `1251-1260` when chapter `1253` arrives)
+- only runs `visual`, `video`, and `upload` once the audio batch has all chapter parts for that range
+
+Notes:
+
+- for safety, a novel with no local crawled chapters is skipped unless you pass `--bootstrap-from`
+- upload completion is remembered in `input/<novel_id>/.progress/watch_pipeline_state.json`
+- default watch settings come from `configs/app.yaml > pipeline.watch` and can still be overridden by CLI flags
+- `--all` uses `configs/app.yaml > pipeline.watch.novels` when that list is non-empty; otherwise it falls back to all files under `configs/novels/*.json`
+- `--from-stage` / `--to-stage` let you run only a contiguous slice of watch stages
+
+```bash
+uv run novel-tts pipeline watch <novel_id>
+uv run novel-tts pipeline watch <novel_id> --once
+uv run novel-tts pipeline watch <novel_id> --interval-seconds 900
+uv run novel-tts pipeline watch --all
+uv run novel-tts pipeline watch <novel_id> --bootstrap-from 1201
+uv run novel-tts pipeline watch <novel_id> --skip-upload
+uv run novel-tts pipeline watch <novel_id> --skip-crawl --skip-translate --skip-repair --skip-polish
+uv run novel-tts pipeline watch --all --to-stage polish
+uv run novel-tts pipeline watch <novel_id> --from-stage tts --to-stage upload
 ```
 
 ## Troubleshooting
