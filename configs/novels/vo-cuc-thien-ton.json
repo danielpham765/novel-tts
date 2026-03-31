@@ -68,7 +68,6 @@
     "video_codec": "libx264",
     "audio_codec": "aac",
     "preset": "veryfast",
-    "crf": 28,
     "audio_bitrate": "96k",
     "episode_batch_size": 10
   }

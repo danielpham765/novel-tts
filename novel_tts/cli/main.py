@@ -221,6 +221,7 @@ def _run_pipeline_per_stage(
     upload_platform: str,
     force: bool,
     media_workers: int = 1,
+    visual_workers: int = 1,
 ) -> None:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -228,12 +229,12 @@ def _run_pipeline_per_stage(
     from novel_tts.tts import create_menu, run_tts
     from novel_tts.upload import run_uploads
 
-    def _parallel(fn, items):
-        if media_workers <= 1 or len(items) <= 1:
+    def _parallel(fn, items, workers: int):
+        if workers <= 1 or len(items) <= 1:
             for args in items:
                 fn(*args)
             return
-        with ThreadPoolExecutor(max_workers=media_workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(fn, *args): args for args in items}
             for fut in as_completed(futures):
                 fut.result()
@@ -248,11 +249,13 @@ def _run_pipeline_per_stage(
         _parallel(
             lambda s, e: generate_visual(config, s, e, force=force),
             [(c_start, c_end) for c_start, c_end, _ in translated_ranges],
+            visual_workers,
         )
     if not skip_video:
         _parallel(
             lambda s, e: create_video(config, s, e, force=force),
             [(c_start, c_end) for c_start, c_end, _ in translated_ranges],
+            media_workers,
         )
     if not skip_upload:
         upload_ranges = [(c_start, c_end) for c_start, c_end, _ in translated_ranges]
@@ -1543,7 +1546,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             force = bool(getattr(args, "force", False))
-            workers = max(1, int(getattr(args, "workers", None) or config.video.media_workers))
+            workers = max(1, int(getattr(args, "workers", None) or config.video.visual_workers))
             start, end = parse_range(args.range)
             ranges = list(get_translated_ranges(config, start, end))
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1879,6 +1882,7 @@ def main(argv: list[str] | None = None) -> int:
             pipeline_mode = str(getattr(args, "mode", None) or config.video.pipeline_mode or "per-stage")
             pipeline_force = bool(getattr(args, "force", False))
             media_workers = max(1, int(getattr(args, "workers", None) or config.video.media_workers))
+            visual_workers = max(1, int(getattr(args, "workers", None) or config.video.visual_workers))
             if pipeline_mode == "per-video":
                 _run_pipeline_per_video(
                     config,
@@ -1904,6 +1908,7 @@ def main(argv: list[str] | None = None) -> int:
                     upload_platform=upload_platform,
                     force=pipeline_force,
                     media_workers=media_workers,
+                    visual_workers=visual_workers,
                 )
             return 0
 

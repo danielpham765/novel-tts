@@ -203,6 +203,7 @@ class VideoConfig:
     episode_batch_size: int = 10
     use_gpu: bool = False
     media_workers: int = 1
+    visual_workers: int = 3
     pipeline_mode: str = "per-stage"
 
 

@@ -112,7 +112,9 @@ upload:
 video:
   use_gpu: true
   media_workers: 14
+  visual_workers: 3
   pipeline_mode: per-stage
+  crf: 38
 
 pipeline:
   watch:
