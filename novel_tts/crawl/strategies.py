@@ -5,8 +5,9 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import requests
@@ -25,6 +26,8 @@ _TIMEOUT_STATUS_CODES = {408, 504, 522, 524}
 _CRAWL_PROXY_TIMEOUT_CAP_SECONDS = 30.0
 _CRAWL_PROXY_ATTEMPTS_WITH_BROWSER_FALLBACK = 2
 _BROWSER_PROXY_CONNECT_TIMEOUT_SECONDS = 1.5
+_CRAWL_PROXY_BLACKLIST_TIMEOUTS = 2
+_CRAWL_PROXY_BLACKLIST_SECONDS = 300.0
 
 
 class ProxyTimeoutError(RequestsTimeout):
@@ -32,6 +35,15 @@ class ProxyTimeoutError(RequestsTimeout):
         super().__init__(message)
         self.proxy_name = proxy_name
         self.proxy_server = proxy_server
+
+
+@dataclass
+class CrawlProxySessionState:
+    timeout_counts: dict[str, int] = field(default_factory=dict)
+    blacklisted_until: dict[str, float] = field(default_factory=dict)
+    probe_urls: dict[str, str] = field(default_factory=dict)
+    recheck_running: set[str] = field(default_factory=set)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
 def _is_playwright_sync_loop_error(exc: Exception) -> bool:
@@ -90,11 +102,180 @@ def _resolve_proxy_names(cfg: ProxyGatewayConfig, redis_cfg: RedisConfig | None)
     return [str(item) for item in (getattr(cfg, "proxies", None) or []) if str(item).strip()]
 
 
+def _filter_proxy_names_for_session(
+    proxy_names: list[str],
+    proxy_session_state: CrawlProxySessionState | None,
+    *,
+    now: float | None = None,
+    log_skips: bool = True,
+) -> list[str]:
+    if proxy_session_state is None:
+        return list(proxy_names)
+    ts = time.time() if now is None else float(now)
+    allowed: list[str] = []
+    for proxy_name in proxy_names:
+        with proxy_session_state.lock:
+            blacklisted_until = float(proxy_session_state.blacklisted_until.get(proxy_name, 0.0) or 0.0)
+        if blacklisted_until <= 0.0:
+            allowed.append(proxy_name)
+            continue
+        remaining = max(0.0, blacklisted_until - ts)
+        if log_skips:
+            if remaining <= 0.0:
+                LOGGER.info(
+                    "crawl proxy still blacklisted pending background recheck | proxy=%s",
+                    proxy_name,
+                )
+            else:
+                LOGGER.info(
+                    "crawl proxy blacklisted in current session; skipping proxy | proxy=%s remaining_seconds=%.0f",
+                    proxy_name,
+                    remaining,
+                )
+    return allowed
+
+
+def _record_proxy_success(proxy_session_state: CrawlProxySessionState | None, proxy_name: str) -> None:
+    if proxy_session_state is None or not proxy_name:
+        return
+    with proxy_session_state.lock:
+        proxy_session_state.timeout_counts.pop(proxy_name, None)
+        proxy_session_state.blacklisted_until.pop(proxy_name, None)
+        proxy_session_state.probe_urls.pop(proxy_name, None)
+
+
+def _probe_proxy_recovery(
+    *,
+    proxy_name: str,
+    probe_url: str,
+    cfg: ProxyGatewayConfig,
+    redis_cfg: RedisConfig | None,
+) -> bool:
+    if not proxy_name or not probe_url:
+        return False
+    try:
+        response = proxy_gateway_mod.request(
+            "GET",
+            probe_url,
+            headers=_default_headers(),
+            cfg=_cfg_for_single_proxy(cfg, proxy_name),
+            redis_cfg=redis_cfg,
+            timeout_seconds=min(10.0, _CRAWL_PROXY_TIMEOUT_CAP_SECONDS),
+        )
+    except Exception as exc:
+        if _is_timeout_like_exception(exc):
+            return False
+        return False
+    return not _is_timeout_like_response(response)
+
+
+def _ensure_proxy_recheck_worker(
+    proxy_session_state: CrawlProxySessionState | None,
+    *,
+    proxy_name: str,
+    probe_url: str,
+    cfg: ProxyGatewayConfig,
+    redis_cfg: RedisConfig | None,
+) -> None:
+    if proxy_session_state is None or not proxy_name or not probe_url:
+        return
+    with proxy_session_state.lock:
+        proxy_session_state.probe_urls[proxy_name] = probe_url
+        if proxy_name in proxy_session_state.recheck_running:
+            return
+        proxy_session_state.recheck_running.add(proxy_name)
+
+    def _worker() -> None:
+        try:
+            while True:
+                with proxy_session_state.lock:
+                    due_at = float(proxy_session_state.blacklisted_until.get(proxy_name, 0.0) or 0.0)
+                    current_probe_url = str(proxy_session_state.probe_urls.get(proxy_name, probe_url) or "").strip()
+                if due_at <= 0.0:
+                    return
+                sleep_seconds = max(0.0, due_at - time.time())
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+                if _probe_proxy_recovery(
+                    proxy_name=proxy_name,
+                    probe_url=current_probe_url,
+                    cfg=cfg,
+                    redis_cfg=redis_cfg,
+                ):
+                    with proxy_session_state.lock:
+                        proxy_session_state.blacklisted_until.pop(proxy_name, None)
+                        proxy_session_state.timeout_counts.pop(proxy_name, None)
+                        proxy_session_state.probe_urls.pop(proxy_name, None)
+                    LOGGER.info(
+                        "crawl proxy recovered in background health check; removing blacklist | proxy=%s",
+                        proxy_name,
+                    )
+                    return
+                with proxy_session_state.lock:
+                    if proxy_name not in proxy_session_state.blacklisted_until:
+                        return
+                    proxy_session_state.blacklisted_until[proxy_name] = time.time() + _CRAWL_PROXY_BLACKLIST_SECONDS
+                LOGGER.warning(
+                    "crawl proxy still unhealthy in background health check; keeping blacklist | proxy=%s next_check_seconds=%.0f",
+                    proxy_name,
+                    _CRAWL_PROXY_BLACKLIST_SECONDS,
+                )
+        finally:
+            with proxy_session_state.lock:
+                proxy_session_state.recheck_running.discard(proxy_name)
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"crawl-proxy-recheck-{proxy_name}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _record_proxy_timeout(
+    proxy_session_state: CrawlProxySessionState | None,
+    proxy_name: str,
+    *,
+    now: float | None = None,
+    probe_url: str = "",
+    cfg: ProxyGatewayConfig | None = None,
+    redis_cfg: RedisConfig | None = None,
+) -> None:
+    if proxy_session_state is None or not proxy_name:
+        return
+    ts = time.time() if now is None else float(now)
+    with proxy_session_state.lock:
+        failures = int(proxy_session_state.timeout_counts.get(proxy_name, 0) or 0) + 1
+        if probe_url:
+            proxy_session_state.probe_urls[proxy_name] = probe_url
+    if failures >= _CRAWL_PROXY_BLACKLIST_TIMEOUTS:
+        with proxy_session_state.lock:
+            proxy_session_state.timeout_counts.pop(proxy_name, None)
+            proxy_session_state.blacklisted_until[proxy_name] = ts + _CRAWL_PROXY_BLACKLIST_SECONDS
+        LOGGER.warning(
+            "crawl proxy temporarily blacklisted in current session | proxy=%s timeout_failures=%s cooldown_seconds=%.0f",
+            proxy_name,
+            failures,
+            _CRAWL_PROXY_BLACKLIST_SECONDS,
+        )
+        if cfg is not None:
+            _ensure_proxy_recheck_worker(
+                proxy_session_state,
+                proxy_name=proxy_name,
+                probe_url=probe_url,
+                cfg=cfg,
+                redis_cfg=redis_cfg,
+            )
+        return
+    with proxy_session_state.lock:
+        proxy_session_state.timeout_counts[proxy_name] = failures
+
+
 def _cfg_for_single_proxy(cfg: ProxyGatewayConfig, proxy_name: str) -> ProxyGatewayConfig:
     return ProxyGatewayConfig(
         enabled=True,
         base_url=cfg.base_url,
-        mode=cfg.mode,
+        mode="direct",
         auto_discovery=False,
         keys_per_proxy=cfg.keys_per_proxy,
         proxies=[proxy_name],
@@ -107,10 +288,15 @@ def _resolve_browser_proxy(
     redis_cfg: RedisConfig | None,
     *,
     preferred_proxy_name: str = "",
+    proxy_session_state: CrawlProxySessionState | None = None,
 ) -> tuple[str, str]:
     if not bool(getattr(cfg, "enabled", False)):
         return "", ""
-    proxy_names = _resolve_proxy_names(cfg, redis_cfg)
+    proxy_names = _filter_proxy_names_for_session(
+        _resolve_proxy_names(cfg, redis_cfg),
+        proxy_session_state,
+        log_skips=False,
+    )
     inventory = proxy_gateway_mod.load_proxy_inventory(cfg=cfg)
     if not inventory:
         return "", ""
@@ -143,6 +329,7 @@ def _resolve_browser_proxy_candidates(
     *,
     preferred_proxy_name: str = "",
     preferred_proxy_server: str = "",
+    proxy_session_state: CrawlProxySessionState | None = None,
 ) -> list[tuple[str, str]]:
     candidates: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -154,7 +341,12 @@ def _resolve_browser_proxy_candidates(
         candidates.append(item)
         seen.add(item)
 
-    name, server = _resolve_browser_proxy(cfg, redis_cfg, preferred_proxy_name=preferred_proxy_name)
+    name, server = _resolve_browser_proxy(
+        cfg,
+        redis_cfg,
+        preferred_proxy_name=preferred_proxy_name,
+        proxy_session_state=proxy_session_state,
+    )
     if server:
         item = (name, server)
         if item not in seen:
@@ -168,7 +360,11 @@ def _resolve_browser_proxy_candidates(
     if not inventory:
         return candidates
 
-    proxy_names = _resolve_proxy_names(cfg, redis_cfg)
+    proxy_names = _filter_proxy_names_for_session(
+        _resolve_proxy_names(cfg, redis_cfg),
+        proxy_session_state,
+        log_skips=False,
+    )
     ordered_names: list[str] = []
     if preferred_name:
         ordered_names.append(preferred_name)
@@ -225,15 +421,21 @@ def _request_with_proxy_rotation(
     timeout_seconds: float,
     max_proxy_attempts: int | None = None,
     per_proxy_timeout_seconds: float | None = None,
+    proxy_session_state: CrawlProxySessionState | None = None,
 ) -> tuple[requests.Response, str, str]:
-    proxy_names = _resolve_proxy_names(cfg, redis_cfg)
+    request_mode = "direct"
+    resolved_proxy_names = _resolve_proxy_names(cfg, redis_cfg)
+    proxy_names = _filter_proxy_names_for_session(
+        resolved_proxy_names,
+        proxy_session_state,
+    )
     if max_proxy_attempts is not None:
         try:
             max_attempts_int = max(1, int(max_proxy_attempts))
         except Exception:
             max_attempts_int = 1
         proxy_names = proxy_names[:max_attempts_int]
-    if not proxy_names:
+    if not proxy_names and not resolved_proxy_names:
         response = proxy_gateway_mod.request(
             method,
             url,
@@ -243,6 +445,10 @@ def _request_with_proxy_rotation(
             timeout_seconds=timeout_seconds,
         )
         return response, "", ""
+    if not proxy_names:
+        raise ProxyTimeoutError(
+            f"No available proxies for {url} in current crawl session (healthy proxies may be temporarily blacklisted)"
+        )
 
     last_timeout_error: Exception | None = None
     last_proxy_name = ""
@@ -257,6 +463,7 @@ def _request_with_proxy_rotation(
                 cfg,
                 redis_cfg,
                 preferred_proxy_name=proxy_name,
+                proxy_session_state=proxy_session_state,
             )
         except Exception:
             proxy_server = ""
@@ -275,10 +482,18 @@ def _request_with_proxy_rotation(
             last_timeout_error = exc
             last_proxy_name = proxy_name
             last_proxy_server = proxy_server
+            _record_proxy_timeout(
+                proxy_session_state,
+                proxy_name,
+                probe_url=url,
+                cfg=cfg,
+                redis_cfg=redis_cfg,
+            )
             LOGGER.warning(
-                "crawl proxy timeout | url=%s proxy=%s attempt=%s/%s err=%s",
+                "crawl proxy timeout | url=%s proxy=%s mode=%s attempt=%s/%s err=%s",
                 url,
                 proxy_name,
+                request_mode,
                 attempt_idx,
                 len(proxy_names),
                 exc,
@@ -294,10 +509,18 @@ def _request_with_proxy_rotation(
             )
             last_proxy_name = proxy_name
             last_proxy_server = proxy_server
+            _record_proxy_timeout(
+                proxy_session_state,
+                proxy_name,
+                probe_url=url,
+                cfg=cfg,
+                redis_cfg=redis_cfg,
+            )
             LOGGER.warning(
-                "crawl proxy timeout-like response | url=%s proxy=%s attempt=%s/%s status=%s",
+                "crawl proxy timeout-like response | url=%s proxy=%s mode=%s attempt=%s/%s status=%s",
                 url,
                 proxy_name,
+                request_mode,
                 attempt_idx,
                 len(proxy_names),
                 response.status_code,
@@ -305,13 +528,15 @@ def _request_with_proxy_rotation(
             continue
 
         LOGGER.info(
-            "crawl proxy success | url=%s proxy=%s attempt=%s/%s status=%s",
+            "crawl proxy success | url=%s proxy=%s mode=%s attempt=%s/%s status=%s",
             url,
             proxy_name,
+            request_mode,
             attempt_idx,
             len(proxy_names),
             response.status_code,
         )
+        _record_proxy_success(proxy_session_state, proxy_name)
         return response, proxy_name, proxy_server
 
     raise ProxyTimeoutError(
@@ -360,10 +585,12 @@ class HttpFetchStrategy(FetchStrategy):
         *,
         proxy_gateway: ProxyGatewayConfig | None = None,
         redis_cfg: RedisConfig | None = None,
+        proxy_session_state: CrawlProxySessionState | None = None,
     ) -> None:
         self.policy = policy
         self.proxy_gateway = proxy_gateway or ProxyGatewayConfig()
         self.redis_cfg = redis_cfg
+        self.proxy_session_state = proxy_session_state
 
     def fetch(self, url: str, timeout_seconds: int) -> FetchResult:
         cookie_header = os.environ.get("NOVEL_TTS_COOKIE_HEADER", "").strip()
@@ -379,6 +606,7 @@ class HttpFetchStrategy(FetchStrategy):
                 _CRAWL_PROXY_ATTEMPTS_WITH_BROWSER_FALLBACK if browser_fallback_enabled else None
             ),
             per_proxy_timeout_seconds=_CRAWL_PROXY_TIMEOUT_CAP_SECONDS,
+            proxy_session_state=self.proxy_session_state,
         )
         html = response.text
         title = ""
@@ -416,6 +644,7 @@ class BootstrapHttpFetchStrategy(FetchStrategy):
         *,
         proxy_gateway: ProxyGatewayConfig | None = None,
         redis_cfg: RedisConfig | None = None,
+        proxy_session_state: CrawlProxySessionState | None = None,
     ) -> None:
         self.browser_config = browser_config
         self.policy = policy
@@ -424,6 +653,7 @@ class BootstrapHttpFetchStrategy(FetchStrategy):
         self.bootstrapped_at = 0.0
         self.proxy_gateway = proxy_gateway or ProxyGatewayConfig()
         self.redis_cfg = redis_cfg
+        self.proxy_session_state = proxy_session_state
         self._last_proxy_name = ""
         self._last_proxy_server = ""
 
@@ -486,6 +716,7 @@ class BootstrapHttpFetchStrategy(FetchStrategy):
                 _CRAWL_PROXY_ATTEMPTS_WITH_BROWSER_FALLBACK if browser_fallback_enabled else None
             ),
             per_proxy_timeout_seconds=_CRAWL_PROXY_TIMEOUT_CAP_SECONDS,
+            proxy_session_state=self.proxy_session_state,
         )
         self._last_proxy_name = proxy_name
         self._last_proxy_server = proxy_server
@@ -564,11 +795,13 @@ class BrowserFetchStrategy(FetchStrategy):
         *,
         proxy_gateway: ProxyGatewayConfig | None = None,
         redis_cfg: RedisConfig | None = None,
+        proxy_session_state: CrawlProxySessionState | None = None,
     ) -> None:
         self.browser_config = browser_config
         self.policy = policy
         self.proxy_gateway = proxy_gateway or ProxyGatewayConfig()
         self.redis_cfg = redis_cfg
+        self.proxy_session_state = proxy_session_state
         self._playwright = None
         self._browser = None
         self._context = None
@@ -627,6 +860,7 @@ class BrowserFetchStrategy(FetchStrategy):
             self.redis_cfg,
             preferred_proxy_name=self._preferred_proxy_name,
             preferred_proxy_server=self._preferred_proxy_server,
+            proxy_session_state=self.proxy_session_state,
         )
         reachable_candidates: list[tuple[str, str]] = []
         for proxy_name, proxy_server in proxy_candidates:
@@ -785,6 +1019,7 @@ def build_strategy_chain(
     *,
     proxy_gateway: ProxyGatewayConfig | None = None,
     redis_cfg: RedisConfig | None = None,
+    proxy_session_state: CrawlProxySessionState | None = None,
 ) -> StrategyChain:
     policy = ChallengePolicy(browser_config)
     strategies: list[FetchStrategy] = []
@@ -795,10 +1030,18 @@ def build_strategy_chain(
                 policy,
                 proxy_gateway=proxy_gateway,
                 redis_cfg=redis_cfg,
+                proxy_session_state=proxy_session_state,
             )
         )
     elif crawl_config.preferred_fetch_mode != "browser-only":
-        strategies.append(HttpFetchStrategy(policy, proxy_gateway=proxy_gateway, redis_cfg=redis_cfg))
+        strategies.append(
+            HttpFetchStrategy(
+                policy,
+                proxy_gateway=proxy_gateway,
+                redis_cfg=redis_cfg,
+                proxy_session_state=proxy_session_state,
+            )
+        )
     if policy.should_try_browser_fallback():
         strategies.append(
             BrowserFetchStrategy(
@@ -806,6 +1049,7 @@ def build_strategy_chain(
                 policy,
                 proxy_gateway=proxy_gateway,
                 redis_cfg=redis_cfg,
+                proxy_session_state=proxy_session_state,
             )
         )
     return StrategyChain(policy=policy, strategies=strategies)

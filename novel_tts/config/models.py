@@ -80,9 +80,9 @@ class CrawlConfig:
     preferred_fetch_mode: str = "auto"
     request_timeout_seconds: int = 120
     content_wait_timeout_seconds: int = 45
-    delay_between_chapters_seconds: float = 1.5
+    delay_between_chapters_seconds: float = 1.0
     max_fetch_retries: int = 3
-    retry_backoff_seconds: float = 15.0
+    retry_backoff_seconds: float = 5.0
     rate_limit_cooldown_seconds: float = 300.0
 
 

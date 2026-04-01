@@ -24,7 +24,12 @@ from novel_tts.config.models import (
 from novel_tts.crawl import service as crawl_service
 from novel_tts.crawl.challenge import ChallengePolicy
 from novel_tts.crawl.service import SourceDiscoveryResult, crawl_range
-from novel_tts.crawl.strategies import BrowserFetchStrategy, _request_with_proxy_rotation, _resolve_browser_proxy
+from novel_tts.crawl.strategies import (
+    BrowserFetchStrategy,
+    CrawlProxySessionState,
+    _request_with_proxy_rotation,
+    _resolve_browser_proxy,
+)
 
 
 def _make_config(tmp_path: Path) -> NovelConfig:
@@ -236,6 +241,43 @@ def test_request_with_proxy_rotation_tries_next_proxy_on_timeout(monkeypatch: py
     assert proxy_server == "http://2.2.2.2:8080"
 
 
+def test_request_with_proxy_rotation_forces_direct_mode_for_crawl(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = ProxyGatewayConfig(enabled=True, auto_discovery=True, base_url="http://localhost:8888", mode="socket")
+    monkeypatch.setattr(
+        "novel_tts.crawl.strategies.proxy_gateway_mod.load_healthy_proxy_names_from_redis",
+        lambda **kwargs: (["proxy-a"], ""),
+    )
+    monkeypatch.setattr(
+        "novel_tts.crawl.strategies.proxy_gateway_mod.load_proxy_inventory",
+        lambda **kwargs: [
+            {"name": "proxy-a", "host": "1.1.1.1:8080", "is_healthy": True},
+        ],
+    )
+
+    seen_modes: list[str] = []
+
+    def _fake_request(method, url, *, headers=None, cfg=None, redis_cfg=None, timeout_seconds=None, body=None, key_index=None):
+        del method, url, headers, redis_cfg, timeout_seconds, body, key_index
+        seen_modes.append(str(getattr(cfg, "mode", "")))
+        return _make_response("https://example.com/chapter")
+
+    monkeypatch.setattr("novel_tts.crawl.strategies.proxy_gateway_mod.request", _fake_request)
+
+    response, proxy_name, proxy_server = _request_with_proxy_rotation(
+        "GET",
+        "https://example.com/chapter",
+        headers={"user-agent": "ua"},
+        cfg=cfg,
+        redis_cfg=None,
+        timeout_seconds=10,
+    )
+
+    assert response.status_code == 200
+    assert proxy_name == "proxy-a"
+    assert proxy_server == "http://1.1.1.1:8080"
+    assert seen_modes == ["direct"]
+
+
 def test_request_with_proxy_rotation_falls_back_direct_when_no_healthy_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -344,6 +386,147 @@ def test_request_with_proxy_rotation_respects_attempt_limit_and_timeout_override
         )
 
     assert calls == [("proxy-a", 30.0), ("proxy-b", 30.0)]
+
+
+def test_request_with_proxy_rotation_blacklists_proxy_after_two_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = ProxyGatewayConfig(enabled=True, auto_discovery=True, base_url="http://localhost:8888", mode="socket")
+    session_state = CrawlProxySessionState()
+    now = {"value": 1000.0}
+    monkeypatch.setattr("novel_tts.crawl.strategies.time.time", lambda: now["value"])
+    monkeypatch.setattr(
+        "novel_tts.crawl.strategies.proxy_gateway_mod.load_healthy_proxy_names_from_redis",
+        lambda **kwargs: (["proxy-a", "proxy-b"], ""),
+    )
+    monkeypatch.setattr(
+        "novel_tts.crawl.strategies.proxy_gateway_mod.load_proxy_inventory",
+        lambda **kwargs: [
+            {"name": "proxy-a", "host": "1.1.1.1:8080", "is_healthy": True},
+            {"name": "proxy-b", "host": "2.2.2.2:8080", "is_healthy": True},
+        ],
+    )
+    monkeypatch.setattr("novel_tts.crawl.strategies._ensure_proxy_recheck_worker", lambda *args, **kwargs: None)
+
+    calls: list[str] = []
+
+    def _fake_request(method, url, *, headers=None, cfg=None, redis_cfg=None, timeout_seconds=None, body=None, key_index=None):
+        del method, url, headers, redis_cfg, timeout_seconds, body, key_index
+        proxy_name = cfg.proxies[0] if cfg and cfg.proxies else "direct"
+        calls.append(proxy_name)
+        if proxy_name == "proxy-a":
+            raise requests.Timeout("timed out")
+        return _make_response("https://example.com")
+
+    monkeypatch.setattr("novel_tts.crawl.strategies.proxy_gateway_mod.request", _fake_request)
+
+    _request_with_proxy_rotation(
+        "GET",
+        "https://example.com/1",
+        headers={"user-agent": "ua"},
+        cfg=cfg,
+        redis_cfg=None,
+        timeout_seconds=10,
+        proxy_session_state=session_state,
+    )
+    _request_with_proxy_rotation(
+        "GET",
+        "https://example.com/2",
+        headers={"user-agent": "ua"},
+        cfg=cfg,
+        redis_cfg=None,
+        timeout_seconds=10,
+        proxy_session_state=session_state,
+    )
+
+    calls.clear()
+    _request_with_proxy_rotation(
+        "GET",
+        "https://example.com/3",
+        headers={"user-agent": "ua"},
+        cfg=cfg,
+        redis_cfg=None,
+        timeout_seconds=10,
+        proxy_session_state=session_state,
+    )
+
+    assert calls == ["proxy-b"]
+
+
+def test_request_with_proxy_rotation_keeps_blacklisted_proxy_out_of_main_path_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = ProxyGatewayConfig(enabled=True, auto_discovery=True, base_url="http://localhost:8888", mode="socket")
+    session_state = CrawlProxySessionState(
+        timeout_counts={},
+        blacklisted_until={"proxy-a": 1300.0},
+        recheck_running={"proxy-a"},
+    )
+    now = {"value": 1301.0}
+    monkeypatch.setattr("novel_tts.crawl.strategies.time.time", lambda: now["value"])
+    monkeypatch.setattr(
+        "novel_tts.crawl.strategies.proxy_gateway_mod.load_healthy_proxy_names_from_redis",
+        lambda **kwargs: (["proxy-a", "proxy-b"], ""),
+    )
+    monkeypatch.setattr(
+        "novel_tts.crawl.strategies.proxy_gateway_mod.load_proxy_inventory",
+        lambda **kwargs: [
+            {"name": "proxy-a", "host": "1.1.1.1:8080", "is_healthy": True},
+            {"name": "proxy-b", "host": "2.2.2.2:8080", "is_healthy": True},
+        ],
+    )
+
+    calls: list[str] = []
+
+    def _fake_request(method, url, *, headers=None, cfg=None, redis_cfg=None, timeout_seconds=None, body=None, key_index=None):
+        del method, url, headers, redis_cfg, timeout_seconds, body, key_index
+        proxy_name = cfg.proxies[0] if cfg and cfg.proxies else "direct"
+        calls.append(proxy_name)
+        return _make_response("https://example.com")
+
+    monkeypatch.setattr("novel_tts.crawl.strategies.proxy_gateway_mod.request", _fake_request)
+
+    _request_with_proxy_rotation(
+        "GET",
+        "https://example.com/after-expiry",
+        headers={"user-agent": "ua"},
+        cfg=cfg,
+        redis_cfg=None,
+        timeout_seconds=10,
+        proxy_session_state=session_state,
+    )
+    assert calls == ["proxy-b"]
+
+
+def test_background_recheck_removes_blacklist_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    from novel_tts.crawl import strategies as strategies_mod
+
+    cfg = ProxyGatewayConfig(enabled=True, auto_discovery=True, base_url="http://localhost:8888", mode="socket")
+    session_state = CrawlProxySessionState(
+        blacklisted_until={"proxy-a": 1000.0},
+        probe_urls={"proxy-a": "https://example.com/probe"},
+    )
+    monkeypatch.setattr("novel_tts.crawl.strategies.time.time", lambda: 1000.0)
+    monkeypatch.setattr("novel_tts.crawl.strategies.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("novel_tts.crawl.strategies._probe_proxy_recovery", lambda **kwargs: True)
+
+    class _ImmediateThread:
+        def __init__(self, *, target, name, daemon):
+            del name, daemon
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr("novel_tts.crawl.strategies.threading.Thread", _ImmediateThread)
+
+    strategies_mod._ensure_proxy_recheck_worker(
+        session_state,
+        proxy_name="proxy-a",
+        probe_url="https://example.com/probe",
+        cfg=cfg,
+        redis_cfg=None,
+    )
+
+    assert "proxy-a" not in session_state.blacklisted_until
 
 
 def test_resolve_browser_proxy_prefers_requested_proxy_name(monkeypatch: pytest.MonkeyPatch) -> None:

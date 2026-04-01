@@ -23,7 +23,7 @@ from .repair_config import (
     repair_config_path,
     save_repair_config,
 )
-from .strategies import build_strategy_chain
+from .strategies import CrawlProxySessionState, build_strategy_chain
 from .types import ChapterEntry
 
 LOGGER = get_logger(__name__)
@@ -1093,6 +1093,7 @@ def _fetch_replacement_block(
                 tmp_cfg.browser_debug,
                 proxy_gateway=tmp_cfg.proxy_gateway,
                 redis_cfg=tmp_cfg.queue.redis,
+                proxy_session_state=CrawlProxySessionState(),
             )
             entry = ChapterEntry(chapter, f"第{chapter}章", url)
             block, _parsed_number, _stats = _fetch_chapter(entry, tmp_cfg, resolver, strategy_chain)
@@ -2069,6 +2070,7 @@ def resolve_directory_entries(
     to_chapter: int | None = None,
     fetch_all_pages: bool = False,
     log_exceptions: bool = True,
+    proxy_session_state: CrawlProxySessionState | None = None,
 ) -> dict[int, ChapterEntry]:
     registry = build_default_registry()
     resolver = registry.get(config.source.resolver_id)
@@ -2077,6 +2079,7 @@ def resolve_directory_entries(
         config.browser_debug,
         proxy_gateway=config.proxy_gateway,
         redis_cfg=config.queue.redis,
+        proxy_session_state=proxy_session_state,
     )
     dir_url = directory_url or config.crawl.directory_url
 
@@ -2148,6 +2151,7 @@ def discover_source_entries(
     to_chapter: int | None = None,
     fetch_all_pages: bool = False,
     log_exceptions: bool = True,
+    proxy_session_state: CrawlProxySessionState | None = None,
 ) -> SourceDiscoveryResult | None:
     source_bound_config = config_with_source(config, source_config)
     entries = resolve_directory_entries(
@@ -2156,6 +2160,7 @@ def discover_source_entries(
         to_chapter=to_chapter,
         fetch_all_pages=fetch_all_pages,
         log_exceptions=log_exceptions,
+        proxy_session_state=proxy_session_state,
     )
     latest_chapter = max((int(chapter) for chapter in entries), default=0)
     return SourceDiscoveryResult(
@@ -2178,6 +2183,7 @@ def crawl_range(
     run_started_at = time.time()
     manifest = _load_failure_manifest(config)
     registry = build_default_registry()
+    proxy_session_state = CrawlProxySessionState()
     source_candidates = list(source_configs or [config.source])
     discovery_results: list[SourceDiscoveryResult] = []
     for source_cfg in source_candidates:
@@ -2189,6 +2195,7 @@ def crawl_range(
                 to_chapter=to_chapter,
                 fetch_all_pages=False,
                 log_exceptions=True,
+                proxy_session_state=proxy_session_state,
             )
         except Exception:
             continue
@@ -2307,6 +2314,7 @@ def crawl_range(
                     candidate_config.browser_debug,
                     proxy_gateway=candidate_config.proxy_gateway,
                     redis_cfg=candidate_config.queue.redis,
+                    proxy_session_state=proxy_session_state,
                 )
                 try:
                     block, parsed_number, stats = _fetch_chapter(
