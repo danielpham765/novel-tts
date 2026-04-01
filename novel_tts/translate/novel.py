@@ -22,6 +22,9 @@ HAN_REGEX = re.compile(r"[\u4e00-\u9fff]")
 JSON_BLOCK_REGEX = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 PLACEHOLDER_TOKEN_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}QXZ")
 PLACEHOLDER_LIKE_RE = re.compile(r"(?:ZXQ|QZX)\d{1,6}Q(?:XZ)?")
+# Broader pattern to catch hallucinated variants where the LLM used letters instead of digits
+# or dropped the XZ suffix (e.g. ZXQBRQ, QZX5Q, ZXQ001Q).
+PLACEHOLDER_BROAD_RE = re.compile(r"(?:ZXQ|QZX)[A-Za-z0-9]{1,8}Q(?:XZ)?")
 ROMANIZED_ARTIFACT_RE = re.compile(
     r"thiển trương viên|thập ma|thiểu điểm|chẩm hội|na khả thị|thiên chân vạn xác|"
     r"thuấn gian(?: giải khai)?|trừu trứ lương khí|kinh đào hãi lãng|đích phu trượng|"
@@ -267,6 +270,12 @@ def restore_placeholders(text: str, mapping: dict[str, str]) -> str:
     for token, value in mapping.items():
         text = text.replace(token, value)
         text = text.replace(token.replace("ZXQ", "QZX", 1), value)
+    # Strip any remaining malformed tokens not in mapping (e.g. ZXQBRQ where LLM used
+    # letters instead of digits or dropped the XZ suffix).
+    remaining = sorted(set(PLACEHOLDER_BROAD_RE.findall(text)))
+    if remaining:
+        LOGGER.warning("restore_placeholders: stripping unresolved placeholder tokens: %s", remaining)
+        text = PLACEHOLDER_BROAD_RE.sub("", text)
     return text
 
 

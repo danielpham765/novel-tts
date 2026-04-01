@@ -7,6 +7,7 @@ from pathlib import Path
 from novel_tts.common.text import normalize_ellipsis
 from novel_tts.common.logging import get_logger
 from novel_tts.config.models import NovelConfig
+from novel_tts.translate.novel import PLACEHOLDER_BROAD_RE
 
 LOGGER = get_logger(__name__)
 
@@ -611,6 +612,14 @@ def polish_translations(config: NovelConfig, filenames: list[str] | None = None)
             polished = normalize_text(original, chapter_num, config.translation.polish_replacements)
             if origin_titles.get(str(int(chapter_num))):
                 polished = _force_fold_heading_from_next_line(polished, chapter_num)
+            leftover_tokens = sorted(set(PLACEHOLDER_BROAD_RE.findall(polished)))
+            if leftover_tokens:
+                LOGGER.warning(
+                    "polish: placeholder tokens still present | file=%s chapter=%s tokens=%s",
+                    origin_path.name,
+                    int(chapter_num),
+                    leftover_tokens,
+                )
             if polished != original:
                 part_path.write_text(polished, encoding="utf-8")
                 changed_parts += 1
