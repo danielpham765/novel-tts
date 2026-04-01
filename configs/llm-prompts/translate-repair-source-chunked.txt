@@ -4,6 +4,8 @@ Nhiệm vụ của ngươi:
 - Chỉ sửa đoạn BẢN DỊCH HIỆN CÓ sao cho khớp với BẢN GỐC.
 - Giữ nguyên ý và thứ tự theo BẢN GỐC, không thêm ý, không cắt mất nội dung.
 - Phải thay hết toàn bộ chữ Hán còn sót (kể cả chữ Hán lẻ bị trộn trong câu tiếng Việt).
+- Phải sửa cả các lỗi xưng hô/chỉ ngôi sai người, sai giới tính, sai người nói nếu có thể đối chiếu được từ BẢN GỐC.
+- Nếu bản gốc/ngữ cảnh trong đoạn chưa đủ chắc về giới tính, không đoán bừa; ưu tiên tên riêng, chức danh hoặc cách gọi trung tính.
 {forbidden_lines}- Không viết tiêu đề/ghi chú, không nhắc lại phần ngoài đoạn này.
 - Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH) tương ứng.
 

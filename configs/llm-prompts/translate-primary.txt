@@ -2,6 +2,13 @@
 Glossary dùng bắt buộc nếu xuất hiện:
 {glossary_text}
 
+Trước khi xuất kết quả, tự rà lại xưng hô và ngôi chỉ:
+- Mỗi đại từ/ngôi gọi như hắn, y, gã, chàng, nàng, cô, cô gái, thiếu niên, thiếu nữ, anh, chị, ông, bà phải khớp đúng người đang được nhắc tới trong bản gốc và mạch cảnh hiện tại.
+- Tuyệt đối không tự suy nữ hóa hoặc nam hóa nhân vật. Không dùng "nàng", "cô", "thiếu nữ", "cô gái" cho nam; không dùng "chàng", "hắn", "thiếu niên" cho nữ nếu bản gốc/ngữ cảnh không xác nhận như vậy.
+- Nếu bản gốc hoặc ngữ cảnh chưa đủ chắc về giới tính/ngôi gọi, ưu tiên lặp lại tên riêng, chức danh, quan hệ, hoặc dùng cách gọi trung tính như "người kia", "người đó", "đối phương" thay vì đoán bừa.
+- Giữ xưng hô nhất quán trong cùng một đoạn/cảnh; đừng đổi qua lại giữa tên, đại từ, vai vế nếu bản gốc không đổi.
+- Với câu thoại, xác định đúng ai đang nói với ai rồi mới chọn cặp xưng hô; không áp công thức cố định cho mọi nhân vật.
+
 Hãy tự kiểm tra và sửa ngay trong một lần trả lời trước khi xuất kết quả cuối cùng. Tuyệt đối không để xuất hiện kiểu phiên âm máy/pinyin lẫn vào tiếng Việt như 'tha', 'ngã', 'nhĩ', 'liễu', 'thập ma', 'chẩm hội'.
 
 Dịch đoạn sau sang tiếng Việt:

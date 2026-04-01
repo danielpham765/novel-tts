@@ -94,6 +94,7 @@ Current top-level command families:
 - `translate`
 - `queue`
 - `tts`
+- `create-menu`
 - `visual`
 - `video`
 - `upload`
@@ -106,8 +107,9 @@ Important subcommands:
 
 - `crawl run`, `crawl verify`, `crawl repair`
 - `translate novel`, `translate chapter`, `translate polish`, `translate captions`
-- `queue launch`, `queue add`, `queue worker`, `queue supervisor`, `queue monitor`, `queue ps`, `queue ps-all`, `queue repair`, `queue reset-key`, `queue stop`
-- `youtube playlist`, `youtube playlist update`, `youtube video`, `youtube video update`, `youtube quota`
+- `queue launch`, `queue add`, `queue worker`, `queue supervisor`, `queue monitor`, `queue ps`, `queue ps-all`, `queue repair`, `queue requeue-untranslated-exhausted`, `queue reset-key`, `queue stop`
+- `create-menu`
+- `youtube playlist`, `youtube playlist update`, `youtube video`, `youtube video update`, `youtube quota`, `youtube quota capture`, `youtube quota redis`, `youtube all`
 - `pipeline run`
 - `pipeline watch`
 
@@ -306,6 +308,7 @@ Responsibilities:
 - normalize backward-compatible CLI shapes
 - map commands to per-run log files under `.logs/`
 - support watch-mode terminal UIs for `queue ps`, `queue ps-all`, and `ai-key ps`
+- expose standalone `create-menu` and YouTube admin/quota commands in addition to the main pipeline stages
 - provide two pipeline execution modes:
   - `per-stage`
   - `per-video`
@@ -538,7 +541,7 @@ It handles:
 
 `translate/repair.py` scans translated chapters for suspicious outputs and enqueues only the broken ones back into the queue.
 
-This is a higher-level repair loop on top of crawl repair.
+This is a higher-level repair loop on top of crawl repair. The operator-facing CLI path for this today is `queue repair`, which calls into the translate repair scanner and then enqueues the selected jobs.
 
 ### Queue
 
@@ -648,6 +651,7 @@ The queue subsystem also provides operator-focused process inspection:
 - `queue ps-all`
 - `queue stop`
 - `queue reset-key`
+- `queue requeue-untranslated-exhausted`
 
 These commands inspect the local process table plus Redis queue state to present a pm2-like operational view.
 
@@ -763,6 +767,13 @@ The current splitting logic looks for `Chương <n>` headings in translated text
 - writes a merged MP3 for the range
 - writes a chapter-menu text file under `output/<novel>/subtitle/`
 
+The same module also exposes menu-only helpers:
+
+- `create_menu()`
+- `regenerate_menu()`
+
+These back the standalone `create-menu` command and the `tts --re-generate-menu` maintenance path.
+
 Current provider path:
 
 - `gradio_vie_tts`
@@ -848,7 +859,11 @@ The same module also backs read/update admin commands:
 - update playlist metadata
 - list/get videos from the authenticated channel uploads playlist
 - update video metadata
+- capture and read browser-derived quota sessions per YouTube project slot
+- read quota summaries from shared Redis snapshots across all configured slots
 - rewrite playlist-index lines in descriptions for already uploaded videos
+- reorder uploaded playlist items by parsed episode number
+- remove older duplicated uploads while keeping the newest copy per title
 
 ## Pipeline Orchestration
 

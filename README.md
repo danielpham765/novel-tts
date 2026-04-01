@@ -276,6 +276,21 @@ uv run novel-tts crawl verify <novel_id> --range 1-10
 uv run novel-tts crawl verify <novel_id> --file chuong_1-10.txt
 ```
 
+#### `crawl repair`
+
+Repairs already-crawled origin batches on disk. It can generate `input/<novel_id>/repair_config.yaml` from crawl research logs, then apply the repair plan back onto the saved `origin/*.txt` files.
+
+```bash
+# Generate/update repair_config.yaml from crawl research files
+uv run novel-tts crawl repair <novel_id> --generate-repair-config
+
+# Run repair using input/<novel_id>/repair_config.yaml
+uv run novel-tts crawl repair <novel_id> --run --range 1-10
+
+# Repair only selected origin files
+uv run novel-tts crawl repair <novel_id> --run --file chuong_1-10.txt
+```
+
 ### Translate
 
 #### Direct translation (`translate novel`) is debug-oriented
@@ -401,6 +416,7 @@ Use `--force` to re-translate.
 uv run novel-tts queue add <novel_id> --range 2001-2500
 uv run novel-tts queue add <novel_id> --range 2004-2016 --force
 uv run novel-tts queue add <novel_id> --chapters 1205,1214
+uv run novel-tts queue add <novel_id> --repair-report .logs/<novel_id>/crawl/addition-replacement_chapter_list.txt
 uv run novel-tts queue add <novel_id> --all
 ```
 
@@ -433,6 +449,14 @@ uv run novel-tts queue repair <novel_id> --range 1401-1410
 uv run novel-tts queue repair <novel_id> --all
 ```
 
+#### `queue requeue-untranslated-exhausted`
+
+Re-enqueues jobs that exhausted retries but still do not have valid translated output on disk.
+
+```bash
+uv run novel-tts queue requeue-untranslated-exhausted <novel_id>
+```
+
 ### AI key telemetry
 
 Reads `.secrets/gemini-keys.txt` and inspects Redis metrics emitted by queue workers.
@@ -462,6 +486,16 @@ Behavior notes:
 uv run novel-tts tts <novel_id> --range 1-10
 uv run novel-tts tts <novel_id> --range 1-10 --force
 uv run novel-tts tts <novel_id> --range 701-800 --tts-server-name onPremise --tts-model-name cpu
+uv run novel-tts tts <novel_id> --range 701-800 --re-generate-menu
+uv run novel-tts tts <novel_id> --re-generate-menu --all
+```
+
+### Create Menu
+
+Builds or refreshes chapter menu files under `output/<novel_id>/subtitle/` from translated chapter headings without re-running TTS.
+
+```bash
+uv run novel-tts create-menu <novel_id> --range 1-10
 ```
 
 ### Visual

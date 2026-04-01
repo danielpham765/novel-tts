@@ -77,7 +77,7 @@ When answering questions or making edits, **anchor your reasoning** to these fil
   - `configs/glossaries/<novel>.json` (or explicit glossary file)
   - selected environment variables
 - **Dataclass root**: `NovelConfig` with key sections:
-  - `storage`, `crawl`, `browser_debug`, `translation`, `captions`, `queue`, `tts`, `visual`, `video`
+  - `storage`, `crawl`, `browser_debug`, `models`, `translation`, `captions`, `queue`, `tts`, `visual`, `video`, `upload`, `pipeline`, `proxy_gateway`
 
 **Per-novel storage layout** (contract relied on across subsystems):
 
@@ -105,7 +105,7 @@ When modifying behavior, **preserve these directory and filename contracts** or 
 
 - File: `novel_tts/cli/main.py`
 - Role: thin dispatcher:
-  - Parses commands: `crawl`, `translate`, `queue`, `ai-key`, `quota-supervisor`, `tts`, `visual`, `video`, `pipeline`.
+  - Parses commands: `crawl`, `translate`, `queue`, `ai-key`, `quota-supervisor`, `tts`, `create-menu`, `visual`, `video`, `upload`, `youtube`, `pipeline`.
   - Computes default log file (`_default_log_path`).
   - Loads `NovelConfig` and calls the right service function.
   - Keeps backward compatibility for old `crawl <novel>` syntax.
@@ -132,7 +132,7 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Heavy multi-pass cleanup for residual Han characters.
   - Glossary placeholder flow and optional auto-update.
   - Rebuild `translated/*.txt` from `.parts`.
-  - Scan translated outputs and enqueue repair jobs back into Redis (`translate repair`).
+  - Provide repair scan logic in `translate/repair.py`, which the CLI currently exposes via `queue repair`.
 - Provider abstraction:
   - `gemini_http`, `openai_chat` via `get_translation_provider`.
 - **Key functions to know**:
@@ -148,6 +148,8 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Spawn workers that run `python -m novel_tts translate chapter ...`.
   - Optionally enqueue a special captions job id: `captions` (runs `translate captions`).
   - Enable the central quota gate for translate subprocesses (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`).
+  - Re-enqueue suspicious translated chapters via `queue repair`.
+  - Recover exhausted-but-still-untranslated jobs via `queue requeue-untranslated-exhausted`.
   - Launch/monitor processes for a novel (`queue launch`).
 - Design:
   - Redis stores **job + quota bookkeeping only**; translation truth is still on disk.
@@ -162,6 +164,7 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Call TTS provider (`gradio_vie_tts` currently) per chunk.
   - Merge wavs into one mp3 with `ffmpeg`, respecting tempo.
   - Generate chapter menu text file with timestamps.
+- Also expose `create_menu` / `regenerate_menu` for menu-only maintenance paths.
 - **Caching**:
   - If a chunk `.wav` already exists and is non-empty, it is reused (important for idempotent runs).
 
@@ -173,6 +176,15 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Loop visual track to match audio duration.
   - Mux audio + visual into final `video/<range>.mp4`.
 - Source of truth for overlay content: `config.visual` and generated subtitles.
+
+### Upload / YouTube Admin
+
+- File: `novel_tts/upload/service.py`
+- Responsibilities:
+  - Upload rendered outputs to YouTube.
+  - Provide TikTok dry-run validation.
+  - Expose YouTube playlist/video admin commands plus quota capture/read helpers.
+  - Keep upload selection quota-aware across configured YouTube project slots.
 
 ### Common Utilities
 

@@ -2,6 +2,8 @@
 Glossary dùng bắt buộc nếu xuất hiện:
 {glossary_text}
 
-Chỉ sửa đoạn văn sau: thay toàn bộ chữ Hán còn sót thành tiếng Việt tự nhiên. Giữ nguyên ý, không thêm bớt. Tuyệt đối không để sót chữ Hán. Chỉ trả về đúng đoạn đã sửa.
+Chỉ sửa đoạn văn sau: thay toàn bộ chữ Hán còn sót thành tiếng Việt tự nhiên. Giữ nguyên ý, không thêm bớt. Tuyệt đối không để sót chữ Hán.
+Không tự đổi xưng hô sang nữ hay nam nếu đoạn không xác nhận rõ; khi chưa chắc, ưu tiên tên riêng, chức danh hoặc cách gọi trung tính.
+Chỉ trả về đúng đoạn đã sửa.
 
 {text}

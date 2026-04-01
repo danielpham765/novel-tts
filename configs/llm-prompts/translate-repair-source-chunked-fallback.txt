@@ -3,6 +3,7 @@ Dưới đây là một đoạn tiếng Việt (TRÍCH) còn lẫn chữ Hán.
 Nhiệm vụ của ngươi:
 - Dịch hết toàn bộ chữ Hán còn sót sang tiếng Việt.
 - Giữ nguyên ý và thứ tự theo đoạn hiện có, không thêm ý, không cắt mất nội dung.
+- Không tự đổi xưng hô sang nữ hay nam nếu đoạn hiện có không xác nhận rõ; khi chưa chắc, ưu tiên tên riêng, chức danh hoặc cách gọi trung tính.
 {forbidden_lines}- Không viết tiêu đề/ghi chú.
 - Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH).
 

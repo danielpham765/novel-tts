@@ -2,6 +2,11 @@
 Glossary dùng bắt buộc nếu xuất hiện:
 {glossary_text}
 
+Phải chọn xưng hô đúng ngôi và đúng người:
+- Không tự gán giới tính khi bản gốc/ngữ cảnh chưa chắc.
+- Nếu chưa đủ chắc về giới tính hay vai xưng hô, dùng tên riêng, chức danh hoặc cách gọi trung tính thay vì đoán.
+- Tuyệt đối tránh các lỗi như dùng "nàng" để chỉ nam hoặc dùng "chàng" để chỉ nữ.
+
 Đây là một đoạn đối thoại hoặc trần thuật trong tiểu thuyết hư cấu. Hãy chuyển ngữ sang tiếng Việt rõ nghĩa, trung tính, giữ nguyên diễn biến. Chỉ trả về bản dịch.
 
 {text}

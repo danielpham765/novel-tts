@@ -7,6 +7,7 @@ Use this workflow when the user asks to refresh project documentation so it matc
 - update all relevant docs affected by the current code and workflow shape
 - prefer current implementation over older docs wording
 - keep docs practical, file-first, and operational rather than aspirational
+- treat Claude-facing agent docs as part of the required doc set, including the root `AGENTS.md`
 - keep `README.md`, `docs/ARCHITECTURE.md`, and agent docs consistent with each other
 - keep `docs/ARCHITECTURE.md` as the detailed current-state architecture reference, not a shallow summary
 
@@ -14,7 +15,7 @@ Use this workflow when the user asks to refresh project documentation so it matc
 
 Default docs to consider:
 
-- `AGENTS.md`
+- `AGENTS.md` (Claude/general agent-facing repo contract)
 - `README.md`
 - `docs/ARCHITECTURE.md`
 - `docs/agents/codex/AGENTS.md`
@@ -67,6 +68,7 @@ Across the affected docs, make sure the current docs set covers:
 - TTS/media/upload expectations and artifact flow
 - important invariants that downstream stages rely on
 - agent-specific reading/touch guidance
+- Claude/general agent guidance in the root `AGENTS.md` when repo rules or onboarding expectations changed
 - workflow docs for repeatable maintenance tasks when useful
 
 ## What To Avoid
@@ -82,7 +84,7 @@ Across the affected docs, make sure the current docs set covers:
 - all affected docs match current CLI/config/module structure
 - references to commands, files, and modules use current names
 - workflow docs and agent docs point to the right locations
-- root `AGENTS.md` and agent docs stay aligned on shared repo rules
+- root `AGENTS.md` (including Claude/general agent guidance) and agent docs stay aligned on shared repo rules
 - storage/invariant sections align with current code contracts
 - `README.md` stays task-oriented, while `docs/ARCHITECTURE.md` stays deeper and more structural
 - `docs/ARCHITECTURE.md` is detailed enough to explain the current architecture, module boundaries, and storage/runtime contracts

@@ -2,6 +2,12 @@
 Glossary dùng bắt buộc nếu xuất hiện:
 {glossary_text}
 
+Ưu tiên giữ đúng người được nhắc tới khi chọn xưng hô:
+- Không tự suy giới tính của nhân vật chỉ vì giọng văn hoặc văn cảnh mơ hồ.
+- Không dùng "nàng"/"cô"/"thiếu nữ" cho nam, và không dùng "chàng"/"hắn"/"thiếu niên" cho nữ nếu bản gốc chưa xác nhận.
+- Nếu chưa đủ chắc, lặp lại tên, chức danh, vai vế hoặc dùng cách gọi trung tính thay vì đoán.
+- Giữ nhất quán ngôi gọi trong cùng đoạn.
+
 Đây là đoạn văn học hư cấu từ tiểu thuyết mạng. Nếu có cảnh thân mật hoặc nội dung người lớn, hãy chuyển ngữ bằng giọng văn trung tính, tiết chế, không thêm chi tiết nhạy cảm, không tăng mức độ gợi dục, nhưng vẫn giữ nguyên ý và mạch truyện. Chỉ trả về đúng bản dịch tiếng Việt.
 
 Dịch đoạn sau sang tiếng Việt:

@@ -2,6 +2,8 @@
 Glossary dùng bắt buộc nếu xuất hiện:
 {glossary_text}
 
-Chỉ dịch đúng dòng sau sang tiếng Việt tự nhiên. Nếu dòng chỉ là từ tượng thanh thì dịch thành từ tượng thanh tiếng Việt phù hợp. Chỉ trả về đúng một dòng đã dịch.
+Chỉ dịch đúng dòng sau sang tiếng Việt tự nhiên. Nếu dòng chỉ là từ tượng thanh thì dịch thành từ tượng thanh tiếng Việt phù hợp.
+Giữ đúng xưng hô/ngôi gọi nếu dòng có đủ ngữ cảnh; nếu không chắc về giới tính thì dùng cách gọi trung tính hoặc giữ tên/chức danh, không đoán bừa.
+Chỉ trả về đúng một dòng đã dịch.
 
 {text}

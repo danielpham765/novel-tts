@@ -5,6 +5,8 @@ Nhiệm vụ của ngươi:
 - Chỉ xuất ra bản dịch tiếng Việt cuối cùng của cả chương.
 - Phải thay hết toàn bộ chữ Hán còn sót, kể cả chữ Hán lẻ bị trộn trong câu tiếng Việt.
 - Nếu bản dịch hiện có đã đúng ở chỗ nào thì giữ nguyên tinh thần, chỉ sửa phần lỗi.
+- Phải sửa cả các lỗi xưng hô/chỉ ngôi sai người, sai vai nói, sai giới tính bằng cách đối chiếu lại bản gốc.
+- Không tự đoán giới tính. Nếu bản gốc chưa đủ chắc, ưu tiên tên riêng, chức danh, vai vế hoặc cách gọi trung tính thay vì dùng "nàng", "chàng", "cô", "hắn" bừa.
 - Không để lại chữ Hán, không giải thích, không ghi chú.
 
 BẢN GỐC:

@@ -95,12 +95,17 @@ Important sections:
 
 - `storage`
 - `crawl`
+- `browser_debug`
+- `models`
 - `translation`
 - `captions`
 - `queue`
 - `tts`
 - `visual`
 - `video`
+- `upload`
+- `pipeline`
+- `proxy_gateway`
 
 ## Storage Contract
 
@@ -139,6 +144,13 @@ Current workflows:
 
 Dispatch only. Do not add business logic here unless argument parsing or orchestration requires it.
 
+Current top-level command families include:
+
+- `crawl`, `translate`, `queue`
+- `tts`, `create-menu`, `visual`, `video`
+- `upload`, `youtube`
+- `pipeline`, `quota-supervisor`, `ai-key`
+
 ### Crawl
 
 - `novel_tts/crawl/service.py`
@@ -152,6 +164,7 @@ Public entrypoints:
 
 - `crawl_range`
 - `verify_crawled_content`
+- `repair_crawled_content`
 
 Important facts:
 
@@ -192,7 +205,7 @@ Important facts:
 - `translated/*.txt` is rebuilt from `.parts`
 - translation does multiple cleanup/repair passes for residual Han
 - glossary can auto-update from translated chapters
-- `translate repair` scans ranges and enqueues broken chapters back into Redis for queue workers to re-translate
+- `translate/repair.py` contains the scan logic used by `queue repair` to re-enqueue broken chapters
 
 Provider support:
 
@@ -209,6 +222,7 @@ Public entrypoints:
 - `run_worker`
 - `run_status_monitor`
 - `launch_queue_stack`
+- `requeue_untranslated_exhausted_jobs`
 
 Important facts:
 
@@ -219,6 +233,9 @@ Important facts:
 - Redis stores queue bookkeeping only
 - disk files remain source of truth
 - queue workers enable central quota for their translate subprocesses (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`)
+- queue add supports `--repair-report` in addition to direct chapter/range selection
+- `queue repair` scans translated outputs and re-enqueues only suspicious chapters
+- queue has a maintenance path to requeue exhausted-but-still-untranslated jobs
 
 Operator UX:
 
@@ -248,6 +265,28 @@ Operator command:
 
 - `uv run novel-tts quota-supervisor` (run once globally; uses `configs/app.yaml` queue.redis.*)
 
+### TTS / Menu / Media / Upload
+
+- `novel_tts/tts/service.py`
+- `novel_tts/media/service.py`
+- `novel_tts/upload/service.py`
+
+Public entrypoints worth knowing:
+
+- `run_tts`
+- `create_menu`
+- `regenerate_menu`
+- `generate_visual`
+- `create_video`
+- `run_upload`
+- `run_uploads`
+
+Important facts:
+
+- `create-menu` can rebuild chapter menu text without re-running TTS
+- `tts --re-generate-menu` preserves existing timestamps and refreshes labels from current translated text
+- upload includes both publish commands and YouTube admin/quota utilities from the same service module
+
 ### AI Key Telemetry
 
 - `novel_tts/ai_key/service.py`
@@ -261,36 +300,6 @@ Important facts:
 - reads `.secrets/gemini-keys.txt` but never prints raw keys
 - reads Redis cfg from `configs/app.yaml` (`queue.redis.*`)
 - scans per-key/per-model 1-minute counters emitted by queue processes
-
-### TTS
-
-- `novel_tts/tts/service.py`
-- `novel_tts/tts/providers.py`
-
-Public entrypoint:
-
-- `run_tts`
-
-Important facts:
-
-- expects translated batch file exactly matching requested range
-- splits by `Chương <n>`
-- writes wav chunks then merges mp3 via ffmpeg
-- current provider: `gradio_vie_tts`
-
-### Media
-
-- `novel_tts/media/service.py`
-
-Public entrypoints:
-
-- `generate_visual`
-- `create_video`
-
-Important facts:
-
-- visual rendering is FFmpeg drawtext over a background video
-- final video loops visual to match audio duration
 
 ## Critical Invariants
 

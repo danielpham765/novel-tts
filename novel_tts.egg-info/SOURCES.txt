@@ -62,6 +62,7 @@ novel_tts/translate/glossary.py
 novel_tts/translate/model.py
 novel_tts/translate/novel.py
 novel_tts/translate/polish.py
+novel_tts/translate/prompts.py
 novel_tts/translate/providers.py
 novel_tts/translate/repair.py
 novel_tts/tts/__init__.py
