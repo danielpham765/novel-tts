@@ -1,7 +1,8 @@
 proxy_gateway:
-  enabled: false
+  enabled: true
   base_url: http://localhost:8888
-  mode: socket
+  # mode: socket
+  mode: direct
   auto_discovery: true
   keys_per_proxy: 2
   direct_run_strategy: proxy_1

@@ -268,6 +268,50 @@ def _prepare_upstream_headers(headers: dict[str, str] | None) -> dict[str, str]:
     return cleaned
 
 
+def normalize_browser_proxy_server(host: str) -> str:
+    normalized = str(host or "").strip()
+    if not normalized:
+        return ""
+    if "://" in normalized:
+        return normalized
+    return f"http://{normalized}"
+
+
+def load_proxy_inventory(
+    *,
+    cfg: ProxyGatewayConfig,
+    timeout_seconds: float = 5.0,
+) -> list[dict[str, object]] | None:
+    base_url = (getattr(cfg, "base_url", "") or "").strip().rstrip("/")
+    if not base_url:
+        return None
+    try:
+        response = requests.get(f"{base_url}/proxies", timeout=max(1.0, float(timeout_seconds)))
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        LOGGER.warning("ProxyGateway proxy inventory fetch failed | base_url=%s err=%s", base_url, exc)
+        return None
+    if not isinstance(payload, list):
+        return None
+    out: list[dict[str, object]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        host = str(item.get("host") or "").strip()
+        if not name or not host:
+            continue
+        out.append(
+            {
+                "name": name,
+                "host": host,
+                "is_healthy": bool(item.get("is_healthy")),
+            }
+        )
+    return out
+
+
 def _build_proxy_header_profiles(proxy_count: int) -> list[dict[str, str]]:
     if proxy_count <= 0:
         return []

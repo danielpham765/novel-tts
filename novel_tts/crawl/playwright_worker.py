@@ -82,8 +82,9 @@ def _connect_or_launch(playwright, browser_config: dict[str, object], *, allow_f
     executable_path = str(browser_config.get("executable_path", "") or "").strip()
     user_data_dir = str(browser_config.get("user_data_dir", "") or "").strip()
     headless = bool(browser_config.get("headless", False))
+    browser_proxy_server = str(browser_config.get("proxy_server", "") or "").strip()
 
-    if mode == "debug-attach" and remote_debugging_url:
+    if mode == "debug-attach" and remote_debugging_url and not browser_proxy_server:
         try:
             browser = playwright.chromium.connect_over_cdp(remote_debugging_url)
             context = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -95,17 +96,20 @@ def _connect_or_launch(playwright, browser_config: dict[str, object], *, allow_f
                 raise
             fallback_reason = str(exc)
     else:
-        fallback_reason = ""
+        fallback_reason = "proxy_server_requested" if browser_proxy_server else ""
 
     if user_data_dir:
         last_exc: Exception | None = None
         for candidate in _browser_executable_candidates(executable_path) or [""]:
             try:
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir,
-                    headless=headless,
-                    executable_path=candidate or None,
-                )
+                launch_args: dict[str, object] = {
+                    "user_data_dir": user_data_dir,
+                    "headless": headless,
+                    "executable_path": candidate or None,
+                }
+                if browser_proxy_server:
+                    launch_args["proxy"] = {"server": browser_proxy_server}
+                context = playwright.chromium.launch_persistent_context(**launch_args)
                 page = context.pages[0] if context.pages else context.new_page()
                 return None, context, page, ("standalone:" + fallback_reason if fallback_reason else "standalone")
             except Exception as exc:
@@ -118,6 +122,8 @@ def _connect_or_launch(playwright, browser_config: dict[str, object], *, allow_f
         launch_args: dict[str, object] = {"headless": headless}
         if candidate:
             launch_args["executable_path"] = candidate
+        if browser_proxy_server:
+            launch_args["proxy"] = {"server": browser_proxy_server}
         try:
             browser = playwright.chromium.launch(**launch_args)
             context = browser.new_context()

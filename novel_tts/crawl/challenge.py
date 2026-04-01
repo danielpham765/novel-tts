@@ -54,7 +54,7 @@ class ChallengePolicy:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def launch_debug_browser(self, url: str) -> None:
+    def launch_debug_browser(self, url: str, *, proxy_server: str = "") -> None:
         executable = self.browser_config.executable_path or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         args = [
             executable,
@@ -62,6 +62,8 @@ class ChallengePolicy:
             "--no-first-run",
             "--disable-blink-features=AutomationControlled",
         ]
+        if proxy_server:
+            args.append(f"--proxy-server={proxy_server}")
         if self.browser_config.user_data_dir:
             args.append(f"--user-data-dir={self.browser_config.user_data_dir}")
         if self.browser_config.profile_directory:

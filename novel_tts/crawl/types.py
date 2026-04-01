@@ -31,4 +31,6 @@ class FetchResult:
     strategy_name: str = ""
     challenge_detected: bool = False
     block_reason: str = ""
+    proxy_name: str = ""
+    proxy_server: str = ""
     debug_artifacts: list[Path] = field(default_factory=list)

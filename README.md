@@ -263,7 +263,13 @@ uv run novel-tts crawl run <novel_id> --from 1 --to 10
 
 # Override directory URL if needed
 uv run novel-tts crawl run <novel_id> --range 1-10 --dir-url 'https://...'
+
+# Recrawl chapters that already exist locally
+uv run novel-tts crawl run <novel_id> --range 1-10 --force
 ```
+
+By default, `crawl run` skips chapters already present in local `input/<novel_id>/origin/*.txt` files.
+Use `--force` to recrawl those chapters.
 
 #### `crawl verify`
 

@@ -320,6 +320,7 @@ def _build_parser() -> argparse.ArgumentParser:
     crawl_run_parser.add_argument("--to", dest="to_chapter", type=int)
     crawl_run_parser.add_argument("--range")
     crawl_run_parser.add_argument("--dir-url")
+    crawl_run_parser.add_argument("--force", action="store_true")
     crawl_run_parser.add_argument(
         "--no-prune-manifest",
         action="store_true",
@@ -1126,6 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
                     start,
                     end,
                     args.dir_url,
+                    force=bool(getattr(args, "force", False)),
                     prune_failure_manifest=not bool(getattr(args, "no_prune_manifest", False)),
                 )
                 for output in outputs:
@@ -1870,7 +1872,7 @@ def main(argv: list[str] | None = None) -> int:
                     parser.error("pipeline run requires --range or both --from and --to")
                 start, end = args.from_chapter, args.to_chapter
             if not run_stage_flags["crawl"]:
-                crawl_range(config, start, end)
+                crawl_range(config, start, end, force=bool(getattr(args, "force", False)))
             if not run_stage_flags["translate"]:
                 launch_queue_stack(config, restart=False, add_queue=False)
                 add_jobs_to_queue(config, start, end, force=bool(getattr(args, "force", False)))

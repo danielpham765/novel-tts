@@ -470,6 +470,27 @@ def _iter_origin_batch_files(origin_dir: Path) -> list[Path]:
     )
 
 
+def _existing_origin_chapter_numbers(
+    *,
+    origin_dir: Path,
+    chapter_regex: str,
+    from_chapter: int | None = None,
+    to_chapter: int | None = None,
+) -> set[int]:
+    existing: set[int] = set()
+    for path in _iter_origin_batch_files(origin_dir):
+        if not _batch_file_overlaps_range(path, from_chapter, to_chapter):
+            continue
+        raw = path.read_text(encoding="utf-8")
+        for chapter_number, _title, _body in _split_crawled_chapters(raw, chapter_regex):
+            if from_chapter is not None and chapter_number < from_chapter:
+                continue
+            if to_chapter is not None and chapter_number > to_chapter:
+                continue
+            existing.add(chapter_number)
+    return existing
+
+
 def _batch_file_overlaps_range(path: Path, from_chapter: int | None, to_chapter: int | None) -> bool:
     if from_chapter is None and to_chapter is None:
         return True
@@ -1067,7 +1088,12 @@ def _fetch_replacement_block(
                 video=config.video,
                 proxy_gateway=config.proxy_gateway,
             )
-            strategy_chain = build_strategy_chain(tmp_cfg.crawl, tmp_cfg.browser_debug)
+            strategy_chain = build_strategy_chain(
+                tmp_cfg.crawl,
+                tmp_cfg.browser_debug,
+                proxy_gateway=tmp_cfg.proxy_gateway,
+                redis_cfg=tmp_cfg.queue.redis,
+            )
             entry = ChapterEntry(chapter, f"第{chapter}章", url)
             block, _parsed_number, _stats = _fetch_chapter(entry, tmp_cfg, resolver, strategy_chain)
             title_line, _, body = block.partition("\n")
@@ -2046,7 +2072,12 @@ def resolve_directory_entries(
 ) -> dict[int, ChapterEntry]:
     registry = build_default_registry()
     resolver = registry.get(config.source.resolver_id)
-    strategy_chain = build_strategy_chain(config.crawl, config.browser_debug)
+    strategy_chain = build_strategy_chain(
+        config.crawl,
+        config.browser_debug,
+        proxy_gateway=config.proxy_gateway,
+        redis_cfg=config.queue.redis,
+    )
     dir_url = directory_url or config.crawl.directory_url
 
     LOGGER.info(
@@ -2140,6 +2171,7 @@ def crawl_range(
     to_chapter: int,
     directory_url: str | None = None,
     *,
+    force: bool = False,
     prune_failure_manifest: bool = True,
     source_configs: list[SourceConfig] | None = None,
 ) -> list[Path]:
@@ -2168,15 +2200,24 @@ def crawl_range(
     primary_discovery = discovery_results[0]
     active_config = config_with_source(config, primary_discovery.source_config)
     resolver = registry.get(active_config.source.resolver_id)
-    strategy_chain = build_strategy_chain(active_config.crawl, active_config.browser_debug)
     dir_url = directory_url or active_config.crawl.directory_url
+    existing_chapters = set()
+    if not force:
+        existing_chapters = _existing_origin_chapter_numbers(
+            origin_dir=config.storage.origin_dir,
+            chapter_regex=config.translation.chapter_regex,
+            from_chapter=from_chapter,
+            to_chapter=to_chapter,
+        )
     LOGGER.info(
-        "Starting crawl | novel=%s source=%s range=%s-%s directory=%s",
+        "Starting crawl | novel=%s source=%s range=%s-%s directory=%s force=%s existing_in_range=%s",
         active_config.novel_id,
         active_config.crawl.site_id,
         from_chapter,
         to_chapter,
         dir_url,
+        force,
+        len(existing_chapters),
     )
     chapter_sources: dict[int, list[tuple[SourceConfig, ChapterEntry]]] = {}
     chapter_map: dict[int, ChapterEntry] = {}
@@ -2200,6 +2241,7 @@ def crawl_range(
     outputs: list[Path] = []
     total_success = 0
     total_failed = 0
+    total_skipped = 0
     failed_chapters: list[int] = []
     batch_size = max(1, config.crawl.chapter_batch_size)
     aligned_start = ((from_chapter - 1) // batch_size) * batch_size + 1
@@ -2211,6 +2253,7 @@ def crawl_range(
         fetched_numbers: list[int] = []
         batch_success = 0
         batch_failed = 0
+        batch_skipped = 0
         LOGGER.info(
             "Batch start | novel=%s source=%s batch=%s-%s batch_size=%s",
             active_config.novel_id,
@@ -2220,6 +2263,18 @@ def crawl_range(
             batch_size,
         )
         for chapter_number in range(fetch_start, fetch_end + 1):
+            if (not force) and chapter_number in existing_chapters:
+                batch_skipped += 1
+                total_skipped += 1
+                LOGGER.info(
+                    "Skipping existing chapter | novel=%s source=%s chapter=%s batch=%s-%s",
+                    active_config.novel_id,
+                    active_config.crawl.site_id,
+                    chapter_number,
+                    batch_start,
+                    batch_end,
+                )
+                continue
             candidates = chapter_sources.get(chapter_number, [])
             if not candidates and chapter_number in chapter_map:
                 candidates = [(active_config.source, chapter_map[chapter_number])]
@@ -2247,7 +2302,12 @@ def crawl_range(
             for candidate_source, entry in candidates:
                 candidate_config = config_with_source(config, candidate_source)
                 candidate_resolver = registry.get(candidate_config.source.resolver_id)
-                candidate_strategy_chain = build_strategy_chain(candidate_config.crawl, candidate_config.browser_debug)
+                candidate_strategy_chain = build_strategy_chain(
+                    candidate_config.crawl,
+                    candidate_config.browser_debug,
+                    proxy_gateway=candidate_config.proxy_gateway,
+                    redis_cfg=candidate_config.queue.redis,
+                )
                 try:
                     block, parsed_number, stats = _fetch_chapter(
                         entry,
@@ -2312,7 +2372,7 @@ def crawl_range(
                 config.translation.chapter_regex,
             )
             LOGGER.info(
-                "Batch wrote file | novel=%s source=%s batch=%s-%s output=%s chapters=%s success=%s failed=%s",
+                "Batch wrote file | novel=%s source=%s batch=%s-%s output=%s chapters=%s success=%s failed=%s skipped=%s",
                 config.novel_id,
                 config.crawl.site_id,
                 batch_start,
@@ -2321,35 +2381,39 @@ def crawl_range(
                 len(fetched_numbers),
                 batch_success,
                 batch_failed,
+                batch_skipped,
             )
             outputs.append(output_path)
         else:
             LOGGER.warning(
-                "Batch wrote no file | novel=%s source=%s batch=%s-%s success=%s failed=%s",
+                "Batch wrote no file | novel=%s source=%s batch=%s-%s success=%s failed=%s skipped=%s",
                 config.novel_id,
                 config.crawl.site_id,
                 batch_start,
                 batch_end,
                 batch_success,
                 batch_failed,
+                batch_skipped,
             )
         LOGGER.info(
-            "Batch finished | novel=%s source=%s batch=%s-%s success=%s failed=%s",
+            "Batch finished | novel=%s source=%s batch=%s-%s success=%s failed=%s skipped=%s",
             config.novel_id,
             config.crawl.site_id,
             batch_start,
             batch_end,
             batch_success,
             batch_failed,
+            batch_skipped,
         )
     LOGGER.info(
-        "Crawl finished | novel=%s source=%s range=%s-%s success=%s failed=%s outputs=%s elapsed=%.2fs failure_manifest=%s failed_chapters=%s",
+        "Crawl finished | novel=%s source=%s range=%s-%s success=%s failed=%s skipped=%s outputs=%s elapsed=%.2fs failure_manifest=%s failed_chapters=%s",
         config.novel_id,
         config.crawl.site_id,
         from_chapter,
         to_chapter,
         total_success,
         total_failed,
+        total_skipped,
         len(outputs),
         time.time() - run_started_at,
         _failure_manifest_path(config),
