@@ -10,6 +10,7 @@ from novel_tts.config.models import NovelConfig
 from .model import resolve_translation_model
 from .glossary import build_glossary_text
 from .novel import update_glossary_from_chapter
+from .prompts import render_prompt
 from .providers import get_translation_provider, is_queue_worker_env
 
 LOGGER = get_logger(__name__)
@@ -54,21 +55,12 @@ def translate_captions(config: NovelConfig) -> Path:
 
     for chunk_index in range(0, len(source_lines), caption_cfg.chunk_size):
         batch = source_lines[chunk_index : chunk_index + caption_cfg.chunk_size]
-        prompt_parts = [
-            "Bạn là chuyên gia dịch phụ đề Trung -> Việt.",
-            "Dịch tự nhiên theo phong cách phụ đề, ngắn gọn nhưng mượt, ưu tiên câu văn nghe như lời thoại thật.",
-            "Tự động thêm dấu câu phù hợp khi cần, đặc biệt là dấu phẩy, dấu chấm, dấu hỏi và dấu chấm than.",
-            "Nếu tên riêng hoặc thuật ngữ đã xuất hiện trong glossary bên dưới, giữ nhất quán đúng theo glossary, không tự đổi cách gọi.",
-            'Bắt buộc trả về DUY NHẤT JSON object dạng: {"translations":["...", "..."]}.',
-            "translations phải có đúng số phần tử như đầu vào, đúng thứ tự.",
-            "Dịch toàn bộ sang tiếng Việt, không để lại tiếng Trung, bao gồm cả tên riêng.",
-            "Giữ nguyên định dạng subtitle trong dòng nếu có: <i>, </i>, {\\an8}, dấu câu, ký hiệu.",
-        ]
-        if glossary_text:
-            prompt_parts.append("GLOSSARY:")
-            prompt_parts.append(glossary_text)
-        prompt_parts.append(json.dumps({"lines": batch}, ensure_ascii=False))
-        prompt = "\n".join(prompt_parts)
+        glossary_section = f"GLOSSARY:\n{glossary_text}\n" if glossary_text else ""
+        prompt = render_prompt(
+            "caption-translate.txt",
+            glossary_section=glossary_section,
+            batch_json=json.dumps({"lines": batch}, ensure_ascii=False),
+        )
         raw = provider.generate(model, prompt)
         (debug_dir / f"chunk_{chunk_index // caption_cfg.chunk_size + 1}.txt").write_text(prompt, encoding="utf-8")
         (response_dir / f"chunk_{chunk_index // caption_cfg.chunk_size + 1}.txt").write_text(raw, encoding="utf-8")

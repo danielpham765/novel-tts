@@ -1,0 +1,7 @@
+{base_rules}
+Glossary dùng bắt buộc nếu xuất hiện:
+{glossary_text}
+
+Chỉ dịch đúng dòng sau sang tiếng Việt tự nhiên. Nếu dòng chỉ là từ tượng thanh thì dịch thành từ tượng thanh tiếng Việt phù hợp. Chỉ trả về đúng một dòng đã dịch.
+
+{text}

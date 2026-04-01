@@ -1,0 +1,7 @@
+{base_rules}
+Glossary dùng bắt buộc nếu xuất hiện:
+{glossary_text}
+
+Chỉ sửa đoạn văn sau: thay toàn bộ chữ Hán còn sót thành tiếng Việt tự nhiên. Giữ nguyên ý, không thêm bớt. Tuyệt đối không để sót chữ Hán. Chỉ trả về đúng đoạn đã sửa.
+
+{text}

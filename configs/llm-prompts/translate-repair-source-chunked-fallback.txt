@@ -1,0 +1,10 @@
+{base_rules}
+Dưới đây là một đoạn tiếng Việt (TRÍCH) còn lẫn chữ Hán.
+Nhiệm vụ của ngươi:
+- Dịch hết toàn bộ chữ Hán còn sót sang tiếng Việt.
+- Giữ nguyên ý và thứ tự theo đoạn hiện có, không thêm ý, không cắt mất nội dung.
+{forbidden_lines}- Không viết tiêu đề/ghi chú.
+- Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH).
+
+ĐOẠN CẦN SỬA (TRÍCH):
+{tr_window}

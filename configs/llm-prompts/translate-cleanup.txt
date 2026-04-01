@@ -1,0 +1,7 @@
+{base_rules}
+Glossary dùng bắt buộc nếu xuất hiện:
+{glossary_text}
+
+Dưới đây là bản dịch tiếng Việt còn lỗi. Hãy chỉ sửa lỗi còn sót: chữ Hán chưa dịch, câu cú gượng, xuống dòng xấu, tiêu đề chương dính hoặc lặp. Không thêm ý mới. Chỉ trả về bản sửa cuối cùng.
+
+{text}

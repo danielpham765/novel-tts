@@ -1,0 +1,16 @@
+Hãy trích xuất glossary thuật ngữ từ cặp văn bản sau.
+Mục tiêu: dùng cho các chương sau của cùng một truyện để giữ cách dịch nhất quán.
+Chỉ lấy mục thật sự nên tái sử dụng: tên người, tên trường, địa danh, tổ chức, chức danh riêng, biệt hiệu, thuật ngữ riêng.
+Không lấy đại từ, động từ, tính từ, câu hoàn chỉnh, từ thông dụng.
+Khóa phải là cụm chữ Hán xuất hiện nguyên văn trong bản gốc. Giá trị phải là đúng cách gọi tiếng Việt đã dùng trong bản dịch.
+Giá trị bắt buộc phải xuất hiện nguyên văn trong BẢN DỊCH (copy y nguyên), không được tự bịa hoặc tự suy diễn.
+Tuyệt đối không trả về mã placeholder dạng ZXQ123QXZ hoặc QZX123QXZ.
+Nếu chưa chắc chắn hoặc bản dịch không thể hiện rõ, bỏ qua.
+Ưu tiên cụm dài, tránh tạo mục con dư thừa khi đã có mục dài hơn cùng nghĩa.
+Chỉ trả về JSON object thuần, không markdown, không giải thích.
+
+{window_header}BẢN GỐC{compacted_suffix}:
+{compact_source}
+
+BẢN DỊCH{compacted_suffix}:
+{compact_translated}

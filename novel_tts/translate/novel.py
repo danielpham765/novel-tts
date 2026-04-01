@@ -15,6 +15,7 @@ from novel_tts.config.models import NovelConfig
 
 from .glossary import normalize_glossary_text, sanitize_glossary_entries, source_text_variants
 from .model import _clean_model_name, resolve_translation_model
+from .prompts import render_prompt
 from .providers import PromptBlockedError, get_translation_provider
 
 LOGGER = get_logger(__name__)
@@ -871,19 +872,13 @@ def _extract_glossary_updates(config: NovelConfig, provider, source_text: str, t
         max_source_chars=max_source_chars,
         max_translated_chars=max_translated_chars,
     )
-    prompt = (
-        "Hãy trích xuất glossary thuật ngữ từ cặp văn bản sau.\n"
-        "Mục tiêu: dùng cho các chương sau của cùng một truyện để giữ cách dịch nhất quán.\n"
-        "Chỉ lấy mục thật sự nên tái sử dụng: tên người, tên trường, địa danh, tổ chức, chức danh riêng, biệt hiệu, thuật ngữ riêng.\n"
-        "Không lấy đại từ, động từ, tính từ, câu hoàn chỉnh, từ thông dụng.\n"
-        "Khóa phải là cụm chữ Hán xuất hiện nguyên văn trong bản gốc. Giá trị phải là đúng cách gọi tiếng Việt đã dùng trong bản dịch.\n"
-        "Giá trị bắt buộc phải xuất hiện nguyên văn trong BẢN DỊCH (copy y nguyên), không được tự bịa hoặc tự suy diễn.\n"
-        "Tuyệt đối không trả về mã placeholder dạng ZXQ123QXZ hoặc QZX123QXZ.\n"
-        "Nếu chưa chắc chắn hoặc bản dịch không thể hiện rõ, bỏ qua.\n"
-        "Ưu tiên cụm dài, tránh tạo mục con dư thừa khi đã có mục dài hơn cùng nghĩa.\n"
-        "Chỉ trả về JSON object thuần, không markdown, không giải thích.\n\n"
-        f"BẢN GỐC{' (TRÍCH)' if was_compacted else ''}:\n{compact_source}\n\n"
-        f"BẢN DỊCH{' (TRÍCH)' if was_compacted else ''}:\n{compact_translated}\n"
+    compacted_suffix = " (TRÍCH)" if was_compacted else ""
+    prompt = render_prompt(
+        "translate-glossary-extract.txt",
+        window_header="",
+        compacted_suffix=compacted_suffix,
+        compact_source=compact_source,
+        compact_translated=compact_translated,
     )
     default_model = resolve_translation_model(config)
     model = _effective_glossary_model(config, default_model)
@@ -1521,18 +1516,12 @@ def repair_against_source_chunked(
             _save_repair_progress(config, stage_prefix, unit_key, repaired)
             continue
         started = time.perf_counter()
-        prompt = (
-            f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
-            "Dưới đây là bản gốc tiếng Trung (TRÍCH) và bản dịch tiếng Việt hiện có (TRÍCH) của cùng một đoạn.\n"
-            "Nhiệm vụ của ngươi:\n"
-            "- Chỉ sửa đoạn BẢN DỊCH HIỆN CÓ sao cho khớp với BẢN GỐC.\n"
-            "- Giữ nguyên ý và thứ tự theo BẢN GỐC, không thêm ý, không cắt mất nội dung.\n"
-            "- Phải thay hết toàn bộ chữ Hán còn sót (kể cả chữ Hán lẻ bị trộn trong câu tiếng Việt).\n"
-            f"{forbidden_lines}"
-            "- Không viết tiêu đề/ghi chú, không nhắc lại phần ngoài đoạn này.\n"
-            "- Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH) tương ứng.\n\n"
-            f"BẢN GỐC (TRÍCH):\n{src_window}\n\n"
-            f"BẢN DỊCH HIỆN CÓ (TRÍCH):\n{tr_window}"
+        prompt = render_prompt(
+            "translate-repair-source-chunked.txt",
+            base_rules=_strip_placeholder_rules(config.translation.base_rules),
+            forbidden_lines=forbidden_lines,
+            src_window=src_window,
+            tr_window=tr_window,
         )
         try:
             fixed = _generate_once(provider, model, prompt).strip()
@@ -1552,16 +1541,11 @@ def repair_against_source_chunked(
             )
             # Fallback: do a best-effort "Han-only" cleanup without including the Chinese source excerpt.
             # This is less faithful than repairing against source, but is better than failing the entire unit.
-            fallback_prompt = (
-                f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
-                "Dưới đây là một đoạn tiếng Việt (TRÍCH) còn lẫn chữ Hán.\n"
-                "Nhiệm vụ của ngươi:\n"
-                "- Dịch hết toàn bộ chữ Hán còn sót sang tiếng Việt.\n"
-                "- Giữ nguyên ý và thứ tự theo đoạn hiện có, không thêm ý, không cắt mất nội dung.\n"
-                f"{forbidden_lines}"
-                "- Không viết tiêu đề/ghi chú.\n"
-                "- Chỉ xuất ra đoạn tiếng Việt đã sửa (TRÍCH).\n\n"
-                f"ĐOẠN CẦN SỬA (TRÍCH):\n{tr_window}"
+            fallback_prompt = render_prompt(
+                "translate-repair-source-chunked-fallback.txt",
+                base_rules=_strip_placeholder_rules(config.translation.base_rules),
+                forbidden_lines=forbidden_lines,
+                tr_window=tr_window,
             )
             try:
                 fixed = _generate_once(provider, model, fallback_prompt).strip()
@@ -1740,20 +1724,12 @@ def _extract_glossary_updates_chunked(
             len(extracted),
         )
         started = time.perf_counter()
-        prompt = (
-            "Hãy trích xuất glossary thuật ngữ từ cặp văn bản sau.\n"
-            "Mục tiêu: dùng cho các chương sau của cùng một truyện để giữ cách dịch nhất quán.\n"
-            "Chỉ lấy mục thật sự nên tái sử dụng: tên người, tên trường, địa danh, tổ chức, chức danh riêng, biệt hiệu, thuật ngữ riêng.\n"
-            "Không lấy đại từ, động từ, tính từ, câu hoàn chỉnh, từ thông dụng.\n"
-            "Khóa phải là cụm chữ Hán xuất hiện nguyên văn trong bản gốc. Giá trị phải là đúng cách gọi tiếng Việt đã dùng trong bản dịch.\n"
-            "Giá trị bắt buộc phải xuất hiện nguyên văn trong BẢN DỊCH (copy y nguyên), không được tự bịa hoặc tự suy diễn.\n"
-            "Tuyệt đối không trả về mã placeholder dạng ZXQ123QXZ hoặc QZX123QXZ.\n"
-            "Nếu chưa chắc chắn hoặc bản dịch không thể hiện rõ, bỏ qua.\n"
-            "Ưu tiên cụm dài, tránh tạo mục con dư thừa khi đã có mục dài hơn cùng nghĩa.\n"
-            "Chỉ trả về JSON object thuần, không markdown, không giải thích.\n\n"
-            f"WINDOW {idx}/{len(centers)}:\n"
-            f"BẢN GỐC (TRÍCH):\n{compact_src}\n\n"
-            f"BẢN DỊCH (TRÍCH):\n{compact_tr}\n"
+        prompt = render_prompt(
+            "translate-glossary-extract.txt",
+            window_header=f"WINDOW {idx}/{len(centers)}:\n",
+            compacted_suffix=" (TRÍCH)",
+            compact_source=compact_src,
+            compact_translated=compact_tr,
         )
         try:
             updates = _parse_glossary_response(_generate_once(provider, model, prompt))
@@ -2299,14 +2275,11 @@ def _strip_placeholder_rules(base_rules: str) -> str:
 
 
 def _safe_literary_prompt(base_rules: str, glossary_text: str, line_token: str, text: str) -> str:
-    return (
-        f"{base_rules}\n"
-        f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
-        "Đây là đoạn văn học hư cấu từ tiểu thuyết mạng. "
-        "Nếu có cảnh thân mật hoặc nội dung người lớn, hãy chuyển ngữ bằng giọng văn trung tính, tiết chế, "
-        "không thêm chi tiết nhạy cảm, không tăng mức độ gợi dục, nhưng vẫn giữ nguyên ý và mạch truyện. "
-        "Chỉ trả về đúng bản dịch tiếng Việt.\n\n"
-        f"Dịch đoạn sau sang tiếng Việt:\n{text.replace(chr(10), f' {line_token} ')}"
+    return render_prompt(
+        "translate-safe-literary.txt",
+        base_rules=base_rules,
+        glossary_text=glossary_text,
+        text=text.replace(chr(10), f" {line_token} "),
     )
 
 
@@ -2319,13 +2292,11 @@ def _generate_translation_chunk(
     *,
     chunk_max_len: int,
 ) -> str:
-    primary_prompt = (
-        f"{translation_cfg.base_rules}\n"
-        f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
-        "Hãy tự kiểm tra và sửa ngay trong một lần trả lời trước khi xuất kết quả cuối cùng. "
-        "Tuyệt đối không để xuất hiện kiểu phiên âm máy/pinyin lẫn vào tiếng Việt như "
-        "'tha', 'ngã', 'nhĩ', 'liễu', 'thập ma', 'chẩm hội'.\n\n"
-        f"Dịch đoạn sau sang tiếng Việt:\n{chunk.replace(chr(10), f' {translation_cfg.line_token} ')}"
+    primary_prompt = render_prompt(
+        "translate-primary.txt",
+        base_rules=translation_cfg.base_rules,
+        glossary_text=glossary_text,
+        text=chunk.replace(chr(10), f" {translation_cfg.line_token} "),
     )
     try:
         return _generate_once(provider, model, primary_prompt)
@@ -2362,13 +2333,11 @@ def _generate_translation_chunk(
                 len(segment_texts),
                 exc.reason,
             )
-            softened_prompt = (
-                f"{translation_cfg.base_rules}\n"
-                f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
-                "Đây là một đoạn đối thoại hoặc trần thuật trong tiểu thuyết hư cấu. "
-                "Hãy chuyển ngữ sang tiếng Việt rõ nghĩa, trung tính, giữ nguyên diễn biến. "
-                "Chỉ trả về bản dịch.\n\n"
-                f"{segment.replace(chr(10), f' {translation_cfg.line_token} ')}"
+            softened_prompt = render_prompt(
+                "translate-softened.txt",
+                base_rules=translation_cfg.base_rules,
+                glossary_text=glossary_text,
+                text=segment.replace(chr(10), f" {translation_cfg.line_token} "),
             )
             try:
                 outputs.append(_generate_once(provider, model, softened_prompt))
@@ -2382,13 +2351,11 @@ def _generate_translation_chunk(
 def final_cleanup(config: NovelConfig, provider, model: str, text: str, mapping: dict[str, str]) -> str:
     chunk_max_len = _effective_chunk_max_len(config, model)
     glossary_text = _glossary_text_for_text(mapping, text, max_chars=chunk_max_len)
-    prompt = (
-        f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
-        f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
-        "Dưới đây là bản dịch tiếng Việt còn lỗi. "
-        "Hãy chỉ sửa lỗi còn sót: chữ Hán chưa dịch, câu cú gượng, xuống dòng xấu, tiêu đề chương dính hoặc lặp. "
-        "Không thêm ý mới. Chỉ trả về bản sửa cuối cùng.\n\n"
-        f"{text}"
+    prompt = render_prompt(
+        "translate-cleanup.txt",
+        base_rules=_strip_placeholder_rules(config.translation.base_rules),
+        glossary_text=glossary_text,
+        text=text,
     )
     return _generate_once(provider, model, prompt)
 
@@ -2406,13 +2373,11 @@ def patch_remaining_han(config: NovelConfig, provider, model: str, text: str, ma
             lines[idx] = line
             continue
         glossary_text = _glossary_text_for_text(mapping, line, max_chars=_effective_chunk_max_len(config, model))
-        prompt = (
-            f"{_strip_placeholder_rules(translation_cfg.base_rules)}\n"
-            f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
-            "Chỉ dịch đúng dòng sau sang tiếng Việt tự nhiên. "
-            "Nếu dòng chỉ là từ tượng thanh thì dịch thành từ tượng thanh tiếng Việt phù hợp. "
-            "Chỉ trả về đúng một dòng đã dịch.\n\n"
-            f"{line}"
+        prompt = render_prompt(
+            "translate-han-repair-line.txt",
+            base_rules=_strip_placeholder_rules(translation_cfg.base_rules),
+            glossary_text=glossary_text,
+            text=line,
         )
         try:
             fixed = _generate_once(provider, model, prompt)
@@ -2445,13 +2410,11 @@ def aggressive_repair_han(config: NovelConfig, provider, model: str, text: str, 
                 segment,
                 max_chars=int(getattr(translation_cfg, "chunk_max_len", 0) or 0),
             )
-            prompt = (
-                f"{_strip_placeholder_rules(translation_cfg.base_rules)}\n"
-                f"Glossary dùng bắt buộc nếu xuất hiện:\n{glossary_text}\n\n"
-                "Chỉ sửa đoạn văn sau: thay toàn bộ chữ Hán còn sót thành tiếng Việt tự nhiên. "
-                "Giữ nguyên ý, không thêm bớt. Tuyệt đối không để sót chữ Hán. "
-                "Chỉ trả về đúng đoạn đã sửa.\n\n"
-                f"{segment}"
+            prompt = render_prompt(
+                "translate-han-repair-aggressive.txt",
+                base_rules=_strip_placeholder_rules(translation_cfg.base_rules),
+                glossary_text=glossary_text,
+                text=segment,
             )
             try:
                 fixed = _generate_once(provider, model, prompt).strip()
@@ -2470,17 +2433,11 @@ def aggressive_repair_han(config: NovelConfig, provider, model: str, text: str, 
 
 
 def repair_against_source(config: NovelConfig, provider, model: str, source_text: str, translated_text: str) -> str:
-    prompt = (
-        f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
-        "Dưới đây là bản gốc tiếng Trung và bản dịch tiếng Việt hiện có của cùng một chương.\n"
-        "Nhiệm vụ của ngươi:\n"
-        "- Giữ nguyên toàn bộ nội dung và thứ tự theo bản gốc.\n"
-        "- Chỉ xuất ra bản dịch tiếng Việt cuối cùng của cả chương.\n"
-        "- Phải thay hết toàn bộ chữ Hán còn sót, kể cả chữ Hán lẻ bị trộn trong câu tiếng Việt.\n"
-        "- Nếu bản dịch hiện có đã đúng ở chỗ nào thì giữ nguyên tinh thần, chỉ sửa phần lỗi.\n"
-        "- Không để lại chữ Hán, không giải thích, không ghi chú.\n\n"
-        f"BẢN GỐC:\n{source_text}\n\n"
-        f"BẢN DỊCH HIỆN CÓ:\n{translated_text}"
+    prompt = render_prompt(
+        "translate-repair-source.txt",
+        base_rules=_strip_placeholder_rules(config.translation.base_rules),
+        source_text=source_text,
+        translated_text=translated_text,
     )
     return _generate_once(provider, model, prompt)
 
@@ -2494,18 +2451,12 @@ def repair_placeholder_tokens_against_source(
 ) -> str:
     found = sorted(set(PLACEHOLDER_TOKEN_RE.findall(translated_text)))
     examples = ", ".join(found[:8])
-    prompt = (
-        f"{_strip_placeholder_rules(config.translation.base_rules)}\n"
-        "Bản dịch tiếng Việt dưới đây đang bị lỗi: còn sót các mã placeholder dạng ZXQ123QXZ hoặc QZX123QXZ.\n"
-        "Nhiệm vụ của ngươi:\n"
-        "- Tuyệt đối không để lại bất kỳ mã ZXQ...QXZ/QZX...QXZ nào trong kết quả.\n"
-        "- Dựa vào bản gốc tiếng Trung để khôi phục đúng tên người/địa danh/tổ chức/chức danh tương ứng.\n"
-        "- Nếu không chắc cách Việt hóa, giữ nguyên chữ Hán của thuật ngữ trong bản gốc (nhưng vẫn không được để token).\n"
-        "- Giữ nguyên nội dung và thứ tự theo bản gốc, không thêm ý, không xóa làm mất nghĩa.\n"
-        "- Chỉ xuất ra bản dịch tiếng Việt cuối cùng của cả đoạn.\n\n"
-        f"PLACEHOLDER ĐANG BỊ LỌT (ví dụ): {examples}\n\n"
-        f"BẢN GỐC:\n{source_text}\n\n"
-        f"BẢN DỊCH HIỆN CÓ:\n{translated_text}"
+    prompt = render_prompt(
+        "translate-repair-placeholders.txt",
+        base_rules=_strip_placeholder_rules(config.translation.base_rules),
+        examples=examples,
+        source_text=source_text,
+        translated_text=translated_text,
     )
     return _generate_once(provider, model, prompt)
 

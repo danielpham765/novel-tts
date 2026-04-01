@@ -1,0 +1,16 @@
+{base_rules}
+Bản dịch tiếng Việt dưới đây đang bị lỗi: còn sót các mã placeholder dạng ZXQ123QXZ hoặc QZX123QXZ.
+Nhiệm vụ của ngươi:
+- Tuyệt đối không để lại bất kỳ mã ZXQ...QXZ/QZX...QXZ nào trong kết quả.
+- Dựa vào bản gốc tiếng Trung để khôi phục đúng tên người/địa danh/tổ chức/chức danh tương ứng.
+- Nếu không chắc cách Việt hóa, giữ nguyên chữ Hán của thuật ngữ trong bản gốc (nhưng vẫn không được để token).
+- Giữ nguyên nội dung và thứ tự theo bản gốc, không thêm ý, không xóa làm mất nghĩa.
+- Chỉ xuất ra bản dịch tiếng Việt cuối cùng của cả đoạn.
+
+PLACEHOLDER ĐANG BỊ LỌT (ví dụ): {examples}
+
+BẢN GỐC:
+{source_text}
+
+BẢN DỊCH HIỆN CÓ:
+{translated_text}

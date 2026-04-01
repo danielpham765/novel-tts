@@ -1,0 +1,8 @@
+{base_rules}
+Glossary dùng bắt buộc nếu xuất hiện:
+{glossary_text}
+
+Hãy tự kiểm tra và sửa ngay trong một lần trả lời trước khi xuất kết quả cuối cùng. Tuyệt đối không để xuất hiện kiểu phiên âm máy/pinyin lẫn vào tiếng Việt như 'tha', 'ngã', 'nhĩ', 'liễu', 'thập ma', 'chẩm hội'.
+
+Dịch đoạn sau sang tiếng Việt:
+{text}

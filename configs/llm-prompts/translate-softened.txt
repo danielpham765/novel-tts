@@ -1,0 +1,7 @@
+{base_rules}
+Glossary dùng bắt buộc nếu xuất hiện:
+{glossary_text}
+
+Đây là một đoạn đối thoại hoặc trần thuật trong tiểu thuyết hư cấu. Hãy chuyển ngữ sang tiếng Việt rõ nghĩa, trung tính, giữ nguyên diễn biến. Chỉ trả về bản dịch.
+
+{text}

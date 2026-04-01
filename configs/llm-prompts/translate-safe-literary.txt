@@ -1,0 +1,8 @@
+{base_rules}
+Glossary dùng bắt buộc nếu xuất hiện:
+{glossary_text}
+
+Đây là đoạn văn học hư cấu từ tiểu thuyết mạng. Nếu có cảnh thân mật hoặc nội dung người lớn, hãy chuyển ngữ bằng giọng văn trung tính, tiết chế, không thêm chi tiết nhạy cảm, không tăng mức độ gợi dục, nhưng vẫn giữ nguyên ý và mạch truyện. Chỉ trả về đúng bản dịch tiếng Việt.
+
+Dịch đoạn sau sang tiếng Việt:
+{text}
