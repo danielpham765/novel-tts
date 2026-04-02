@@ -3,6 +3,7 @@ pyproject.toml
 novel_tts/__init__.py
 novel_tts/__main__.py
 novel_tts/key_identity.py
+novel_tts/media_batch.py
 novel_tts.egg-info/PKG-INFO
 novel_tts.egg-info/SOURCES.txt
 novel_tts.egg-info/dependency_links.txt
@@ -59,6 +60,7 @@ novel_tts/quota/supervisor.py
 novel_tts/translate/__init__.py
 novel_tts/translate/captions.py
 novel_tts/translate/glossary.py
+novel_tts/translate/glossary_repair.py
 novel_tts/translate/model.py
 novel_tts/translate/novel.py
 novel_tts/translate/polish.py
@@ -72,10 +74,12 @@ novel_tts/upload/__init__.py
 novel_tts/upload/service.py
 tests/test_ai_key_counts.py
 tests/test_ai_key_ps.py
+tests/test_app_local_config.py
 tests/test_cli_rate_limit_exit_code.py
 tests/test_config_tts_merge.py
 tests/test_context_map.py
 tests/test_crawl_batch_merge.py
+tests/test_crawl_proxy_and_force.py
 tests/test_crawl_repair_inline_replace.py
 tests/test_crawl_repair_report.py
 tests/test_crawl_repair_requires_config.py
@@ -85,6 +89,7 @@ tests/test_crawl_verify_flags.py
 tests/test_gemini_http_provider.py
 tests/test_glossary_placeholder_guard.py
 tests/test_logrotate.py
+tests/test_media_batch_config.py
 tests/test_media_visual_requirements.py
 tests/test_pipeline_upload_integration.py
 tests/test_providers_quota_raise_propagates.py
@@ -125,6 +130,7 @@ tests/test_translate_polish_titles.py
 tests/test_translation_prompt_glossary_budget.py
 tests/test_ttkan_resolver.py
 tests/test_tts_cache_invalidation_and_force.py
+tests/test_tts_multi_batch_source.py
 tests/test_tts_provider_config_jsonc.py
 tests/test_tts_provider_model_autoload.py
 tests/test_upload_config_loader.py

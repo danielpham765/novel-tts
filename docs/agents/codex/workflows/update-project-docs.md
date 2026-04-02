@@ -7,7 +7,7 @@ Use this workflow when the user asks to refresh project documentation so it matc
 - update all relevant docs affected by the current code and workflow shape
 - prefer current implementation over older docs wording
 - keep docs practical, file-first, and operational rather than aspirational
-- treat Claude-facing agent docs as part of the required doc set, including the root `AGENTS.md`
+- treat Claude-facing agent docs as part of the required doc set, especially the root `CLAUDE.md`
 - keep `README.md`, `docs/ARCHITECTURE.md`, and agent docs consistent with each other
 - keep `docs/ARCHITECTURE.md` as the detailed current-state architecture reference, not a shallow summary
 
@@ -15,7 +15,8 @@ Use this workflow when the user asks to refresh project documentation so it matc
 
 Default docs to consider:
 
-- `AGENTS.md` (Claude/general agent-facing repo contract)
+- `CLAUDE.md` (Claude Code-facing repo contract)
+- `AGENTS.md` (general agent-facing repo contract when still used in parallel)
 - `README.md`
 - `docs/ARCHITECTURE.md`
 - `docs/agents/codex/AGENTS.md`
@@ -26,16 +27,17 @@ Update only the docs actually affected by the current code changes or drift you 
 
 ## Read Order
 
-1. `AGENTS.md`
-2. `README.md`
-3. `docs/ARCHITECTURE.md`
-4. `docs/agents/codex/AGENTS.md`
-5. `docs/agents/cursor/AGENTS.md`
-6. any existing workflow docs under `docs/agents/codex/workflows/`
-7. `novel_tts/cli/main.py`
-8. `novel_tts/config/loader.py`
-9. `novel_tts/config/models.py`
-10. stage service roots:
+1. `CLAUDE.md`
+2. `AGENTS.md` if present and still part of the repo contract
+3. `README.md`
+4. `docs/ARCHITECTURE.md`
+5. `docs/agents/codex/AGENTS.md`
+6. `docs/agents/cursor/AGENTS.md`
+7. any existing workflow docs under `docs/agents/codex/workflows/`
+8. `novel_tts/cli/main.py`
+9. `novel_tts/config/loader.py`
+10. `novel_tts/config/models.py`
+11. stage service roots:
    - `novel_tts/crawl/service.py`
    - `novel_tts/translate/novel.py`
    - `novel_tts/translate/captions.py`
@@ -68,7 +70,8 @@ Across the affected docs, make sure the current docs set covers:
 - TTS/media/upload expectations and artifact flow
 - important invariants that downstream stages rely on
 - agent-specific reading/touch guidance
-- Claude/general agent guidance in the root `AGENTS.md` when repo rules or onboarding expectations changed
+- Claude Code guidance in the root `CLAUDE.md` when repo rules or onboarding expectations changed
+- root `AGENTS.md` guidance too when that file is still maintained for other agents
 - workflow docs for repeatable maintenance tasks when useful
 
 ## What To Avoid
@@ -77,14 +80,15 @@ Across the affected docs, make sure the current docs set covers:
 - do not infer features from old docs alone
 - do not bulk-describe generated artifacts from `input/` or `output/`
 - do not update one doc in a way that contradicts another
-- do not leave root `AGENTS.md`, architecture docs, README, and agent docs half-migrated
+- do not leave root `CLAUDE.md`, root `AGENTS.md` when applicable, architecture docs, README, and agent docs half-migrated
 
 ## Definition Of Done
 
 - all affected docs match current CLI/config/module structure
 - references to commands, files, and modules use current names
 - workflow docs and agent docs point to the right locations
-- root `AGENTS.md` (including Claude/general agent guidance) and agent docs stay aligned on shared repo rules
+- root `CLAUDE.md` and agent docs stay aligned on shared repo rules
+- root `AGENTS.md` stays aligned too when the repo still maintains it
 - storage/invariant sections align with current code contracts
 - `README.md` stays task-oriented, while `docs/ARCHITECTURE.md` stays deeper and more structural
 - `docs/ARCHITECTURE.md` is detailed enough to explain the current architecture, module boundaries, and storage/runtime contracts

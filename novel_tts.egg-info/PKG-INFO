@@ -28,7 +28,7 @@ File-first Python CLI pipeline for crawling serialized web novels, translating t
 
 - [What this repo does](#what-this-repo-does)
 - [Quick start](#quick-start)
-- [Requirements](#requirements)
+- [Requirements](#requirements)s
 - [Configuration](#configuration)
 - [Storage contract and invariants](#storage-contract-and-invariants)
 - [Recommended workflows](#recommended-workflows)
@@ -112,7 +112,7 @@ Optional / stage-specific requirements:
 
 ### Main config files
 
-- novel configs: `configs/novels/*.json`
+- novel configs: `configs/novels/*.yaml`
 - source configs: `configs/sources/*.json`
 - per-novel glossaries: `configs/glossaries/*.json`
 - app defaults: `configs/app.yaml`
@@ -281,7 +281,13 @@ uv run novel-tts crawl run <novel_id> --from 1 --to 10
 
 # Override directory URL if needed
 uv run novel-tts crawl run <novel_id> --range 1-10 --dir-url 'https://...'
+
+# Recrawl chapters that already exist locally
+uv run novel-tts crawl run <novel_id> --range 1-10 --force
 ```
+
+By default, `crawl run` skips chapters already present in local `input/<novel_id>/origin/*.txt` files.
+Use `--force` to recrawl those chapters.
 
 #### `crawl verify`
 
@@ -292,6 +298,21 @@ Sanity-checks already-crawled origin files. It does not recrawl.
 ```bash
 uv run novel-tts crawl verify <novel_id> --range 1-10
 uv run novel-tts crawl verify <novel_id> --file chuong_1-10.txt
+```
+
+#### `crawl repair`
+
+Repairs already-crawled origin batches on disk. It can generate `input/<novel_id>/repair_config.yaml` from crawl research logs, then apply the repair plan back onto the saved `origin/*.txt` files.
+
+```bash
+# Generate/update repair_config.yaml from crawl research files
+uv run novel-tts crawl repair <novel_id> --generate-repair-config
+
+# Run repair using input/<novel_id>/repair_config.yaml
+uv run novel-tts crawl repair <novel_id> --run --range 1-10
+
+# Repair only selected origin files
+uv run novel-tts crawl repair <novel_id> --run --file chuong_1-10.txt
 ```
 
 ### Translate
@@ -419,6 +440,7 @@ Use `--force` to re-translate.
 uv run novel-tts queue add <novel_id> --range 2001-2500
 uv run novel-tts queue add <novel_id> --range 2004-2016 --force
 uv run novel-tts queue add <novel_id> --chapters 1205,1214
+uv run novel-tts queue add <novel_id> --repair-report .logs/<novel_id>/crawl/addition-replacement_chapter_list.txt
 uv run novel-tts queue add <novel_id> --all
 ```
 
@@ -451,6 +473,14 @@ uv run novel-tts queue repair <novel_id> --range 1401-1410
 uv run novel-tts queue repair <novel_id> --all
 ```
 
+#### `queue requeue-untranslated-exhausted`
+
+Re-enqueues jobs that exhausted retries but still do not have valid translated output on disk.
+
+```bash
+uv run novel-tts queue requeue-untranslated-exhausted <novel_id>
+```
+
 ### AI key telemetry
 
 Reads `.secrets/gemini-keys.txt` and inspects Redis metrics emitted by queue workers.
@@ -466,7 +496,7 @@ uv run novel-tts ai-key ps --filter-raw "$GEMINI_API_KEY"
 
 ### TTS
 
-Reads `input/<novel_id>/translated/chuong_<start>-<end>.txt` and writes audio assets under `output/<novel_id>/audio/<range>/`.
+Reads the translated chapter corpus under `input/<novel_id>/translated/*.txt`, assembles the requested media batch from overlapping translated files, and writes audio assets under `output/<novel_id>/audio/<range>/`.
 
 Behavior notes:
 
@@ -475,11 +505,22 @@ Behavior notes:
 - merged MP3 cache metadata is stored at `output/<novel_id>/audio/<range>/.parts/.cache/merged.sha256`
 - if all chapter WAVs are cache hits and `output/<novel_id>/audio/<range>/<range>.mp3` already exists, merge is skipped unless `--force` is used
 - if translated text changes, the chapter will be re-synthesized even without `--force`
+- media ranges are resolved from `media.media_batch`, while translated files remain rebuildable 10-chapter batches
 
 ```bash
 uv run novel-tts tts <novel_id> --range 1-10
 uv run novel-tts tts <novel_id> --range 1-10 --force
 uv run novel-tts tts <novel_id> --range 701-800 --tts-server-name onPremise --tts-model-name cpu
+uv run novel-tts tts <novel_id> --range 701-800 --re-generate-menu
+uv run novel-tts tts <novel_id> --re-generate-menu --all
+```
+
+### Create Menu
+
+Builds or refreshes chapter menu files under `output/<novel_id>/subtitle/` from translated chapter headings without re-running TTS.
+
+```bash
+uv run novel-tts create-menu <novel_id> --range 1-10
 ```
 
 ### Visual
@@ -715,7 +756,7 @@ Notes:
 - for safety, a novel with no local crawled chapters is skipped unless you pass `--bootstrap-from`
 - upload completion is remembered in `input/<novel_id>/.progress/watch_pipeline_state.json`
 - default watch settings come from `configs/app.yaml > pipeline.watch` and can still be overridden by CLI flags
-- `--all` uses `configs/app.yaml > pipeline.watch.novels` when that list is non-empty; otherwise it falls back to all files under `configs/novels/*.json`
+- `--all` uses `configs/app.yaml > pipeline.watch.novels` when that list is non-empty; otherwise it falls back to all files under `configs/novels/*.yaml`
 - `--from-stage` / `--to-stage` let you run only a contiguous slice of watch stages
 
 ```bash
