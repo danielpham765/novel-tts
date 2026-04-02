@@ -7,6 +7,7 @@ from novel_tts.config.models import (
     BrowserDebugConfig,
     CaptionConfig,
     CrawlConfig,
+    MediaConfig,
     ModelsConfig,
     NovelConfig,
     QueueConfig,
@@ -43,7 +44,7 @@ def _config(tmp_path: Path) -> NovelConfig:
     )
     crawl = CrawlConfig(site_id="site")
     browser_debug = BrowserDebugConfig()
-    source = SourceConfig(source_id="site", resolver_id="resolver", crawl=crawl, browser_debug=browser_debug)
+    source = SourceConfig(source_id="site", resolver_id="resolver", crawl=crawl)
     queue = QueueConfig(redis=RedisConfig(prefix="novel_tts"), min_pick_interval_seconds=2.0)
     return NovelConfig(
         novel_id="novel",
@@ -55,14 +56,15 @@ def _config(tmp_path: Path) -> NovelConfig:
         source=source,
         storage=storage,
         crawl=crawl,
-        browser_debug=browser_debug,
         models=ModelsConfig(provider="gemini_http"),
         translation=TranslationConfig(chapter_regex=r"^Chuong (\d+)", base_rules=""),
         captions=CaptionConfig(),
         queue=queue,
         tts=TtsConfig(provider="gradio_vie_tts", voice="voice"),
-        visual=VisualConfig(background_video="bg.mp4"),
-        video=VideoConfig(),
+        media=MediaConfig(
+            visual=VisualConfig(background_video="bg.mp4"),
+            video=VideoConfig(),
+        ),
     )
 
 

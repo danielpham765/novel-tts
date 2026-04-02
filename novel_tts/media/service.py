@@ -6,10 +6,11 @@ from pathlib import Path
 
 from novel_tts.common.ffmpeg import ffmpeg_has_filter, ffprobe_duration, run_ffmpeg
 from novel_tts.config.models import NovelConfig
+from novel_tts.media_batch import count_media_batches_before, get_media_batch_range, media_range_key
 
 
 def _range_key(start: int, end: int) -> str:
-    return f"chuong_{start}-{end}"
+    return media_range_key(start, end)
 
 
 def _esc_drawtext(text: str) -> str:
@@ -71,7 +72,7 @@ def _visual_cache_value(
     line3: str,
     font_file: str,
     render_width: int,
-    episode_batch_size: int,
+    episode_index: int,
     start: int,
     end: int,
     use_gpu: bool = False,
@@ -85,7 +86,7 @@ def _visual_cache_value(
         f"line3={line3}",
         f"font_file={font_file}",
         f"render_width={render_width}",
-        f"episode_batch_size={episode_batch_size}",
+        f"episode_index={episode_index}",
         f"start={start}",
         f"end={end}",
         f"use_gpu={use_gpu}",
@@ -107,15 +108,15 @@ def _video_cache_value(
 
 
 def _visual_encode_args(config: NovelConfig) -> list[str]:
-    if config.video.use_gpu:
+    if config.media.video.use_gpu:
         _nvenc_preset_map = {
             "ultrafast": "p1", "superfast": "p1", "veryfast": "p2",
             "faster": "p3", "fast": "p4", "medium": "p5",
             "slow": "p6", "slower": "p7", "veryslow": "p7",
         }
-        nvenc_preset = _nvenc_preset_map.get(config.video.preset, config.video.preset)
-        return ["-c:v", "h264_nvenc", "-preset", nvenc_preset, "-cq", str(config.video.crf), "-b:v", "0"]
-    return ["-c:v", config.video.video_codec, "-preset", config.video.preset, "-crf", str(config.video.crf)]
+        nvenc_preset = _nvenc_preset_map.get(config.media.video.preset, config.media.video.preset)
+        return ["-c:v", "h264_nvenc", "-preset", nvenc_preset, "-cq", str(config.media.video.crf), "-b:v", "0"]
+    return ["-c:v", config.media.video.video_codec, "-preset", config.media.video.preset, "-crf", str(config.media.video.crf)]
 
 
 def generate_visual(config: NovelConfig, start: int, end: int, force: bool = False) -> tuple[Path, Path]:
@@ -125,7 +126,7 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
             "support, then verify with: ffmpeg -hide_banner -filters | rg drawtext"
         )
     range_key = _range_key(start, end)
-    background = config.storage.image_dir / config.visual.background_video
+    background = config.storage.image_dir / config.media.visual.background_video
     if not background.exists():
         raise FileNotFoundError(f"Background video not found: {background}")
     channel_name_image = config.storage.root / "image" / "channel-name.png"
@@ -135,20 +136,21 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
     output_dir.mkdir(parents=True, exist_ok=True)
     output_video = output_dir / f"{range_key}.mp4"
     thumbnail = output_dir / f"{range_key}.png"
-    episode_batch_size = max(1, int(getattr(config.video, "episode_batch_size", 10) or 10))
+    batch_start, batch_end = get_media_batch_range(config, start)
+    episode_index = count_media_batches_before(config, batch_start) + 1
     expected_cache = _visual_cache_value(
         mode="range",
         background=background,
         channel_name_image=channel_name_image,
-        line1=config.visual.line1,
-        line2=config.visual.line2,
-        line3=config.visual.line3,
-        font_file=config.visual.font_file,
-        render_width=int(config.visual.render_width),
-        episode_batch_size=episode_batch_size,
+        line1=config.media.visual.line1,
+        line2=config.media.visual.line2,
+        line3=config.media.visual.line3,
+        font_file=config.media.visual.font_file,
+        render_width=int(config.media.visual.render_width),
+        episode_index=episode_index,
         start=start,
         end=end,
-        use_gpu=config.video.use_gpu,
+        use_gpu=config.media.video.use_gpu,
     )
     cached_value = _read_cache(output_dir, range_key)
     outputs_exist = (
@@ -159,18 +161,17 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
     )
     if (not force) and outputs_exist and cached_value == expected_cache:
         return output_video, thumbnail
-    font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
-    part_index = ((start - 1) // episode_batch_size) + 1
+    font_arg = f":fontfile={config.media.visual.font_file}" if config.media.visual.font_file else ""
     drawtext_filters = ",".join(
         [
-            f"drawtext=text='{_esc_drawtext(f'Tập {part_index}')}'{font_arg}:fontcolor=#FFD200:fontsize=48:borderw=4:bordercolor=black:x=10:y=35",
+            f"drawtext=text='{_esc_drawtext(f'Tập {episode_index}')}'{font_arg}:fontcolor=#FFD200:fontsize=48:borderw=4:bordercolor=black:x=10:y=35",
             f"drawtext=text='{_esc_drawtext(f'Chương {start} -> {end}')}'{font_arg}:fontcolor=white:fontsize=32:borderw=4:bordercolor=black:x=10:y=95",
-            f"drawtext=text='{_esc_drawtext(config.visual.line1)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-200",
-            f"drawtext=text='{_esc_drawtext(config.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-130",
-            f"drawtext=text='{_esc_drawtext(config.visual.line3)}'{font_arg}:fontcolor=white:fontsize=30:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-60",
+            f"drawtext=text='{_esc_drawtext(config.media.visual.line1)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-200",
+            f"drawtext=text='{_esc_drawtext(config.media.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-130",
+            f"drawtext=text='{_esc_drawtext(config.media.visual.line3)}'{font_arg}:fontcolor=white:fontsize=30:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-60",
         ]
     )
-    render_width = int(config.visual.render_width)
+    render_width = int(config.media.visual.render_width)
     filter_complex = (
         f"[0:v]scale={render_width}:-2[scaled];"
         f"[scaled]{drawtext_filters}[base];"
@@ -208,8 +209,8 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int, force: bool =
         )
     if chapter < 1:
         raise ValueError("chapter must be >= 1")
-    background_cover = config.storage.image_dir / config.visual.background_cover
-    if not config.visual.background_cover:
+    background_cover = config.storage.image_dir / config.media.visual.background_cover
+    if not config.media.visual.background_cover:
         raise ValueError('Missing visual.background_cover in novel config for --chapter flow')
     if background_cover.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
         raise ValueError("visual.background_cover must be a .jpg, .jpeg, or .png file")
@@ -225,15 +226,15 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int, force: bool =
         mode="chapter",
         background=background_cover,
         channel_name_image=None,
-        line1=_line1_for_chapter(config.visual.line1, chapter),
-        line2=config.visual.line2,
-        line3=config.visual.line3,
-        font_file=config.visual.font_file,
-        render_width=int(config.visual.render_width),
-        episode_batch_size=max(1, int(getattr(config.video, "episode_batch_size", 10) or 10)),
+        line1=_line1_for_chapter(config.media.visual.line1, chapter),
+        line2=config.media.visual.line2,
+        line3=config.media.visual.line3,
+        font_file=config.media.visual.font_file,
+        render_width=int(config.media.visual.render_width),
+        episode_index=count_media_batches_before(config, chapter) + 1,
         start=chapter,
         end=chapter,
-        use_gpu=config.video.use_gpu,
+        use_gpu=config.media.video.use_gpu,
     )
     cached_value = _read_cache(output_dir, range_key)
     outputs_exist = (
@@ -244,16 +245,16 @@ def generate_visual_for_chapter(config: NovelConfig, chapter: int, force: bool =
     )
     if (not force) and outputs_exist and cached_value == expected_cache:
         return output_video, thumbnail
-    font_arg = f":fontfile={config.visual.font_file}" if config.visual.font_file else ""
-    line1_text = _line1_for_chapter(config.visual.line1, chapter)
+    font_arg = f":fontfile={config.media.visual.font_file}" if config.media.visual.font_file else ""
+    line1_text = _line1_for_chapter(config.media.visual.line1, chapter)
 
     # Render all lines inside the cover image area.
     filters = ",".join(
         [
-            f"scale={int(config.visual.render_width)}:-2",
+            f"scale={int(config.media.visual.render_width)}:-2",
             f"drawtext=text='{_esc_drawtext(line1_text)}'{font_arg}:fontcolor=#FFD200:fontsize=56:borderw=6:bordercolor=black:x=(w-text_w)/2 - 150:y=20",
-            f"drawtext=text='{_esc_drawtext(config.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=42:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-180",
-            f"drawtext=text='{_esc_drawtext(config.visual.line3)}'{font_arg}:fontcolor=white:fontsize=36:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-120",
+            f"drawtext=text='{_esc_drawtext(config.media.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=42:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-180",
+            f"drawtext=text='{_esc_drawtext(config.media.visual.line3)}'{font_arg}:fontcolor=white:fontsize=36:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-120",
         ]
     )
 

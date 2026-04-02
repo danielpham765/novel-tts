@@ -11,16 +11,16 @@
     "delay_between_chapters_seconds": 0.2,
     "max_fetch_retries": 3,
     "retry_backoff_seconds": 10.0,
-    "rate_limit_cooldown_seconds": 30.0
-  },
-  "browser_debug": {
-    "mode": "debug-attach",
-    "remote_debugging_url": "http://127.0.0.1:9222",
-    "remote_debugging_port": 9222,
-    "executable_path": "",
-    "user_data_dir": "",
-    "profile_directory": "",
-    "headless": false,
-    "debug_image_dir": "debug/img"
+    "rate_limit_cooldown_seconds": 30.0,
+    "browser_debug": {
+      "mode": "debug-attach",
+      "remote_debugging_url": "http://127.0.0.1:9222",
+      "remote_debugging_port": 9222,
+      "executable_path": "",
+      "user_data_dir": "",
+      "profile_directory": "",
+      "headless": false,
+      "debug_image_dir": "debug/img"
+    }
   }
 }

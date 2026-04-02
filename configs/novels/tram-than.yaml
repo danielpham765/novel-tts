@@ -1,0 +1,45 @@
+---
+novel_id: tram-than
+title: Tram Than
+slug: tram-than
+source_language: zh
+target_language: vi
+storage:
+  input_dir: input/tram-than
+  output_dir: output/tram-than
+  image_dir: image/tram-than
+  logs_dir: ".logs"
+  tmp_dir: tmp
+crawl:
+  sources:
+  - source_id: spudnovel
+    directory_url: https://spudnovel.com/site/detail?id=3
+translation:
+  glossary_file: configs/glossaries/tram-than.json
+  line_token: QZXBRQ
+  post_replacements: {}
+  han_fallback_replacements: {}
+  chapter:
+    chapter_regex: "^第(\\d+)章([^\\n]*)"
+    base_rules: |
+      Ngươi là chuyên gia dịch tiểu thuyết mạng Trung Quốc sang tiếng Việt.
+      Yêu cầu bắt buộc:
+      - Chỉ trả về đúng phần nội dung đã dịch. Không giải thích. Không ghi chú.
+      - Dịch mượt, tự nhiên, nghe như văn truyện.
+      - Dịch hết toàn bộ chữ Hán. Không để sót tiếng Trung.
+      - Dịch toàn bộ tên riêng sang dạng Hán Việt/Việt hóa nhất quán theo glossary.
+      - Ưu tiên xưng hô phù hợp văn truyện, tránh văn nói hiện đại nếu không cần.
+      - Giữ nguyên thứ tự nội dung, không thêm bớt ý.
+      - Phải giữ nguyên mọi token placeholder dạng ZXQ<digits>QXZ hoặc QZX<digits>QXZ (ví dụ ZXQ000QXZ) và token xuống dòng QZXBRQ; không tạo token mới; không đổi chữ số.
+  captions: {}
+models: {}
+queue: {}
+tts: {}
+media:
+  visual:
+    background_video: background.mp4
+    tag_text: Trảm Thần
+    line1: Trảm Thần
+    line2: Audio novel
+    line3: spudnovel
+  video: {}

@@ -10,6 +10,7 @@ from novel_tts.config.models import (
     BrowserDebugConfig,
     CaptionConfig,
     CrawlConfig,
+    MediaConfig,
     ModelsConfig,
     NovelConfig,
     QueueConfig,
@@ -38,7 +39,7 @@ def _make_config(tmp_path: Path) -> NovelConfig:
     )
     crawl = CrawlConfig(site_id="test")
     browser_debug = BrowserDebugConfig()
-    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl, browser_debug=browser_debug)
+    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl)
     models = ModelsConfig(
         provider="gemini_http",
         enabled_models=["gemma-3-27b-it"],
@@ -61,14 +62,15 @@ def _make_config(tmp_path: Path) -> NovelConfig:
         source=source,
         storage=storage,
         crawl=crawl,
-        browser_debug=browser_debug,
         models=models,
         translation=translation,
         captions=CaptionConfig(chunk_size=10),
         queue=QueueConfig(),
         tts=TtsConfig(provider="local", voice="test"),
-        visual=VisualConfig(background_video=""),
-        video=VideoConfig(),
+        media=MediaConfig(
+            visual=VisualConfig(background_video=""),
+            video=VideoConfig(),
+        ),
     )
 
 

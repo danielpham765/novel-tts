@@ -10,10 +10,9 @@ from uuid import uuid4
 
 import redis
 import requests
-import yaml
 
 from novel_tts.common import logrotate
-from novel_tts.config.loader import load_novel_config
+from novel_tts.config.loader import _load_app_config, load_novel_config
 from novel_tts.config.models import ProxyGatewayConfig
 from novel_tts.quota import keys as quota_keys
 from novel_tts.quota.lua_scripts import TRY_GRANT_LUA
@@ -36,10 +35,7 @@ def _repo_root() -> Path:
 
 
 def _load_redis_cfg() -> RedisCfg:
-    path = _repo_root() / "configs" / "app.yaml"
-    payload = {}
-    if path.exists():
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload = _load_app_config()
     queue = payload.get("queue") if isinstance(payload, dict) else {}
     redis_raw = queue.get("redis") if isinstance(queue, dict) else {}
     if not isinstance(redis_raw, dict):
@@ -52,10 +48,7 @@ def _load_redis_cfg() -> RedisCfg:
 
 
 def _load_proxy_gateway_cfg() -> ProxyGatewayConfig:
-    path = _repo_root() / "configs" / "app.yaml"
-    payload: dict = {}
-    if path.exists():
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload: dict = _load_app_config()
     proxy_raw = payload.get("proxy_gateway") if isinstance(payload, dict) else {}
     if proxy_raw is None:
         proxy_raw = {}

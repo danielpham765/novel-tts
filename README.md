@@ -94,7 +94,7 @@ Optional / stage-specific requirements:
 
 ### Main config files
 
-- novel configs: `configs/novels/*.json`
+- novel configs: `configs/novels/*.yaml`
 - source configs: `configs/sources/*.json`
 - per-novel glossaries: `configs/glossaries/*.json`
 - app defaults: `configs/app.yaml`
@@ -478,7 +478,7 @@ uv run novel-tts ai-key ps --filter-raw "$GEMINI_API_KEY"
 
 ### TTS
 
-Reads `input/<novel_id>/translated/chuong_<start>-<end>.txt` and writes audio assets under `output/<novel_id>/audio/<range>/`.
+Reads the translated chapter corpus under `input/<novel_id>/translated/*.txt`, assembles the requested media batch from overlapping translated files, and writes audio assets under `output/<novel_id>/audio/<range>/`.
 
 Behavior notes:
 
@@ -487,6 +487,7 @@ Behavior notes:
 - merged MP3 cache metadata is stored at `output/<novel_id>/audio/<range>/.parts/.cache/merged.sha256`
 - if all chapter WAVs are cache hits and `output/<novel_id>/audio/<range>/<range>.mp3` already exists, merge is skipped unless `--force` is used
 - if translated text changes, the chapter will be re-synthesized even without `--force`
+- media ranges are resolved from `media.media_batch`, while translated files remain rebuildable 10-chapter batches
 
 ```bash
 uv run novel-tts tts <novel_id> --range 1-10
@@ -737,7 +738,7 @@ Notes:
 - for safety, a novel with no local crawled chapters is skipped unless you pass `--bootstrap-from`
 - upload completion is remembered in `input/<novel_id>/.progress/watch_pipeline_state.json`
 - default watch settings come from `configs/app.yaml > pipeline.watch` and can still be overridden by CLI flags
-- `--all` uses `configs/app.yaml > pipeline.watch.novels` when that list is non-empty; otherwise it falls back to all files under `configs/novels/*.json`
+- `--all` uses `configs/app.yaml > pipeline.watch.novels` when that list is non-empty; otherwise it falls back to all files under `configs/novels/*.yaml`
 - `--from-stage` / `--to-stage` let you run only a contiguous slice of watch stages
 
 ```bash

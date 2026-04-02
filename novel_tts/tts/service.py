@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 from novel_tts.common.ffmpeg import ffprobe_duration, run_ffmpeg
 from novel_tts.common.logging import get_logger
 from novel_tts.config.models import NovelConfig
+from novel_tts.media_batch import media_range_key
 
 from .providers import get_tts_provider
 
@@ -38,17 +40,39 @@ def split_text_into_chunks(text: str) -> tuple[list[str], list[dict[str, object]
 
 
 def _range_key(start: int, end: int) -> str:
-    return f"chuong_{start}-{end}"
+    return media_range_key(start, end)
 
 
-def _translated_text_path(config: NovelConfig, start: int, end: int, range_key: str | None = None) -> Path:
-    if range_key is None:
-        range_key = _range_key(start, end)
-        
-    direct = config.storage.translated_dir / f"{range_key}.txt"
-    if direct.exists():
-        return direct
-    raise FileNotFoundError(f"Translated range file not found: {direct}")
+def _iter_translated_batch_paths(config: NovelConfig, start: int, end: int) -> list[tuple[int, int, Path]]:
+    if not config.storage.translated_dir.exists():
+        return []
+    pattern = re.compile(r"^chuong_(\d+)-(\d+)\.txt$")
+    matched: list[tuple[int, int, Path]] = []
+    for path in sorted(config.storage.translated_dir.iterdir()):
+        if not path.is_file():
+            continue
+        item = pattern.match(path.name)
+        if item is None:
+            continue
+        batch_start = int(item.group(1))
+        batch_end = int(item.group(2))
+        if batch_start <= end and batch_end >= start:
+            matched.append((batch_start, batch_end, path))
+    matched.sort(key=lambda item: (item[0], item[1]))
+    return matched
+
+
+def _load_translated_text(config: NovelConfig, start: int, end: int) -> tuple[str, list[Path]]:
+    matched = _iter_translated_batch_paths(config, start, end)
+    if not matched:
+        raise FileNotFoundError(
+            f"No translated batch files overlap requested range {start}-{end} in {config.storage.translated_dir}"
+        )
+    paths = [path for _, _, path in matched]
+    text = "\n\n".join(path.read_text(encoding="utf-8").strip() for path in paths if path.exists()).strip()
+    if not text:
+        raise ValueError(f"Translated batch files are empty for requested range {start}-{end}")
+    return text, paths
 
 
 def _chunk_hash(text: str) -> str:
@@ -226,8 +250,7 @@ def create_menu(config: NovelConfig, start: int, end: int, range_key: str | None
     output_range_key = range_key or _range_key(start, end)
     menu_path = config.storage.subtitle_dir / f"{output_range_key}_menu.txt"
 
-    source_path = _translated_text_path(config, start, end, range_key)
-    text = source_path.read_text(encoding="utf-8")
+    text, source_paths = _load_translated_text(config, start, end)
     _, all_chapter_info = split_text_into_chunks(text)
     chapter_info = [c for c in all_chapter_info if start <= int(c["number"]) <= end]
 
@@ -236,12 +259,13 @@ def create_menu(config: NovelConfig, start: int, end: int, range_key: str | None
         timestamps = [line.split(" ", 1)[0] for line in existing_lines if line.strip()]
         if len(timestamps) != len(chapter_info):
             LOGGER.warning(
-                "Menu entry count mismatch, skipping | path=%s menu_entries=%s translated_chapters=%s range=%s-%s",
+                "Menu entry count mismatch, skipping | path=%s menu_entries=%s translated_chapters=%s range=%s-%s sources=%s",
                 menu_path,
                 len(timestamps),
                 len(chapter_info),
                 start,
                 end,
+                ",".join(path.name for path in source_paths),
             )
             return menu_path
         lines: list[str] = []
@@ -282,8 +306,7 @@ def regenerate_menu(config: NovelConfig, start: int, end: int, range_key: str | 
     existing_lines = menu_path.read_text(encoding="utf-8").splitlines()
     timestamps = [line.split(" ", 1)[0] for line in existing_lines if line.strip()]
 
-    source_path = _translated_text_path(config, start, end, range_key)
-    text = source_path.read_text(encoding="utf-8")
+    text, _source_paths = _load_translated_text(config, start, end)
     _, chapter_info = split_text_into_chunks(text)
     chapter_info = [c for c in chapter_info if start <= int(c["number"]) <= end]
 
@@ -391,9 +414,7 @@ def _merge_audio(
 
 
 def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = None, force: bool = False) -> Path:
-    translated_range_key = range_key
-    source_path = _translated_text_path(config, start, end, translated_range_key)
-    text = source_path.read_text(encoding="utf-8")
+    text, source_paths = _load_translated_text(config, start, end)
     chunks, chapter_info = split_text_into_chunks(text)
     
     # Filter chunks cleanly based on the slice we want
@@ -407,7 +428,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
     chunks = filtered_chunks
     chapter_info = filtered_chapter_info
     if not chunks:
-        raise ValueError(f"No chapters found for requested range: {start}-{end} (source={source_path})")
+        raise ValueError(f"No chapters found for requested range: {start}-{end}")
     
     output_range_key = _range_key(start, end)
         
@@ -427,7 +448,7 @@ def run_tts(config: NovelConfig, start: int, end: int, range_key: str | None = N
         "TTS start | range=%s chapters=%s source=%s server=%s model=%s voice=%s",
         output_range_key,
         len(chunks),
-        source_path,
+        ",".join(path.name for path in source_paths),
         config.tts.server_name,
         config.tts.model_name,
         config.tts.voice,

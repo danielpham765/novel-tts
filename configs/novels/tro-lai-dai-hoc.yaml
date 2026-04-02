@@ -1,0 +1,46 @@
+---
+novel_id: tro-lai-dai-hoc
+title: Sau Khi Tro Ve Dai Hoc
+slug: tro-lai-dai-hoc
+source_language: zh
+target_language: vi
+storage:
+  input_dir: input/tro-lai-dai-hoc
+  output_dir: output/tro-lai-dai-hoc
+  image_dir: image/tro-lai-dai-hoc
+  logs_dir: ".logs"
+  tmp_dir: tmp
+crawl:
+  sources:
+  - source_id: ttkan
+    directory_url: https://twkan.com/book/76284/index.html
+translation:
+  glossary_file: configs/glossaries/tro-lai-dai-hoc.json
+  line_token: QZXBRQ
+  post_replacements: {}
+  han_fallback_replacements: {}
+  chapter:
+    repair_mode: true
+    chapter_regex: "^第(\\d+)章([^\\n]*)"
+    base_rules: |
+      Ngươi là chuyên gia dịch tiểu thuyết mạng Trung Quốc sang tiếng Việt.
+      Yêu cầu bắt buộc:
+      - Chỉ trả về đúng phần nội dung đã dịch. Không giải thích. Không ghi chú.
+      - Dịch mượt, tự nhiên, nghe như văn truyện.
+      - Dịch hết toàn bộ chữ Hán. Không để sót tiếng Trung.
+      - Dịch toàn bộ tên riêng sang dạng Hán Việt/Việt hóa nhất quán theo glossary.
+      - Ưu tiên xưng hô phù hợp văn truyện, tránh văn nói hiện đại nếu không cần.
+      - Giữ nguyên thứ tự nội dung, không thêm bớt ý.
+      - Phải giữ nguyên mọi token placeholder dạng ZXQ<digits>QXZ hoặc QZX<digits>QXZ (ví dụ ZXQ000QXZ) và token xuống dòng QZXBRQ; không tạo token mới; không đổi chữ số.
+  captions: {}
+models: {}
+queue: {}
+tts: {}
+media:
+  visual:
+    background_video: background.mp4
+    tag_text: Đan Tu Chân
+    line1: Trở Lại Đại Học Sau Khi Trọng Sinh
+    line2: Tôi Bắt Đầu Với Thân Phận Của Một Phú Nhị Đại Siêu Giàu
+    line3: Truyện Đô Thị, Trọng Sinh
+  video: {}

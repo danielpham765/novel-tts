@@ -11,6 +11,9 @@ from .models import (
     BrowserDebugConfig,
     CaptionConfig,
     CrawlConfig,
+    MediaConfig,
+    MediaBatchConfig,
+    MediaBatchRule,
     ModelsConfig,
     NovelConfig,
     PipelineConfig,
@@ -29,6 +32,7 @@ from .models import (
     VideoConfig,
     VisualConfig,
 )
+from novel_tts.common.text import parse_range
 from novel_tts.translate.glossary import sanitize_glossary_entries
 
 LOGGER = logging.getLogger(__name__)
@@ -39,11 +43,15 @@ def _root_dir() -> Path:
 
 
 def _config_path(novel_id: str) -> Path:
-    return _root_dir() / "configs" / "novels" / f"{novel_id}.json"
+    return _root_dir() / "configs" / "novels" / f"{novel_id}.yaml"
 
 
 def _app_config_path() -> Path:
     return _root_dir() / "configs" / "app.yaml"
+
+
+def _app_local_config_path() -> Path:
+    return _root_dir() / "configs" / "app.local.yaml"
 
 
 def _source_config_path(source_id: str) -> Path:
@@ -125,13 +133,20 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _load_app_config() -> dict:
-    path = _app_config_path()
-    if not path.exists():
-        return {}
+    payload: dict = {}
+    for path in (_app_config_path(), _app_local_config_path()):
+        if not path.exists():
+            continue
+        raw = _load_yaml_object(path, label="app config")
+        payload = _deep_merge(payload, raw)
+    return payload
+
+
+def _load_yaml_object(path: Path, *, label: str) -> dict:
     with path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
     if not isinstance(payload, dict):
-        raise ValueError(f"Invalid app config format: {path}")
+        raise ValueError(f"Invalid {label} format: {path}")
     return payload
 
 
@@ -269,6 +284,59 @@ def _normalize_pipeline_watch_config(watch_raw: dict) -> dict:
     return normalized
 
 
+def _normalize_media_batch_config(media_batch_raw: dict | None) -> dict:
+    if media_batch_raw is None:
+        media_batch_raw = {}
+    if not isinstance(media_batch_raw, dict):
+        raise ValueError('Invalid "media_batch" config (expected object)')
+
+    normalized = dict(media_batch_raw)
+    try:
+        default_size = int(normalized.get("default_chapter_batch_size", 10) or 10)
+    except Exception as exc:
+        raise ValueError('Invalid "media_batch.default_chapter_batch_size" (expected integer >= 1)') from exc
+    if default_size < 1:
+        raise ValueError('Invalid "media_batch.default_chapter_batch_size" (must be >= 1)')
+    normalized["default_chapter_batch_size"] = default_size
+
+    overrides_raw = normalized.get("chapter_batch_overrides", []) or []
+    if not isinstance(overrides_raw, list):
+        raise ValueError('Invalid "media_batch.chapter_batch_overrides" (expected list)')
+
+    normalized_overrides: list[dict[str, object]] = []
+    resolved_ranges: list[tuple[int, int]] = []
+    for index, item in enumerate(overrides_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f'Invalid "media_batch.chapter_batch_overrides[{index}]" (expected object)')
+        range_text = _clean_text(item.get("range"))
+        if not range_text:
+            raise ValueError(f'Missing "media_batch.chapter_batch_overrides[{index}].range"')
+        try:
+            start, end = parse_range(range_text)
+        except Exception as exc:
+            raise ValueError(
+                f'Invalid "media_batch.chapter_batch_overrides[{index}].range" (expected "<start>-<end>")'
+            ) from exc
+        try:
+            batch_size = int(item.get("chapter_batch_size", 0) or 0)
+        except Exception as exc:
+            raise ValueError(
+                f'Invalid "media_batch.chapter_batch_overrides[{index}].chapter_batch_size" (expected integer >= 1)'
+            ) from exc
+        if batch_size < 1:
+            raise ValueError(f'Invalid "media_batch.chapter_batch_overrides[{index}].chapter_batch_size" (must be >= 1)')
+        for existing_start, existing_end in resolved_ranges:
+            if start <= existing_end and end >= existing_start:
+                raise ValueError(
+                    'Invalid "media_batch.chapter_batch_overrides" (overlapping ranges are not allowed)'
+                )
+        resolved_ranges.append((start, end))
+        normalized_overrides.append({"range": range_text, "chapter_batch_size": batch_size})
+
+    normalized["chapter_batch_overrides"] = normalized_overrides
+    return normalized
+
+
 def _normalize_proxy_gateway_config(proxy_raw: dict) -> ProxyGatewayConfig:
     if proxy_raw is None:
         proxy_raw = {}
@@ -326,7 +394,6 @@ def _build_source_configs(
     *,
     sources_raw,
     crawl_override_raw: dict,
-    browser_debug_override_raw: dict,
 ) -> list[SourceConfig]:
     source_configs: list[SourceConfig] = []
     if isinstance(sources_raw, list) and sources_raw:
@@ -343,28 +410,34 @@ def _build_source_configs(
             crawl_override_flat = dict(source_item)
             crawl_override_flat.pop("source_id", None)
             merged_crawl_raw = _deep_merge(source_raw["crawl"], crawl_override_flat)
-            merged_browser_debug_raw = _deep_merge(source_raw.get("browser_debug", {}), browser_debug_override_raw)
+            browser_debug_raw = merged_crawl_raw.pop("browser_debug", {})
+            if browser_debug_raw is None:
+                browser_debug_raw = {}
+            if not isinstance(browser_debug_raw, dict):
+                raise ValueError(f'Invalid crawl.sources[{index}].browser_debug config (expected object)')
             source_configs.append(
                 SourceConfig(
                     source_id=source_id,
                     resolver_id=str(source_raw.get("resolver_id", source_id)),
-                    crawl=CrawlConfig(**merged_crawl_raw),
-                    browser_debug=BrowserDebugConfig(**merged_browser_debug_raw),
+                    crawl=CrawlConfig(**merged_crawl_raw, browser_debug=BrowserDebugConfig(**browser_debug_raw)),
                 )
             )
         return source_configs
 
     crawl_override_flat = dict(crawl_override_raw)
     crawl_override_flat.pop("sources", None)
+    browser_debug_raw = crawl_override_flat.pop("browser_debug", {})
+    if browser_debug_raw is None:
+        browser_debug_raw = {}
+    if not isinstance(browser_debug_raw, dict):
+        raise ValueError('Invalid novel "crawl.browser_debug" config (expected object)')
     merged_crawl_raw = dict(crawl_override_flat)
     merged_crawl_raw.setdefault("site_id", "")
-    merged_browser_debug_raw = dict(browser_debug_override_raw)
     source_configs.append(
         SourceConfig(
             source_id="",
             resolver_id="",
-            crawl=CrawlConfig(**merged_crawl_raw),
-            browser_debug=BrowserDebugConfig(**merged_browser_debug_raw),
+            crawl=CrawlConfig(**merged_crawl_raw, browser_debug=BrowserDebugConfig(**browser_debug_raw)),
         )
     )
     return source_configs
@@ -374,7 +447,7 @@ def load_novel_source_configs(novel_id: str) -> list[SourceConfig]:
     path = _config_path(novel_id)
     if not path.exists():
         raise FileNotFoundError(f"Novel config not found: {path}")
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = _load_yaml_object(path, label="novel config")
     crawl_override_raw = raw.get("crawl", {})
     if crawl_override_raw is None:
         crawl_override_raw = {}
@@ -383,15 +456,11 @@ def load_novel_source_configs(novel_id: str) -> list[SourceConfig]:
     if "source_id" in crawl_override_raw:
         raise ValueError('Deprecated config key "crawl.source_id" (migrate to crawl.sources[0].source_id)')
     sources_raw = crawl_override_raw.get("sources", None)
-    browser_debug_override_raw = raw.get("browser_debug", {})
-    if browser_debug_override_raw is None:
-        browser_debug_override_raw = {}
-    if not isinstance(browser_debug_override_raw, dict):
-        raise ValueError('Invalid novel "browser_debug" config (expected object)')
+    if "browser_debug" in raw:
+        raise ValueError('Deprecated config key "browser_debug" (move to "crawl.browser_debug")')
     return _build_source_configs(
         sources_raw=sources_raw,
         crawl_override_raw=crawl_override_raw,
-        browser_debug_override_raw=browser_debug_override_raw,
     )
 
 
@@ -399,7 +468,7 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     path = _config_path(novel_id)
     if not path.exists():
         raise FileNotFoundError(f"Novel config not found: {path}")
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = _load_yaml_object(path, label="novel config")
     app_raw = _load_app_config()
     models_raw = _deep_merge(app_raw.get("models", {}), raw.get("models", {}))
     merged_tts_raw = _deep_merge(app_raw.get("tts", {}) or {}, raw.get("tts", {}) or {})
@@ -479,16 +548,12 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         logs_dir=storage_logs_dir,
         tmp_dir=storage_tmp_dir,
     )
-    browser_debug_override_raw = raw.get("browser_debug", {})
-    if browser_debug_override_raw is None:
-        browser_debug_override_raw = {}
-    if not isinstance(browser_debug_override_raw, dict):
-        raise ValueError('Invalid novel "browser_debug" config (expected object)')
+    if "browser_debug" in raw:
+        raise ValueError('Deprecated config key "browser_debug" (move to "crawl.browser_debug")')
 
     all_source_configs = _build_source_configs(
         sources_raw=sources_raw,
         crawl_override_raw=crawl_override_raw,
-        browser_debug_override_raw=browser_debug_override_raw,
     )
     primary_source_cfg = all_source_configs[0]
     source_id = primary_source_cfg.source_id
@@ -498,8 +563,8 @@ def load_novel_config(novel_id: str) -> NovelConfig:
     proxy_gateway_raw = _deep_merge(app_raw.get("proxy_gateway", {}) or {}, raw.get("proxy_gateway", {}) or {})
     proxy_gateway_cfg = _normalize_proxy_gateway_config(proxy_gateway_raw)
     # Model pool settings are shared across queue and direct translate, so we support a top-level
-    # "models" section in configs/app.yaml and per-novel overrides in configs/novels/*.json.
-    # In configs/app.yaml and configs/novels/*.json, model pool settings live in the top-level "models" section.
+    # "models" section in configs/app.yaml and per-novel overrides in configs/novels/*.yaml.
+    # In configs/app.yaml and configs/novels/*.yaml, model pool settings live in the top-level "models" section.
     # The queue config can still carry legacy enabled_models/model_configs, but models.* is canonical.
     if isinstance(models_raw.get("enabled_models"), list) and models_raw["enabled_models"]:
         if (
@@ -620,18 +685,53 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         model_configs=queue_model_configs,
     )
 
-    visual_raw = raw.get("visual", {})
+    if "visual" in raw:
+        raise ValueError('Deprecated config key "visual" (move to "media.visual")')
+    if "video" in raw:
+        raise ValueError('Deprecated config key "video" (move to "media.video")')
+    if "media_batch" in raw:
+        raise ValueError('Deprecated config key "media_batch" (move to "media.media_batch")')
+    app_media_raw = app_raw.get("media", {}) or {}
+    novel_media_raw = raw.get("media", {}) or {}
+    media_raw = _deep_merge(app_media_raw, novel_media_raw)
+    if media_raw is None:
+        media_raw = {}
+    if not isinstance(media_raw, dict):
+        raise ValueError('Invalid "media" config (expected object)')
+    visual_raw = media_raw.get("visual", {})
     if visual_raw is None:
         visual_raw = {}
     if not isinstance(visual_raw, dict):
-        raise ValueError('Invalid novel "visual" config (expected object)')
+        raise ValueError('Invalid "media.visual" config (expected object)')
     visual_raw.setdefault("background_video", "")
     visual_raw.setdefault("background_cover", "")
-    video_raw = _deep_merge(app_raw.get("video", {}) or {}, raw.get("video", {}) or {})
+    media_batch_base = app_media_raw.get("media_batch", {}) or {}
+    media_batch_override = novel_media_raw.get("media_batch", {}) or {}
+    media_batch_raw = _deep_merge(media_batch_base, media_batch_override)
+    if (
+        isinstance(media_batch_base, dict)
+        and isinstance(media_batch_override, dict)
+        and ("chapter_batch_overrides" in media_batch_base or "chapter_batch_overrides" in media_batch_override)
+    ):
+        media_batch_raw["chapter_batch_overrides"] = [
+            *(media_batch_base.get("chapter_batch_overrides", []) or []),
+            *(media_batch_override.get("chapter_batch_overrides", []) or []),
+        ]
+    media_batch_normalized = _normalize_media_batch_config(media_batch_raw)
+    media_batch_cfg = MediaBatchConfig(
+        **{
+            **media_batch_normalized,
+            "chapter_batch_overrides": [
+                MediaBatchRule(**item)
+                for item in media_batch_normalized["chapter_batch_overrides"]
+            ],
+        }
+    )
+    video_raw = media_raw.get("video", {})
     if video_raw is None:
         video_raw = {}
     if not isinstance(video_raw, dict):
-        raise ValueError('Invalid novel "video" config (expected object)')
+        raise ValueError('Invalid "media.video" config (expected object)')
     upload_raw = _deep_merge(app_raw.get("upload", {}) or {}, raw.get("upload", {}) or {})
     if upload_raw is None:
         upload_raw = {}
@@ -674,7 +774,6 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         source=source,
         storage=storage,
         crawl=source.crawl,
-        browser_debug=source.browser_debug,
         models=models_cfg,
         translation=TranslationConfig(**translation_raw),
         captions=CaptionConfig(**captions_raw),
@@ -685,8 +784,11 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         ),
         proxy_gateway=proxy_gateway_cfg,
         tts=TtsConfig(**merged_tts_raw),
-        visual=VisualConfig(**visual_raw),
-        video=VideoConfig(**video_raw),
+        media=MediaConfig(
+            visual=VisualConfig(**visual_raw),
+            video=VideoConfig(**video_raw),
+            media_batch=media_batch_cfg,
+        ),
         upload=upload_cfg,
         pipeline=pipeline_cfg,
     )

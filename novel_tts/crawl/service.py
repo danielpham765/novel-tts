@@ -1054,11 +1054,8 @@ def _fetch_replacement_block(
         try:
             source_raw = _load_source_config_from_repo(config.storage.root, source_id)
             crawl_raw = source_raw.get("crawl", {}) if isinstance(source_raw.get("crawl", {}), dict) else {}
-            browser_raw = (
-                source_raw.get("browser_debug", {}) if isinstance(source_raw.get("browser_debug", {}), dict) else {}
-            )
-            crawl_cfg = config.crawl.__class__(**crawl_raw)
-            browser_cfg = config.browser_debug.__class__(**browser_raw)
+            browser_raw = crawl_raw.pop("browser_debug", {}) if isinstance(crawl_raw.get("browser_debug", {}), dict) else {}
+            crawl_cfg = config.crawl.__class__(**crawl_raw, browser_debug=config.crawl.browser_debug.__class__(**browser_raw))
 
             resolver = registry.get(source_raw.get("resolver_id", source_id))
             # Clone config for accurate logging + delays/timeout/backoff.
@@ -1066,7 +1063,6 @@ def _fetch_replacement_block(
                 source_id=source_id,
                 resolver_id=source_raw.get("resolver_id", source_id),
                 crawl=crawl_cfg,
-                browser_debug=browser_cfg,
             )
             tmp_cfg = config.__class__(
                 novel_id=config.novel_id,
@@ -1078,19 +1074,17 @@ def _fetch_replacement_block(
                 source=tmp_source,
                 storage=config.storage,
                 crawl=crawl_cfg,
-                browser_debug=browser_cfg,
                 models=config.models,
                 translation=config.translation,
                 captions=config.captions,
                 queue=config.queue,
                 tts=config.tts,
-                visual=config.visual,
-                video=config.video,
+                media=config.media,
                 proxy_gateway=config.proxy_gateway,
             )
             strategy_chain = build_strategy_chain(
                 tmp_cfg.crawl,
-                tmp_cfg.browser_debug,
+                tmp_cfg.crawl.browser_debug,
                 proxy_gateway=tmp_cfg.proxy_gateway,
                 redis_cfg=tmp_cfg.queue.redis,
                 proxy_session_state=CrawlProxySessionState(),
@@ -2076,7 +2070,7 @@ def resolve_directory_entries(
     resolver = registry.get(config.source.resolver_id)
     strategy_chain = build_strategy_chain(
         config.crawl,
-        config.browser_debug,
+        config.crawl.browser_debug,
         proxy_gateway=config.proxy_gateway,
         redis_cfg=config.queue.redis,
         proxy_session_state=proxy_session_state,
@@ -2139,7 +2133,6 @@ def config_with_source(config: NovelConfig, source_config: SourceConfig) -> Nove
         source_id=source_config.source_id,
         source=source_config,
         crawl=source_config.crawl,
-        browser_debug=source_config.browser_debug,
     )
 
 
@@ -2311,7 +2304,7 @@ def crawl_range(
                 candidate_resolver = registry.get(candidate_config.source.resolver_id)
                 candidate_strategy_chain = build_strategy_chain(
                     candidate_config.crawl,
-                    candidate_config.browser_debug,
+                    candidate_config.crawl.browser_debug,
                     proxy_gateway=candidate_config.proxy_gateway,
                     redis_cfg=candidate_config.queue.redis,
                     proxy_session_state=proxy_session_state,

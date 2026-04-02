@@ -33,7 +33,7 @@ def test_load_novel_config_upload_merge(tmp_path, monkeypatch) -> None:
         },
     }
     (tmp_path / "configs" / "app.yaml").write_text(yaml.safe_dump(app_cfg, sort_keys=False), encoding="utf-8")
-    source_cfg = {"crawl": {"site_id": "test"}, "browser_debug": {}}
+    source_cfg = {"crawl": {"site_id": "test", "browser_debug": {}}}
     (tmp_path / "configs" / "sources" / "s1.json").write_text(json.dumps(source_cfg), encoding="utf-8")
     novel_cfg = {
         "novel_id": "n1",
@@ -50,11 +50,13 @@ def test_load_novel_config_upload_merge(tmp_path, monkeypatch) -> None:
         "translation": {"chapter": {"chapter_regex": "^$", "base_rules": "x"}},
         "models": {},
         "tts": {},
-        "visual": {"background_video": "bg.mp4"},
-        "video": {},
+        "media": {"visual": {"background_video": "bg.mp4"}, "video": {}},
         "upload": {"default_platform": "tiktok", "tiktok": {"enabled": True, "dry_run": True}},
     }
-    (tmp_path / "configs" / "novels" / "n1.json").write_text(json.dumps(novel_cfg), encoding="utf-8")
+    (tmp_path / "configs" / "novels" / "n1.yaml").write_text(
+        yaml.safe_dump(novel_cfg, sort_keys=False),
+        encoding="utf-8",
+    )
 
     cfg = loader.load_novel_config("n1")
     assert cfg.upload.default_platform == "tiktok"
@@ -95,7 +97,7 @@ def test_load_novel_config_upload_rejects_mismatched_youtube_account_lists(tmp_p
         },
     }
     (tmp_path / "configs" / "app.yaml").write_text(yaml.safe_dump(app_cfg, sort_keys=False), encoding="utf-8")
-    source_cfg = {"crawl": {"site_id": "test"}, "browser_debug": {}}
+    source_cfg = {"crawl": {"site_id": "test", "browser_debug": {}}}
     (tmp_path / "configs" / "sources" / "s1.json").write_text(json.dumps(source_cfg), encoding="utf-8")
     novel_cfg = {
         "novel_id": "n1",
@@ -112,11 +114,13 @@ def test_load_novel_config_upload_rejects_mismatched_youtube_account_lists(tmp_p
         "translation": {"chapter": {"chapter_regex": "^$", "base_rules": "x"}},
         "models": {},
         "tts": {},
-        "visual": {"background_video": "bg.mp4"},
-        "video": {},
+        "media": {"visual": {"background_video": "bg.mp4"}, "video": {}},
         "upload": {"default_platform": "youtube"},
     }
-    (tmp_path / "configs" / "novels" / "n1.json").write_text(json.dumps(novel_cfg), encoding="utf-8")
+    (tmp_path / "configs" / "novels" / "n1.yaml").write_text(
+        yaml.safe_dump(novel_cfg, sort_keys=False),
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="must have the same number of entries"):
         loader.load_novel_config("n1")
@@ -146,7 +150,7 @@ def test_load_novel_config_upload_rejects_invalid_youtube_project_selector(tmp_p
         },
     }
     (tmp_path / "configs" / "app.yaml").write_text(yaml.safe_dump(app_cfg, sort_keys=False), encoding="utf-8")
-    source_cfg = {"crawl": {"site_id": "test"}, "browser_debug": {}}
+    source_cfg = {"crawl": {"site_id": "test", "browser_debug": {}}}
     (tmp_path / "configs" / "sources" / "s1.json").write_text(json.dumps(source_cfg), encoding="utf-8")
     novel_cfg = {
         "novel_id": "n1",
@@ -163,11 +167,13 @@ def test_load_novel_config_upload_rejects_invalid_youtube_project_selector(tmp_p
         "translation": {"chapter": {"chapter_regex": "^$", "base_rules": "x"}},
         "models": {},
         "tts": {},
-        "visual": {"background_video": "bg.mp4"},
-        "video": {},
+        "media": {"visual": {"background_video": "bg.mp4"}, "video": {}},
         "upload": {"default_platform": "youtube"},
     }
-    (tmp_path / "configs" / "novels" / "n1.json").write_text(json.dumps(novel_cfg), encoding="utf-8")
+    (tmp_path / "configs" / "novels" / "n1.yaml").write_text(
+        yaml.safe_dump(novel_cfg, sort_keys=False),
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match='upload.youtube.project'):
         loader.load_novel_config("n1")

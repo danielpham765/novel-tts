@@ -25,7 +25,7 @@ def _write_minimal_config_tree(tmp_path, *, novel_id: str = "n1") -> None:
     }
     (tmp_path / "configs" / "app.yaml").write_text(yaml.safe_dump(app_cfg, sort_keys=False), encoding="utf-8")
 
-    source_cfg = {"crawl": {"site_id": "test"}, "browser_debug": {}}
+    source_cfg = {"crawl": {"site_id": "test", "browser_debug": {}}}
     (tmp_path / "configs" / "sources" / "s1.json").write_text(json.dumps(source_cfg), encoding="utf-8")
 
     novel_cfg = {
@@ -43,10 +43,12 @@ def _write_minimal_config_tree(tmp_path, *, novel_id: str = "n1") -> None:
         "translation": {"chapter": {"chapter_regex": "^$", "base_rules": "x"}},
         "models": {},
         "tts": {},
-        "visual": {},
-        "video": {},
+        "media": {"visual": {}, "video": {}},
     }
-    (tmp_path / "configs" / "novels" / f"{novel_id}.json").write_text(json.dumps(novel_cfg), encoding="utf-8")
+    (tmp_path / "configs" / "novels" / f"{novel_id}.yaml").write_text(
+        yaml.safe_dump(novel_cfg, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def test_normalize_text_uses_injected_replacements() -> None:

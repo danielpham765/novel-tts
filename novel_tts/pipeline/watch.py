@@ -12,6 +12,7 @@ from novel_tts.config.loader import _load_app_config
 from novel_tts.crawl import crawl_range
 from novel_tts.crawl.service import config_with_source, discover_source_entries
 from novel_tts.media import create_video, generate_visual
+from novel_tts.media_batch import collect_media_batch_ranges, media_range_key
 from novel_tts.queue import add_jobs_to_queue, launch_queue_stack, wait_for_range_completion
 from novel_tts.translate import polish_translations
 from novel_tts.translate.repair import enqueue_repair_jobs, find_repair_jobs_in_range
@@ -41,7 +42,7 @@ def _discover_configured_novel_ids(repo_root: Path) -> list[str]:
     novels_dir = repo_root / "configs" / "novels"
     if not novels_dir.exists():
         return []
-    return sorted(path.stem for path in novels_dir.glob("*.json") if path.is_file())
+    return sorted(path.stem for path in novels_dir.glob("*.yaml") if path.is_file())
 
 
 def _watch_state_path(config: NovelConfig) -> Path:
@@ -85,7 +86,7 @@ def _batch_range_for_chapter(chapter: int, batch_size: int) -> tuple[int, int]:
 
 
 def _range_key(start: int, end: int) -> str:
-    return f"chuong_{start}-{end}"
+    return media_range_key(start, end)
 
 
 def _translated_range_path(config: NovelConfig, start: int, end: int) -> Path:
@@ -368,12 +369,13 @@ def _process_novel(
 
         if not skip_polish:
             _polish_range(source_bound_config, crawl_start, crawl_end)
-        tts_ranges.extend(_collect_ranges_for_span(crawl_start, crawl_end, batch_size))
+        tts_ranges.extend([(item.start, item.end) for item in collect_media_batch_ranges(config, crawl_start, crawl_end)])
         changed = True
 
     latest_known = max(local_latest, remote_latest)
     if latest_known > 0:
-        latest_range = _batch_range_for_chapter(latest_known, batch_size)
+        latest_item = collect_media_batch_ranges(config, latest_known, latest_known)[0]
+        latest_range = (latest_item.start, latest_item.end)
         if latest_range not in tts_ranges:
             tts_ranges.append(latest_range)
 

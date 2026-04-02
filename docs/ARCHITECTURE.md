@@ -125,7 +125,7 @@ Configuration is built by `novel_tts.config.loader.load_novel_config()`.
 
 The loader merges:
 
-- `configs/novels/<novel_id>.json`
+- `configs/novels/<novel_id>.yaml`
 - `configs/sources/<source_id>.json`
 - `configs/app.yaml`
 - `configs/glossaries/<novel_id>.json` or an explicit glossary file
@@ -140,10 +140,10 @@ The merged result is a `NovelConfig` dataclass graph from `novel_tts.config.mode
 - metadata: `novel_id`, `title`, `slug`, languages
 - source wiring: `source_id`, `source`
 - paths: `storage`
-- crawl: `crawl`, `browser_debug`
+- crawl: `crawl` including `crawl.browser_debug`
 - translation: `models`, `translation`, `captions`
 - queue/runtime: `queue`, `proxy_gateway`
-- downstream media: `tts`, `visual`, `video`
+- downstream media: `tts`, `media` with `media.visual`, `media.video`, `media.media_batch`
 - publishing: `upload`
 
 ### Merge Rules
@@ -748,9 +748,9 @@ Primary files:
 
 ### Input Contract
 
-TTS expects a translated batch file matching the requested range key:
+TTS reads translated files from:
 
-- `input/<novel>/translated/chuong_<start>-<end>.txt`
+- `input/<novel>/translated/*.txt`
 
 The current splitting logic looks for `Chương <n>` headings in translated text.
 
@@ -758,7 +758,7 @@ The current splitting logic looks for `Chương <n>` headings in translated text
 
 `run_tts()`:
 
-- loads the translated range file
+- loads all translated batch files overlapping the requested media range
 - splits it into chapter chunks
 - filters those chunks to the requested range
 - connects to the configured Gradio server/model
@@ -873,7 +873,7 @@ It can:
 
 - crawl a range
 - launch queue translation for the requested chapter range and wait until it completes
-- discover translated batch ranges overlapping the request
+- resolve downstream media batch ranges from `media.media_batch`
 - execute downstream media in one of two modes:
   - `per-stage`
   - `per-video`

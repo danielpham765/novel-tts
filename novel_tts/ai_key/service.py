@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import redis
-import yaml
 
+from novel_tts.config.loader import _load_app_config
 from novel_tts.config.models import ProxyGatewayConfig
 from novel_tts.key_identity import key_token_from_raw
 from novel_tts.net.proxy_gateway import select_proxy_for_key_index
@@ -54,10 +54,7 @@ def _load_keys() -> list[str]:
 
 
 def _load_redis_cfg() -> RedisCfg:
-    path = _repo_root() / "configs" / "app.yaml"
-    payload = {}
-    if path.exists():
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload = _load_app_config()
     queue = payload.get("queue") if isinstance(payload, dict) else {}
     redis_raw = queue.get("redis") if isinstance(queue, dict) else {}
     if not isinstance(redis_raw, dict):
@@ -71,10 +68,7 @@ def _load_redis_cfg() -> RedisCfg:
 
 
 def _load_enabled_models() -> list[str]:
-    path = _repo_root() / "configs" / "app.yaml"
-    payload = {}
-    if path.exists():
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload = _load_app_config()
     models = payload.get("models") if isinstance(payload, dict) else {}
     enabled = models.get("enabled_models") if isinstance(models, dict) else None
     if isinstance(enabled, list):
@@ -88,10 +82,7 @@ def _load_enabled_models() -> list[str]:
 
 
 def _load_model_limits() -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-    path = _repo_root() / "configs" / "app.yaml"
-    payload = {}
-    if path.exists():
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload = _load_app_config()
     models = payload.get("models") if isinstance(payload, dict) else {}
     if not isinstance(models, dict):
         models = {}
@@ -156,10 +147,7 @@ def _load_model_limits() -> tuple[dict[str, int], dict[str, int], dict[str, int]
 
 
 def _load_proxy_gateway_cfg() -> ProxyGatewayConfig:
-    path = _repo_root() / "configs" / "app.yaml"
-    payload = {}
-    if path.exists():
-        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload = _load_app_config()
     proxy_raw = payload.get("proxy_gateway") if isinstance(payload, dict) else {}
     if proxy_raw is None:
         proxy_raw = {}

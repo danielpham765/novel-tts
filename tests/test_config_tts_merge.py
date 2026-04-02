@@ -22,7 +22,7 @@ def test_tts_defaults_from_app_yaml_and_novel_overrides(tmp_path, monkeypatch):
     }
     (tmp_path / "configs" / "app.yaml").write_text(yaml.safe_dump(app_cfg, sort_keys=False), encoding="utf-8")
 
-    source_cfg = {"crawl": {"site_id": "test"}, "browser_debug": {}}
+    source_cfg = {"crawl": {"site_id": "test", "browser_debug": {}}}
     (tmp_path / "configs" / "sources" / "s1.json").write_text(json.dumps(source_cfg), encoding="utf-8")
 
     base_novel = {
@@ -39,11 +39,16 @@ def test_tts_defaults_from_app_yaml_and_novel_overrides(tmp_path, monkeypatch):
         "crawl": {"sources": [{"source_id": "s1"}]},
         "translation": {"chapter": {"chapter_regex": "^$", "base_rules": "x"}},
         "models": {},
-        "visual": {"background_video": "bg.mp4"},
-        "video": {},
+        "media": {
+            "visual": {"background_video": "bg.mp4"},
+            "video": {},
+        },
     }
 
-    (tmp_path / "configs" / "novels" / "n1.json").write_text(json.dumps(base_novel), encoding="utf-8")
+    (tmp_path / "configs" / "novels" / "n1.yaml").write_text(
+        yaml.safe_dump(base_novel, sort_keys=False),
+        encoding="utf-8",
+    )
     cfg = loader.load_novel_config("n1")
     assert cfg.tts.provider == "gradio_vie_tts"
     assert cfg.tts.voice == "Tuyen"
@@ -53,7 +58,10 @@ def test_tts_defaults_from_app_yaml_and_novel_overrides(tmp_path, monkeypatch):
     override_novel["novel_id"] = "n2"
     override_novel["slug"] = "n2"
     override_novel["tts"] = {"voice": "Ly"}
-    (tmp_path / "configs" / "novels" / "n2.json").write_text(json.dumps(override_novel), encoding="utf-8")
+    (tmp_path / "configs" / "novels" / "n2.yaml").write_text(
+        yaml.safe_dump(override_novel, sort_keys=False),
+        encoding="utf-8",
+    )
     cfg2 = loader.load_novel_config("n2")
     assert cfg2.tts.provider == "gradio_vie_tts"
     assert cfg2.tts.voice == "Ly"
@@ -94,7 +102,10 @@ def test_load_novel_config_allows_captions_only_novel(tmp_path, monkeypatch):
         "models": {},
         "tts": {},
     }
-    (tmp_path / "configs" / "novels" / "captions-only.json").write_text(json.dumps(novel_cfg), encoding="utf-8")
+    (tmp_path / "configs" / "novels" / "captions-only.yaml").write_text(
+        yaml.safe_dump(novel_cfg, sort_keys=False),
+        encoding="utf-8",
+    )
 
     cfg = loader.load_novel_config("captions-only")
     assert cfg.source_id == ""

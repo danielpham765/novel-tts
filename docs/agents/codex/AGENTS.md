@@ -81,7 +81,7 @@ Loaded by:
 
 Merged from:
 
-- `configs/novels/<novel>.json`
+- `configs/novels/<novel>.yaml`
 - `configs/sources/<source>.json`
 - `configs/app.yaml`
 - glossary JSON
@@ -95,14 +95,16 @@ Important sections:
 
 - `storage`
 - `crawl`
-- `browser_debug`
+- `crawl.browser_debug`
 - `models`
 - `translation`
 - `captions`
 - `queue`
 - `tts`
-- `visual`
-- `video`
+- `media`
+- `media.visual`
+- `media.video`
+- `media.media_batch`
 - `upload`
 - `pipeline`
 - `proxy_gateway`

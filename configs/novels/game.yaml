@@ -1,0 +1,50 @@
+---
+novel_id: game
+title: Game Novel
+slug: game
+source_language: zh
+target_language: vi
+storage:
+  input_dir: input/game
+  output_dir: output/game
+  image_dir: image/game
+  logs_dir: ".logs"
+  tmp_dir: tmp
+crawl:
+  sources:
+  - source_id: 69shuba
+    directory_url: https://www.69shuba.com/book/51036.htm
+    chapter_url_pattern: https://www.69shuba.com/txt/51036/{chapter}
+    selectors:
+      content:
+      - ".txtnav"
+      - "#content"
+translation:
+  glossary_file: configs/glossaries/game.json
+  line_token: QZXBRQ
+  post_replacements: {}
+  han_fallback_replacements: {}
+  chapter:
+    chapter_regex: "^第(\\d+)章([^\\n]*)"
+    base_rules: |
+      Ngươi là chuyên gia dịch tiểu thuyết mạng Trung Quốc sang tiếng Việt.
+      Yêu cầu bắt buộc:
+      - Chỉ trả về đúng phần nội dung đã dịch. Không giải thích. Không ghi chú.
+      - Dịch mượt, tự nhiên, nghe như văn truyện.
+      - Dịch hết toàn bộ chữ Hán. Không để sót tiếng Trung.
+      - Dịch toàn bộ tên riêng sang dạng Hán Việt/Việt hóa nhất quán theo glossary.
+      - Ưu tiên xưng hô phù hợp văn truyện, tránh văn nói hiện đại nếu không cần.
+      - Giữ nguyên thứ tự nội dung, không thêm bớt ý.
+      - Phải giữ nguyên mọi token placeholder dạng ZXQ<digits>QXZ hoặc QZX<digits>QXZ (ví dụ ZXQ000QXZ) và token xuống dòng QZXBRQ; không tạo token mới; không đổi chữ số.
+  captions: {}
+models: {}
+queue: {}
+tts: {}
+media:
+  visual:
+    background_video: background.mp4
+    tag_text: Audio Novel
+    line1: Game Novel
+    line2: Truyện audio
+    line3: Generic pipeline
+  video: {}

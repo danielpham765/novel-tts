@@ -8,6 +8,9 @@ from novel_tts.config.models import (
     BrowserDebugConfig,
     CaptionConfig,
     CrawlConfig,
+    MediaConfig,
+    MediaBatchConfig,
+    MediaBatchRule,
     ModelsConfig,
     NovelConfig,
     QueueConfig,
@@ -36,7 +39,7 @@ def _make_config(tmp_path: Path) -> NovelConfig:
     )
     crawl = CrawlConfig(site_id="test")
     browser_debug = BrowserDebugConfig()
-    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl, browser_debug=browser_debug)
+    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl)
     models = ModelsConfig(
         provider="dummy",
         enabled_models=["dummy"],
@@ -60,14 +63,15 @@ def _make_config(tmp_path: Path) -> NovelConfig:
         source=source,
         storage=storage,
         crawl=crawl,
-        browser_debug=browser_debug,
         models=models,
         translation=translation,
         captions=captions,
         queue=queue,
         tts=TtsConfig(provider="local", voice="test"),
-        visual=VisualConfig(background_video="background.mp4"),
-        video=VideoConfig(),
+        media=MediaConfig(
+            visual=VisualConfig(background_video="background.mp4"),
+            video=VideoConfig(),
+        ),
     )
 
 
@@ -79,13 +83,16 @@ def test_generate_visual_requires_drawtext(tmp_path: Path, monkeypatch: pytest.M
         media_service.generate_visual(config, 1, 10)
 
 
-def test_generate_visual_part_index_uses_video_episode_batch_size(
+def test_generate_visual_part_index_uses_media_batch_schedule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _make_config(tmp_path)
-    config.video.episode_batch_size = 10
+    config.media.media_batch = MediaBatchConfig(
+        default_chapter_batch_size=10,
+        chapter_batch_overrides=[MediaBatchRule(range="1-20", chapter_batch_size=5)],
+    )
     config.storage.image_dir.mkdir(parents=True, exist_ok=True)
-    (config.storage.image_dir / config.visual.background_video).write_bytes(b"fake")
+    (config.storage.image_dir / config.media.visual.background_video).write_bytes(b"fake")
     (config.storage.root / "image").mkdir(parents=True, exist_ok=True)
     (config.storage.root / "image" / "channel-name.png").write_bytes(b"fake")
 
@@ -94,15 +101,15 @@ def test_generate_visual_part_index_uses_video_episode_batch_size(
     monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
     monkeypatch.setattr(media_service, "run_ffmpeg", lambda args: ffmpeg_calls.append(args))
 
-    media_service.generate_visual(config, 11, 20)
+    media_service.generate_visual(config, 11, 15)
 
     assert ffmpeg_calls, "Expected ffmpeg to be invoked"
     first_call = ffmpeg_calls[0]
     filter_idx = first_call.index("-filter_complex")
     filters = first_call[filter_idx + 1]
-    assert "Tập 2" in filters
-    assert "scale=-1:114[channel]" in filters
-    assert "overlay=x=W-w-10:y=35" in filters
+    assert "Tập 3" in filters
+    assert "scale=-1:80[channel]" in filters
+    assert "overlay=x=W-w-5:y=10" in filters
     assert str(config.storage.root / "image" / "channel-name.png") in first_call
     assert "-an" in first_call
     assert "0:a?" not in first_call
@@ -111,7 +118,7 @@ def test_generate_visual_part_index_uses_video_episode_batch_size(
 def test_generate_visual_requires_channel_name_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _make_config(tmp_path)
     config.storage.image_dir.mkdir(parents=True, exist_ok=True)
-    (config.storage.image_dir / config.visual.background_video).write_bytes(b"fake")
+    (config.storage.image_dir / config.media.visual.background_video).write_bytes(b"fake")
 
     monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
 
@@ -121,12 +128,12 @@ def test_generate_visual_requires_channel_name_image(tmp_path: Path, monkeypatch
 
 def test_generate_visual_for_chapter_uses_background_cover(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _make_config(tmp_path)
-    config.visual.background_cover = "background.jpg"
-    config.visual.line1 = "Tập 1"
-    config.visual.line2 = "Không Qua Phong Tuyết,"
-    config.visual.line3 = "Làm Sao Thấy Cầu Vồng?"
+    config.media.visual.background_cover = "background.jpg"
+    config.media.visual.line1 = "Tập 1"
+    config.media.visual.line2 = "Không Qua Phong Tuyết,"
+    config.media.visual.line3 = "Làm Sao Thấy Cầu Vồng?"
     config.storage.image_dir.mkdir(parents=True, exist_ok=True)
-    (config.storage.image_dir / config.visual.background_cover).write_bytes(b"fake")
+    (config.storage.image_dir / config.media.visual.background_cover).write_bytes(b"fake")
 
     ffmpeg_calls: list[list[str]] = []
 
@@ -138,7 +145,7 @@ def test_generate_visual_for_chapter_uses_background_cover(tmp_path: Path, monke
     assert len(ffmpeg_calls) >= 1
     first_call = ffmpeg_calls[0]
     assert "-loop" in first_call
-    assert str(config.storage.image_dir / config.visual.background_cover) in first_call
+    assert str(config.storage.image_dir / config.media.visual.background_cover) in first_call
     vf_idx = first_call.index("-vf")
     filters = first_call[vf_idx + 1]
     assert "pad=iw:ih+220:0:0:color=black" not in filters
@@ -151,9 +158,9 @@ def test_generate_visual_for_chapter_requires_valid_cover_extension(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _make_config(tmp_path)
-    config.visual.background_cover = "background.gif"
+    config.media.visual.background_cover = "background.gif"
     config.storage.image_dir.mkdir(parents=True, exist_ok=True)
-    (config.storage.image_dir / config.visual.background_cover).write_bytes(b"fake")
+    (config.storage.image_dir / config.media.visual.background_cover).write_bytes(b"fake")
     monkeypatch.setattr(media_service, "ffmpeg_has_filter", lambda _name: True)
 
     with pytest.raises(ValueError, match=r"\.jpg, \.jpeg, or \.png"):
@@ -163,7 +170,7 @@ def test_generate_visual_for_chapter_requires_valid_cover_extension(
 def test_generate_visual_uses_cached_final_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _make_config(tmp_path)
     config.storage.image_dir.mkdir(parents=True, exist_ok=True)
-    (config.storage.image_dir / config.visual.background_video).write_bytes(b"background")
+    (config.storage.image_dir / config.media.visual.background_video).write_bytes(b"background")
     (config.storage.root / "image").mkdir(parents=True, exist_ok=True)
     (config.storage.root / "image" / "channel-name.png").write_bytes(b"channel")
 
@@ -193,7 +200,7 @@ def test_create_video_uses_cached_final_output_and_invalidates_on_input_change(
 ) -> None:
     config = _make_config(tmp_path)
     visual_path = config.storage.visual_dir / "chuong_1-10.mp4"
-    audio_path = config.storage.audio_dir / "chuong_1-10" / "chuong_1-10.mp3"
+    audio_path = config.storage.audio_dir / "chuong_1-10" / "chuong_1-10.aac"
     visual_path.parent.mkdir(parents=True, exist_ok=True)
     audio_path.parent.mkdir(parents=True, exist_ok=True)
     visual_path.write_bytes(b"visual-v1")

@@ -20,6 +20,7 @@ import redis
 from novel_tts.common.logging import get_logger
 from novel_tts.config.loader import _load_app_config
 from novel_tts.config.models import NovelConfig, UploadYouTubeConfig
+from novel_tts.media_batch import count_media_batches_before, find_media_range_by_episode, media_range_key
 
 LOGGER = get_logger(__name__)
 
@@ -62,7 +63,7 @@ YOUTUBE_QUOTA_UPLOAD_COMMIT_COST = (
 
 
 def _range_key(start: int, end: int) -> str:
-    return f"chuong_{start}-{end}"
+    return media_range_key(start, end)
 
 
 def _read_required_text(path: Path, *, field_name: str) -> str:
@@ -99,13 +100,11 @@ def _parse_playlist_id(raw: str) -> str:
     return playlist
 
 
-def _resolve_title_with_index(raw_title: str, start: int, end: int) -> str:
+def _resolve_title_with_index(config: NovelConfig, raw_title: str, start: int, end: int) -> str:
     title = str(raw_title or "").strip()
     if not title:
         return title
-    # Range-local index (e.g. 1-10 => 1, 11-20 => 2).
-    batch_size = max(1, end - start + 1)
-    index = ((start - 1) // batch_size) + 1
+    index = count_media_batches_before(config, start) + 1
     # Preferred: explicit placeholders in title file.
     if "{index}" in title:
         return title.replace("{index}", str(index))
@@ -1289,7 +1288,7 @@ def _build_upload_spec(config: NovelConfig, start: int, end: int, *, require_med
         field_name="upload.youtube.playlist_file",
     )
     title_raw = _read_required_text(title_path, field_name="title")
-    title = _resolve_title_with_index(title_raw, start, end)
+    title = _resolve_title_with_index(config, title_raw, start, end)
     description_base = _read_required_text(description_path, field_name="description")
     playlist_raw = _read_required_text(playlist_path, field_name="playlist")
     playlist_line = next((line.strip() for line in playlist_raw.splitlines() if line.strip()), "")
@@ -1318,21 +1317,11 @@ def _read_playlist_id(config: NovelConfig) -> str:
 
 
 def _find_range_key_for_episode(config: NovelConfig, episode_index: int) -> str | None:
-    """Return range_key (e.g. 'chuong_1-10') whose episode index matches the given index, or None."""
-    if not config.storage.translated_dir.exists():
+    """Return range_key whose media episode index matches the given index, or None."""
+    item = find_media_range_by_episode(config, episode_index)
+    if item is None:
         return None
-    pattern = re.compile(r"^chuong_(\d+)-(\d+)\.txt$")
-    for file_path in config.storage.translated_dir.iterdir():
-        match = pattern.match(file_path.name)
-        if not match:
-            continue
-        start = int(match.group(1))
-        end = int(match.group(2))
-        batch_size = max(1, end - start + 1)
-        idx = ((start - 1) // batch_size) + 1
-        if idx == episode_index:
-            return _range_key(start, end)
-    return None
+    return item.range_key
 
 
 def _video_in_chapter_range(video_title: str, config: NovelConfig, from_chapter: int, to_chapter: int) -> bool:

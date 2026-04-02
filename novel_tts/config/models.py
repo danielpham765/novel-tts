@@ -70,6 +70,18 @@ class StorageConfig:
 
 
 @dataclass
+class BrowserDebugConfig:
+    mode: str = "auto"
+    remote_debugging_url: str = ""
+    remote_debugging_port: int = 9222
+    executable_path: str = ""
+    user_data_dir: str = ""
+    profile_directory: str = ""
+    headless: bool = False
+    debug_image_dir: str = "debug/img"
+
+
+@dataclass
 class CrawlConfig:
     site_id: str
     directory_url: str = ""
@@ -84,18 +96,7 @@ class CrawlConfig:
     max_fetch_retries: int = 3
     retry_backoff_seconds: float = 5.0
     rate_limit_cooldown_seconds: float = 300.0
-
-
-@dataclass
-class BrowserDebugConfig:
-    mode: str = "auto"
-    remote_debugging_url: str = ""
-    remote_debugging_port: int = 9222
-    executable_path: str = ""
-    user_data_dir: str = ""
-    profile_directory: str = ""
-    headless: bool = False
-    debug_image_dir: str = "debug/img"
+    browser_debug: BrowserDebugConfig = field(default_factory=BrowserDebugConfig)
 
 
 @dataclass
@@ -200,11 +201,29 @@ class VideoConfig:
     audio_bitrate: str = "128k"
     preset: str = "veryfast"
     crf: int = 28
-    episode_batch_size: int = 10
     use_gpu: bool = False
     media_workers: int = 1
     visual_workers: int = 3
     pipeline_mode: str = "per-stage"
+
+
+@dataclass
+class MediaBatchRule:
+    range: str
+    chapter_batch_size: int
+
+
+@dataclass
+class MediaBatchConfig:
+    default_chapter_batch_size: int = 10
+    chapter_batch_overrides: list[MediaBatchRule] = field(default_factory=list)
+
+
+@dataclass
+class MediaConfig:
+    visual: VisualConfig
+    video: VideoConfig = field(default_factory=VideoConfig)
+    media_batch: MediaBatchConfig = field(default_factory=MediaBatchConfig)
 
 
 @dataclass
@@ -269,7 +288,6 @@ class SourceConfig:
     source_id: str
     resolver_id: str
     crawl: CrawlConfig
-    browser_debug: BrowserDebugConfig
 
 
 @dataclass
@@ -283,14 +301,12 @@ class NovelConfig:
     source: SourceConfig
     storage: StorageConfig
     crawl: CrawlConfig
-    browser_debug: BrowserDebugConfig
     models: ModelsConfig
     translation: TranslationConfig
     captions: CaptionConfig
     queue: QueueConfig
     tts: TtsConfig
-    visual: VisualConfig
-    video: VideoConfig
+    media: MediaConfig
     upload: UploadConfig = field(default_factory=UploadConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     proxy_gateway: ProxyGatewayConfig = field(default_factory=ProxyGatewayConfig)

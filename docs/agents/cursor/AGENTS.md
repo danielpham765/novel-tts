@@ -71,13 +71,13 @@ When answering questions or making edits, **anchor your reasoning** to these fil
 
 - **Loader**: `novel_tts.config.loader.load_novel_config()`
 - **Sources**:
-  - `configs/novels/<novel>.json`
+  - `configs/novels/<novel>.yaml`
   - `configs/sources/<source>.json`
   - `configs/app.yaml`
   - `configs/glossaries/<novel>.json` (or explicit glossary file)
   - selected environment variables
 - **Dataclass root**: `NovelConfig` with key sections:
-  - `storage`, `crawl`, `browser_debug`, `models`, `translation`, `captions`, `queue`, `tts`, `visual`, `video`, `upload`, `pipeline`, `proxy_gateway`
+  - `storage`, `crawl`, `crawl.browser_debug`, `models`, `translation`, `captions`, `queue`, `tts`, `media`, `media.visual`, `media.video`, `media.media_batch`, `upload`, `pipeline`, `proxy_gateway`
 
 **Per-novel storage layout** (contract relied on across subsystems):
 
@@ -175,7 +175,7 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Render overlay text over background video using FFmpeg.
   - Loop visual track to match audio duration.
   - Mux audio + visual into final `video/<range>.mp4`.
-- Source of truth for overlay content: `config.visual` and generated subtitles.
+- Source of truth for overlay content: `config.media.visual` and generated subtitles.
 
 ### Upload / YouTube Admin
 

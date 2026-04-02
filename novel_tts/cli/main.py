@@ -27,6 +27,7 @@ from novel_tts.common.logging import (
 from novel_tts.common.text import parse_range
 from novel_tts.common.errors import InputTranslationError, RateLimitExceededError
 from novel_tts.config import load_novel_config, NovelConfig
+from novel_tts.media_batch import collect_media_batch_ranges
 
 LOGGER = get_logger(__name__)
 CRAWL_VERIFY_LOGGER = get_logger("crawl.verify")
@@ -181,32 +182,10 @@ def _watch_table(*, title: str, render: Callable[[], int], refresh_seconds: floa
 
 
 def get_translated_ranges(config: NovelConfig, search_start: int, search_end: int) -> list[tuple[int, int, str]]:
-    ranges = []
-    pattern = re.compile(r"^chuong_(\d+)-(\d+)\.txt$")
-    config_dir = config.storage.translated_dir
-    
-    if not config_dir.exists():
-        return [(search_start, search_end, f"chuong_{search_start}-{search_end}")]
-        
-    for file_path in config_dir.iterdir():
-        if not file_path.is_file():
-            continue
-        match = pattern.match(file_path.name)
-        if match:
-            start = int(match.group(1))
-            end = int(match.group(2))
-            
-            overlap_start = max(start, search_start)
-            overlap_end = min(end, search_end)
-            
-            if overlap_start <= overlap_end:
-                ranges.append((overlap_start, overlap_end, f"chuong_{start}-{end}"))
-                
-    if not ranges:
-        return [(search_start, search_end, f"chuong_{search_start}-{search_end}")]
-        
-    ranges.sort(key=lambda x: x[0])
-    return ranges
+    return [
+        (item.start, item.end, item.range_key)
+        for item in collect_media_batch_ranges(config, search_start, search_end)
+    ]
 
 
 def _run_pipeline_per_stage(
@@ -808,7 +787,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pipeline_watch.add_argument(
         "--all",
         action="store_true",
-        help="Watch all novels from pipeline.watch.novels, or fallback to configs/novels/*.json when that list is empty.",
+        help="Watch all novels from pipeline.watch.novels, or fallback to configs/novels/*.yaml when that list is empty.",
     )
     pipeline_watch.add_argument(
         "--interval-seconds",
@@ -1728,7 +1707,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             force = bool(getattr(args, "force", False))
-            workers = max(1, int(getattr(args, "workers", None) or config.video.visual_workers))
+            workers = max(1, int(getattr(args, "workers", None) or config.media.video.visual_workers))
             start, end = parse_range(args.range)
             ranges = list(get_translated_ranges(config, start, end))
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1750,7 +1729,7 @@ def main(argv: list[str] | None = None) -> int:
 
             config = load_novel_config(args.novel_id)
             force = bool(getattr(args, "force", False))
-            workers = max(1, int(getattr(args, "workers", None) or config.video.media_workers))
+            workers = max(1, int(getattr(args, "workers", None) or config.media.video.media_workers))
             start, end = parse_range(args.range)
             ranges = list(get_translated_ranges(config, start, end))
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2061,10 +2040,10 @@ def main(argv: list[str] | None = None) -> int:
             upload_platform = str(
                 getattr(args, "upload_platform", None) or getattr(config.upload, "default_platform", "youtube")
             )
-            pipeline_mode = str(getattr(args, "mode", None) or config.video.pipeline_mode or "per-stage")
+            pipeline_mode = str(getattr(args, "mode", None) or config.media.video.pipeline_mode or "per-stage")
             pipeline_force = bool(getattr(args, "force", False))
-            media_workers = max(1, int(getattr(args, "workers", None) or config.video.media_workers))
-            visual_workers = max(1, int(getattr(args, "workers", None) or config.video.visual_workers))
+            media_workers = max(1, int(getattr(args, "workers", None) or config.media.video.media_workers))
+            visual_workers = max(1, int(getattr(args, "workers", None) or config.media.video.visual_workers))
             if pipeline_mode == "per-video":
                 _run_pipeline_per_video(
                     config,

@@ -9,6 +9,7 @@ from novel_tts.config.models import (
     BrowserDebugConfig,
     CaptionConfig,
     CrawlConfig,
+    MediaConfig,
     ModelsConfig,
     NovelConfig,
     ProxyGatewayConfig,
@@ -46,7 +47,7 @@ def _make_config(tmp_path: Path) -> NovelConfig:
     )
     crawl = CrawlConfig(site_id="test", chapter_batch_size=10, chapter_regex=r"^第(\d+)章([^\n]*)")
     browser_debug = BrowserDebugConfig(mode="auto")
-    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl, browser_debug=browser_debug)
+    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl)
     models = ModelsConfig(
         provider="gemini_http",
         enabled_models=["dummy"],
@@ -68,14 +69,15 @@ def _make_config(tmp_path: Path) -> NovelConfig:
         source=source,
         storage=storage,
         crawl=crawl,
-        browser_debug=browser_debug,
         models=models,
         translation=translation,
         captions=CaptionConfig(),
         queue=QueueConfig(),
         tts=TtsConfig(provider="local", voice="test"),
-        visual=VisualConfig(background_video=""),
-        video=VideoConfig(),
+        media=MediaConfig(
+            visual=VisualConfig(background_video=""),
+            video=VideoConfig(),
+        ),
         proxy_gateway=ProxyGatewayConfig(),
     )
 

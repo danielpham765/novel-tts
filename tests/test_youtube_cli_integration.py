@@ -174,6 +174,7 @@ def test_upload_update_playlist_index_runs_bulk_update(monkeypatch, tmp_path: Pa
         BrowserDebugConfig,
         CaptionConfig,
         CrawlConfig,
+    MediaConfig,
         ModelsConfig,
         NovelConfig,
         QueueConfig,
@@ -200,7 +201,7 @@ def test_upload_update_playlist_index_runs_bulk_update(monkeypatch, tmp_path: Pa
     )
     crawl = CrawlConfig(site_id="test")
     browser_debug = BrowserDebugConfig()
-    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl, browser_debug=browser_debug)
+    source = SourceConfig(source_id="test", resolver_id="test", crawl=crawl)
     cfg = NovelConfig(
         novel_id="novel",
         title="Novel",
@@ -211,14 +212,15 @@ def test_upload_update_playlist_index_runs_bulk_update(monkeypatch, tmp_path: Pa
         source=source,
         storage=storage,
         crawl=crawl,
-        browser_debug=browser_debug,
         models=ModelsConfig(provider="gemini_http", enabled_models=["m1"], model_configs={"m1": QueueModelConfig()}),
         translation=TranslationConfig(chapter_regex=r"^$", base_rules="", glossary_file=""),
         captions=CaptionConfig(),
         queue=QueueConfig(),
         tts=TtsConfig(provider="local", voice="test"),
-        visual=VisualConfig(background_video="bg.mp4"),
-        video=VideoConfig(),
+        media=MediaConfig(
+            visual=VisualConfig(background_video="bg.mp4"),
+            video=VideoConfig(),
+        ),
         upload=UploadConfig(
             default_platform="youtube",
             youtube=UploadYouTubeConfig(enabled=True),
