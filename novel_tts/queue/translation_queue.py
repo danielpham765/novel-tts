@@ -29,6 +29,7 @@ from novel_tts.translate.novel import (
 
 LOGGER = get_logger(__name__)
 CAPTIONS_JOB_ID = "captions"
+REPAIR_GLOSSARY_JOB_PREFIX = "repair-glossary::"
 
 _RATE_LIMIT_TOKENS = (
     "429",
@@ -1610,6 +1611,23 @@ def _is_captions_job(job_id: str) -> bool:
     return (job_id or "").strip().lower() == CAPTIONS_JOB_ID
 
 
+def _is_repair_glossary_job(job_id: str) -> bool:
+    return (job_id or "").startswith(REPAIR_GLOSSARY_JOB_PREFIX)
+
+
+def _repair_glossary_job_id(chunk_index: int) -> str:
+    return f"{REPAIR_GLOSSARY_JOB_PREFIX}{chunk_index:04d}"
+
+
+def _parse_repair_glossary_chunk_index(job_id: str) -> int:
+    return int(job_id[len(REPAIR_GLOSSARY_JOB_PREFIX):])
+
+
+def _repair_glossary_chunk_needs_work(config: NovelConfig, chunk_index: int) -> bool:
+    from novel_tts.translate.glossary_repair import get_repair_chunk_output_path
+    return not get_repair_chunk_output_path(config, chunk_index).exists()
+
+
 def _parse_job_id(job_id: str) -> tuple[str, str]:
     # Backward-compatible chapter job id: "<file_name>::<chapter_num>"
     file_name, chapter_num = job_id.split("::", 1)
@@ -2088,6 +2106,84 @@ def add_job_ids_to_queue(
     print(
         f"Queued {added} job(s) for novel {config.novel_id} ({label}). "
         f"Skipped inflight={skipped_inflight}, exhausted={skipped_exhausted}, missing_origin={missing_origin}."
+    )
+    return 0
+
+
+def remove_jobs_from_queue(
+    config: NovelConfig,
+    *,
+    chapters: list[int] | None = None,
+    from_chapter: int | None = None,
+    to_chapter: int | None = None,
+    all_pending: bool = False,
+) -> int:
+    """Remove pending (non-inflight) jobs from the queue.
+
+    - ``chapters``: remove specific chapter numbers.
+    - ``from_chapter``/``to_chapter``: remove a chapter range.
+    - ``all_pending``: remove every pending job (flushes all three pending lists + queued set,
+      but leaves inflight and done untouched).
+
+    Inflight jobs are skipped — stopping a running worker must be done separately via ``queue stop``.
+    """
+    client = _client(config)
+
+    if all_pending:
+        # Collect all job_ids currently in the queued set that are not inflight.
+        all_queued: list[str] = [j.decode() if isinstance(j, bytes) else j for j in (client.smembers(_key(config, "queued")) or [])]
+        inflight_ids: set[str] = {j.decode() if isinstance(j, bytes) else j for j in (client.hkeys(_key(config, "inflight")) or [])}
+        job_ids = [j for j in all_queued if j not in inflight_ids]
+    else:
+        # Build the target set of job IDs from origin files.
+        if chapters is not None:
+            wanted: set[int] = {int(ch) for ch in chapters if int(ch) > 0}
+        elif from_chapter is not None and to_chapter is not None:
+            lo, hi = (from_chapter, to_chapter) if from_chapter <= to_chapter else (to_chapter, from_chapter)
+            wanted = set(range(lo, hi + 1))
+        else:
+            raise ValueError("remove_jobs_from_queue: provide chapters, a range, or all_pending=True")
+
+        job_ids = []
+        for source_path in sorted(config.storage.origin_dir.glob("*.txt")):
+            for chapter_num, _text in load_source_chapters(config, source_path):
+                try:
+                    chap = int(str(chapter_num))
+                except Exception:
+                    continue
+                if chap not in wanted:
+                    continue
+                job_ids.append(_job_id(source_path.name, str(chap)))
+
+    if not job_ids:
+        print(f"No matching pending jobs found for novel {config.novel_id}.")
+        return 0
+
+    inflight_ids = {j.decode() if isinstance(j, bytes) else j for j in (client.hkeys(_key(config, "inflight")) or [])}
+    skipped_inflight = 0
+    removed = 0
+
+    pipe = client.pipeline()
+    for job_id in job_ids:
+        if job_id in inflight_ids:
+            skipped_inflight += 1
+            continue
+        pipe.srem(_key(config, "queued"), job_id)
+        pipe.lrem(_key(config, "pending"), 0, job_id)
+        pipe.lrem(_pending_priority_key(config), 0, job_id)
+        pipe.zrem(_pending_delayed_key(config), job_id)
+        removed += 1
+    pipe.execute()
+
+    LOGGER.info(
+        "Queue remove | novel=%s removed=%s skipped_inflight=%s",
+        config.novel_id,
+        removed,
+        skipped_inflight,
+    )
+    print(
+        f"Removed {removed} job(s) from queue for novel {config.novel_id}."
+        + (f" Skipped inflight={skipped_inflight} (use 'queue stop' to stop running workers)." if skipped_inflight else "")
     )
     return 0
 
@@ -2820,18 +2916,30 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             continue
         client.srem(_key(config, "queued"), job_id)
         is_captions = _is_captions_job(job_id)
-        is_force = bool(client.hexists(_key(config, "force"), job_id)) if not is_captions else False
+        is_repair_glossary = _is_repair_glossary_job(job_id)
+        is_force = bool(client.hexists(_key(config, "force"), job_id)) if not (is_captions or is_repair_glossary) else False
         file_name = ""
         chapter_num = ""
+        chunk_index = -1
         source_path: Path | None = None
         if is_captions:
             if not _captions_needs_translation(config):
+                continue
+        elif is_repair_glossary:
+            chunk_index = _parse_repair_glossary_chunk_index(job_id)
+            if not _repair_glossary_chunk_needs_work(config, chunk_index):
                 continue
         else:
             file_name, chapter_num = _parse_job_id(job_id)
             source_path = config.storage.origin_dir / file_name
             if not source_path.exists() or ((not is_force) and (not _chapter_needs_work(config, source_path, chapter_num))):
                 continue
+        if is_repair_glossary:
+            job_type = "repair-glossary"
+        elif is_captions:
+            job_type = "captions"
+        else:
+            job_type = "chapter"
         client.hset(
             _key(config, "inflight"),
             job_id,
@@ -2840,9 +2948,10 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                     "worker": worker_id,
                     "started_at": time.time(),
                     "model": model,
-                    "job_type": "captions" if is_captions else "chapter",
+                    "job_type": job_type,
                     "file_name": file_name,
                     "chapter_num": chapter_num,
+                    "chunk_index": chunk_index if is_repair_glossary else -1,
                 }
             ),
         )
@@ -2860,7 +2969,7 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             [_worker_key_prefix(config, raw_key=raw) for raw in keys],
             ensure_ascii=False,
         )
-        if not is_captions:
+        if not is_captions and not is_repair_glossary:
             env["NOVEL_TTS_GLOSSARY_STRICT"] = "1"
         env["GEMINI_RATE_LIMIT_KEY_PREFIX"] = _worker_key_prefix(config, raw_key=api_key)
         env["GEMINI_REDIS_HOST"] = config.queue.redis.host
@@ -2906,14 +3015,18 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
                 log_file_args = ["--log-file", handler.baseFilename]
                 break
 
-        cmd_args = [sys.executable, "-m", "novel_tts"] + log_file_args + ["translate"]
-        if is_captions:
-            cmd_args += ["captions", config.novel_id]
+        cmd_args = [sys.executable, "-m", "novel_tts"] + log_file_args
+        if is_repair_glossary:
+            cmd_args += ["glossary", "repair-chunk", config.novel_id, "--chunk-index", str(chunk_index)]
         else:
-            cmd_args += ["chapter", config.novel_id]
-            if is_force:
-                cmd_args.append("--force")
-            cmd_args += ["--file", file_name, "--chapter", chapter_num]
+            cmd_args += ["translate"]
+            if is_captions:
+                cmd_args += ["captions", config.novel_id]
+            else:
+                cmd_args += ["chapter", config.novel_id]
+                if is_force:
+                    cmd_args.append("--force")
+                cmd_args += ["--file", file_name, "--chapter", chapter_num]
 
         # If we hit the internal quota gate (exit=76), prefer waiting in-place for short waits rather than
         # releasing/requeueing the job, to reduce churn when workers are only slightly over TPM/RPM.
@@ -3373,7 +3486,9 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
             consecutive_rate_limit_releases = 0
             client.hincrby(_key(config, "model_failed"), model, 1)
             retries = client.hincrby(_key(config, "retries"), job_id, 1)
-            if is_captions:
+            if is_repair_glossary:
+                needs_work = _repair_glossary_chunk_needs_work(config, chunk_index)
+            elif is_captions:
                 needs_work = _captions_needs_translation(config)
             else:
                 assert source_path is not None
@@ -3398,7 +3513,9 @@ def run_worker(config: NovelConfig, key_index: int, model: str) -> int:
         )
         consecutive_rate_limit_releases = 0
         client.hincrby(_key(config, "model_failed"), model, 1)
-        if is_captions:
+        if is_repair_glossary:
+            needs_work = _repair_glossary_chunk_needs_work(config, chunk_index)
+        elif is_captions:
             needs_work = _captions_needs_translation(config)
         else:
             assert source_path is not None
@@ -3749,6 +3866,10 @@ def launch_queue_stack(config: NovelConfig, restart: bool = False, *, add_queue:
                 if add_queue:
                     add_all_jobs_to_queue(config)
                 return 0
+
+    # Clear any stale stopping signal or inflight entries left behind by a previous force-stop.
+    _clear_stopping(config, client)
+    _requeue_stale_inflight(config, client)
 
     # Before launching fresh queue processes, ask the global quota-supervisor to rotate this novel's logs
     # into .logs/archived/today so operators can follow logs from a clean slate.
@@ -4520,6 +4641,9 @@ def stop_queue_processes(
     # --force: immediate kill, same as the old behaviour.
     if force:
         _force_stop_queue_processes(config, roles=selected)
+        client = _client(config)
+        _clear_stopping(config, client)
+        _requeue_stale_inflight(config, client)
         return 0
 
     # Graceful path ---------------------------------------------------------

@@ -12,3 +12,5 @@ debug/
 .secrets/
 .stignore
 image/
+.repair
+*.local.*

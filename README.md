@@ -10,7 +10,7 @@ File-first Python CLI pipeline for crawling serialized web novels, translating t
 
 - [What this repo does](#what-this-repo-does)
 - [Quick start](#quick-start)
-- [Requirements](#requirements)
+- [Requirements](#requirements)s
 - [Configuration](#configuration)
 - [Storage contract and invariants](#storage-contract-and-invariants)
 - [Recommended workflows](#recommended-workflows)

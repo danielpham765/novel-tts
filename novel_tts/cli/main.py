@@ -532,6 +532,22 @@ def _build_parser() -> argparse.ArgumentParser:
     queue_requeue_untranslated_exhausted_parser = queue_sub.add_parser("requeue-untranslated-exhausted")
     queue_requeue_untranslated_exhausted_parser.add_argument("novel_id")
 
+    queue_remove_parser = queue_sub.add_parser("remove", help="Remove pending (non-inflight) jobs from the queue.")
+    queue_remove_parser.add_argument("novel_id")
+    queue_remove_group = queue_remove_parser.add_mutually_exclusive_group(required=True)
+    queue_remove_group.add_argument("--range", help="Chapter range to remove, e.g. 1401-1410")
+    queue_remove_group.add_argument(
+        "--chapters",
+        action="append",
+        default=[],
+        help="Chapter numbers to remove. Repeatable or comma-separated, e.g. --chapters 1205,1214",
+    )
+    queue_remove_group.add_argument(
+        "--all",
+        action="store_true",
+        help="Remove all pending (non-inflight) jobs from the queue.",
+    )
+
     tts_parser = subparsers.add_parser("tts")
     tts_parser.add_argument("novel_id")
     tts_parser.add_argument("--range")
@@ -865,6 +881,51 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Restart background quota-supervisor process (equivalent to --stop then -d).",
     )
 
+    glossary_parser = subparsers.add_parser("glossary")
+    glossary_sub = glossary_parser.add_subparsers(dest="glossary_command", required=True)
+
+    glossary_repair_parser = glossary_sub.add_parser(
+        "repair",
+        help="Chunk glossary and enqueue repair-glossary jobs in the queue.",
+    )
+    glossary_repair_parser.add_argument("novel_id")
+    glossary_repair_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=100,
+        metavar="N",
+        help="Number of glossary entries per job chunk (default: 100).",
+    )
+    glossary_repair_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Clear existing chunk outputs so all chunks are re-processed.",
+    )
+
+    glossary_repair_chunk_parser = glossary_sub.add_parser(
+        "repair-chunk",
+        help="Process a single repair-glossary chunk (called by queue workers).",
+    )
+    glossary_repair_chunk_parser.add_argument("novel_id")
+    glossary_repair_chunk_parser.add_argument("--chunk-index", type=int, required=True)
+
+    glossary_repair_merge_parser = glossary_sub.add_parser(
+        "repair-merge",
+        help="Merge all repaired chunk outputs back into the glossary file.",
+    )
+    glossary_repair_merge_parser.add_argument("novel_id")
+    glossary_repair_merge_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be merged without writing the file.",
+    )
+
+    glossary_repair_status_parser = glossary_sub.add_parser(
+        "repair-status",
+        help="Show progress of an in-progress glossary repair.",
+    )
+    glossary_repair_status_parser.add_argument("novel_id")
+
     ai_key_parser = subparsers.add_parser("ai-key")
     ai_key_sub = ai_key_parser.add_subparsers(dest="ai_key_command", required=True)
     ai_key_ps = ai_key_sub.add_parser("ps")
@@ -936,6 +997,9 @@ def _default_log_path(args) -> Path | None:
     elif command == "pipeline":
         pipeline_command = getattr(args, "pipeline_command", None) or "run"
         log_name = f"pipeline/{pipeline_command}.log"
+    elif command == "glossary":
+        glossary_command = getattr(args, "glossary_command", None) or "repair"
+        log_name = f"glossary/{glossary_command}.log"
     else:
         log_name = f"{command}.log"
 
@@ -1332,6 +1396,7 @@ def main(argv: list[str] | None = None) -> int:
                 launch_queue_stack,
                 list_all_queue_processes,
                 list_queue_processes,
+                remove_jobs_from_queue,
                 requeue_untranslated_exhausted_jobs,
                 run_status_monitor,
                 run_supervisor,
@@ -1488,6 +1553,121 @@ def main(argv: list[str] | None = None) -> int:
                 if config is None:
                     parser.error("queue requeue-untranslated-exhausted requires a novel_id")
                 return requeue_untranslated_exhausted_jobs(config)
+            if args.queue_command == "remove":
+                if config is None:
+                    parser.error("queue remove requires a novel_id")
+                if getattr(args, "all", False):
+                    return remove_jobs_from_queue(config, all_pending=True)
+                if getattr(args, "range", None):
+                    start, end = parse_range(args.range)
+                    return remove_jobs_from_queue(config, from_chapter=start, to_chapter=end)
+                raw_chapters = getattr(args, "chapters", None) or []
+                chapters: list[int] = []
+                for value in raw_chapters:
+                    for part in str(value).split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        try:
+                            chapters.append(int(part))
+                        except ValueError:
+                            parser.error(f"queue remove: invalid chapter: {part!r}")
+                if not chapters:
+                    parser.error("queue remove requires --all, --range, or --chapters")
+                return remove_jobs_from_queue(config, chapters=chapters)
+
+        if args.command == "glossary":
+            import redis as redis_lib
+            from novel_tts.translate.glossary_repair import (
+                enqueue_glossary_repair_jobs,
+                get_repair_status,
+                init_repair,
+                merge_repair_results,
+                repair_glossary_chunk,
+                save_chunk_result,
+            )
+
+            config = load_novel_config(args.novel_id)
+
+            if args.glossary_command == "repair":
+                chunk_size = int(getattr(args, "chunk_size", 100) or 100)
+                force = bool(getattr(args, "force", False))
+                meta = init_repair(config, chunk_size=chunk_size, force=force)
+                total_chunks = meta["total_chunks"]
+                LOGGER.info(
+                    "Glossary repair initialized | novel=%s entries=%d chunks=%d",
+                    config.novel_id,
+                    meta["total_entries"],
+                    total_chunks,
+                )
+                client = redis_lib.Redis(
+                    host=config.queue.redis.host,
+                    port=config.queue.redis.port,
+                    db=config.queue.redis.database,
+                    decode_responses=True,
+                )
+                enqueued = enqueue_glossary_repair_jobs(config, meta, client)
+                print(
+                    f"Glossary repair: {meta['total_entries']} entries → "
+                    f"{total_chunks} chunks (chunk_size={chunk_size}). "
+                    f"Enqueued {enqueued} new job(s)."
+                )
+                if enqueued == 0 and total_chunks > 0:
+                    status = get_repair_status(config)
+                    if status["pending_chunks"] == 0:
+                        print("All chunks already done. Run 'glossary repair-merge' to apply.")
+                    else:
+                        print(
+                            f"{status['done_chunks']}/{total_chunks} chunks done, "
+                            f"{status['pending_chunks']} pending (already inflight or exhausted)."
+                        )
+                return 0
+
+            if args.glossary_command == "repair-chunk":
+                chunk_index = args.chunk_index
+                repaired = repair_glossary_chunk(config, chunk_index)
+                out_path = save_chunk_result(config, chunk_index, repaired)
+                LOGGER.info(
+                    "Glossary chunk %d repaired: %d entries | saved to %s",
+                    chunk_index,
+                    len(repaired),
+                    _format_click_path(out_path),
+                )
+                return 0
+
+            if args.glossary_command == "repair-merge":
+                dry_run = bool(getattr(args, "dry_run", False))
+                gpath, merged = merge_repair_results(config, dry_run=dry_run)
+                if dry_run:
+                    print(f"[dry-run] Would write {len(merged)} entries to {gpath}")
+                else:
+                    LOGGER.info(
+                        "Glossary repair merged | novel=%s entries=%d path=%s",
+                        config.novel_id,
+                        len(merged),
+                        _format_click_path(gpath),
+                    )
+                    print(f"Merged {len(merged)} entries into {gpath}")
+                return 0
+
+            if args.glossary_command == "repair-status":
+                status = get_repair_status(config)
+                if not status["initialized"]:
+                    print(f"No repair in progress for {config.novel_id}. Run 'glossary repair' first.")
+                    return 1
+                done = status["done_chunks"]
+                total = status["total_chunks"]
+                pending = status["pending_chunks"]
+                bar_width = 40
+                filled = int(bar_width * done / max(1, total))
+                bar = "#" * filled + "-" * (bar_width - filled)
+                print(
+                    f"[{bar}] {done}/{total} chunks done "
+                    f"({pending} pending) | "
+                    f"{status['total_entries']} entries | "
+                    f"chunk_size={status['chunk_size']}"
+                )
+                return 0
 
         if args.command == "tts":
             from novel_tts.tts import regenerate_menu, run_tts
