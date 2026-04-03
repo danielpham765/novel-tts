@@ -31,6 +31,17 @@ models:
       glossary_model: 
       chunk_max_len: 5000
 
+crawl:
+  browser_debug:
+    mode: auto
+    remote_debugging_url: ''
+    remote_debugging_port: 9222
+    executable_path: "/snap/bin/chromium"
+    user_data_dir: ''
+    profile_directory: ''
+    headless: false
+    debug_image_dir: debug/img
+
 queue:
   redis:
     host: 127.0.0.1

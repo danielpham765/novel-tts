@@ -14,12 +14,12 @@ crawl:
   sources:
   - source_id: ttkan
     directory_url: https://cn.ttkan.co/novel/chapters/taixuzhizun-cangtianbazhu
-  - source_id: hjwzw
-    directory_url: https://tw.hjwzw.com/Book/Chapter/49948
+  # - source_id: hjwzw
+  #   directory_url: https://tw.hjwzw.com/Book/Chapter/49948
   - source_id: wa01
     directory_url: https://cn.wa01.com/novel/chapters/taixuzhizun-cangtianbazhu
-  - source_id: 1qxs
-    directory_url: https://m.1qxs.com/xs_1/86279
+  # - source_id: 1qxs
+  #   directory_url: https://m.1qxs.com/xs_1/86279
 translation:
   glossary_file: configs/glossaries/thai-hu-chi-ton.json
   blocked_glossary_targets:
