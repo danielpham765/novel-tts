@@ -537,6 +537,10 @@ def _placeholder_block(chapter_number: int, cfg: RepairConfig) -> str:
     return f"{title}\n\n{content}\n"
 
 
+def _placeholder_block_for_short_content(chapter_number: int) -> str:
+    return _placeholder_block(chapter_number, RepairConfig())
+
+
 def _insert_placeholders_into_batch(
     *,
     path: Path,
@@ -1993,6 +1997,22 @@ def _fetch_chapter(entry: ChapterEntry, config: NovelConfig, resolver, strategy_
                     )
                     parts.append(parsed.content)
                     effective_title = parsed.title
+                    break
+                if validation_error.startswith("content_too_short:"):
+                    placeholder_block = _placeholder_block_for_short_content(entry.chapter_number).strip()
+                    placeholder_title, _, placeholder_content = placeholder_block.partition("\n\n")
+                    LOGGER.warning(
+                        "Chapter content too short; using placeholder | novel=%s source=%s chapter=%s part=%s url=%s reason=%s placeholder_title=%s",
+                        config.novel_id,
+                        config.crawl.site_id,
+                        entry.chapter_number,
+                        part_index,
+                        result.final_url,
+                        validation_error,
+                        placeholder_title,
+                    )
+                    parts.append(placeholder_content.strip())
+                    effective_title = placeholder_title
                     break
                 LOGGER.warning(
                     "Invalid chapter content | novel=%s source=%s chapter=%s part=%s url=%s reason=%s attempt=%s/%s",
