@@ -255,6 +255,9 @@ Backward compatibility:
 #### `crawl run`
 
 ```bash
+# Crawl everything from chapter 1 to the latest remote chapter
+uv run novel-tts crawl run <novel_id> --all
+
 # Crawl a chapter range
 uv run novel-tts crawl run <novel_id> --range 1-10
 
@@ -270,6 +273,7 @@ uv run novel-tts crawl run <novel_id> --range 1-10 --force
 
 By default, `crawl run` skips chapters already present in local `input/<novel_id>/origin/*.txt` files.
 Use `--force` to recrawl those chapters.
+Use `--all` to auto-resolve the latest remote chapter and crawl `1..latest`.
 
 #### `crawl verify`
 

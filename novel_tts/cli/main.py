@@ -295,6 +295,11 @@ def _build_parser() -> argparse.ArgumentParser:
     crawl_sub = crawl_parser.add_subparsers(dest="crawl_command")
     crawl_run_parser = crawl_sub.add_parser("run")
     crawl_run_parser.add_argument("novel_id")
+    crawl_run_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Auto-resolve the latest remote chapter and crawl from chapter 1 through that chapter.",
+    )
     crawl_run_parser.add_argument("--from", dest="from_chapter", type=int)
     crawl_run_parser.add_argument("--to", dest="to_chapter", type=int)
     crawl_run_parser.add_argument("--range")
@@ -1155,16 +1160,36 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "crawl":
             from novel_tts.crawl import crawl_range, repair_crawled_content, verify_crawled_content
+            from novel_tts.crawl.service import discover_source_entries
 
             config = load_novel_config(args.novel_id)
             crawl_command = args.crawl_command or "run"
             if crawl_command == "run":
-                if args.range:
+                if bool(getattr(args, "all", False)):
+                    if args.range or args.from_chapter is not None or args.to_chapter is not None:
+                        parser.error("crawl run --all cannot be combined with --range, --from, or --to")
+                    discovery = discover_source_entries(
+                        config,
+                        config.source,
+                        fetch_all_pages=False,
+                        log_exceptions=True,
+                    )
+                    if discovery is None or discovery.latest_chapter < 1:
+                        raise RuntimeError(f"Unable to determine latest chapter for {config.novel_id}")
+                    start, end = 1, discovery.latest_chapter
+                    LOGGER.info(
+                        "Resolved crawl --all range | novel=%s source=%s range=%s-%s",
+                        config.novel_id,
+                        config.source.source_id,
+                        start,
+                        end,
+                    )
+                elif args.range:
                     start, end = parse_range(args.range)
                 else:
                     start, end = args.from_chapter, args.to_chapter
                     if (start is None) or (end is None):
-                        parser.error("crawl run requires --range or both --from and --to")
+                        parser.error("crawl run requires --all, --range, or both --from and --to")
                 outputs = crawl_range(
                     config,
                     start,
