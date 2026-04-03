@@ -62,3 +62,11 @@ def test_normalize_text_does_not_split_lowercase_camelcase() -> None:
 
     assert "iPhone" in out
     assert "i Phone" not in out
+
+
+def test_normalize_text_removes_tilde_characters() -> None:
+    raw = "Chương 1\n\nNàng~khẽ cười ~ rồi bước tới.\n"
+    out = normalize_text(raw, chapter_num="1")
+
+    assert "~" not in out
+    assert "Nàng khẽ cười rồi bước tới." in out

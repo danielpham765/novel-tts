@@ -44,3 +44,10 @@ media:
     line2: Tôi Bắt Đầu Với Thân Phận Của Một Phú Nhị Đại Siêu Giàu
     line3: Truyện Đô Thị, Trọng Sinh
   video: {}
+  media_batch:
+    default_chapter_batch_size: 10
+    chapter_batch_overrides:
+    - range: 1-1200
+      chapter_batch_size: 20
+    - range: 1201-2000
+      chapter_batch_size: 10

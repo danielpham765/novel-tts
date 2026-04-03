@@ -103,3 +103,12 @@ media:
     audio_codec: aac
     preset: veryfast
     audio_bitrate: 96k
+  media_batch:
+    default_chapter_batch_size: 10
+    chapter_batch_overrides:
+    - range: 1-2000
+      chapter_batch_size: 50
+    - range: 2001-2300
+      chapter_batch_size: 20
+    - range: 2301-2500
+      chapter_batch_size: 10

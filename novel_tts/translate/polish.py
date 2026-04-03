@@ -555,6 +555,7 @@ def normalize_text(
         text = _force_fold_heading_from_next_line(text, chapter_num)
     text = re.sub(r"loadAdv\(\d+,\s*\d+\);\s*", "", text)
     text = re.sub(r"[“\"]?Gỗ\.\.\.\s*Cố tổng", "“Cố tổng", text)
+    text = re.sub(r"[~～]+", " ", text)
     text = re.sub(r"([^\n])([“\"])", r"\1 \2", text)
     text = re.sub(r'(?m)^(chương)\s+(?=[“"\'(])', "", text)
     # Break glued narration/dialogue around closing quotes.

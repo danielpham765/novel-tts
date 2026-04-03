@@ -57,7 +57,8 @@ gpu-t4:
   hf_token: ""
 gpu:
   # Dùng backend GPU native để tránh kéo tải sang CPU như GGUF/CPU.
-  backbone: "VieNeu-TTS (GPU)"
+  # backbone: "VieNeu-TTS (GPU)"
+  backbone: "VieNeu-TTS-0.3B (GPU)"
   codec: "NeuCodec (Distill)"
   device: "CUDA"
   use_lmdeploy: true
