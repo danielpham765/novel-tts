@@ -692,6 +692,8 @@ class GeminiHttpProvider(TranslationProvider):
             raise RuntimeError(f"Missing GEMINI_API_KEY and no keys found in {key_path}")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         url_with_key = f"{url}?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        url_with_key = f"{url}?key={api_key}"
         body = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\n{prompt}".strip()}]}],
             "generationConfig": {"temperature": 0.2, "topP": 0.9},

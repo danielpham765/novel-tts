@@ -885,6 +885,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Clear existing chunk outputs so all chunks are re-processed.",
     )
+    glossary_repair_parser.add_argument(
+        "--glossary-file",
+        metavar="PATH",
+        default=None,
+        help="Override glossary file path (e.g. configs/glossaries/novel.auto.json).",
+    )
 
     glossary_repair_chunk_parser = glossary_sub.add_parser(
         "repair-chunk",
@@ -1596,7 +1602,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.glossary_command == "repair":
                 chunk_size = int(getattr(args, "chunk_size", 100) or 100)
                 force = bool(getattr(args, "force", False))
-                meta = init_repair(config, chunk_size=chunk_size, force=force)
+                glossary_file_override = getattr(args, "glossary_file", None) or None
+                meta = init_repair(config, chunk_size=chunk_size, force=force, glossary_path=glossary_file_override)
                 total_chunks = meta["total_chunks"]
                 LOGGER.info(
                     "Glossary repair initialized | novel=%s entries=%d chunks=%d",

@@ -166,6 +166,7 @@ def generate_visual(config: NovelConfig, start: int, end: int, force: bool = Fal
         [
             f"drawtext=text='{_esc_drawtext(f'Tập {episode_index}')}'{font_arg}:fontcolor=#FFD200:fontsize=48:borderw=4:bordercolor=black:x=10:y=35",
             f"drawtext=text='{_esc_drawtext(f'Chương {start} -> {end}')}'{font_arg}:fontcolor=white:fontsize=32:borderw=4:bordercolor=black:x=10:y=95",
+            # f"drawtext=text='{_esc_drawtext(f'Chương {start} -> Kết thúc')}'{font_arg}:fontcolor=white:fontsize=32:borderw=4:bordercolor=black:x=10:y=95",
             f"drawtext=text='{_esc_drawtext(config.media.visual.line1)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-200",
             f"drawtext=text='{_esc_drawtext(config.media.visual.line2)}'{font_arg}:fontcolor=#FFD200:fontsize=40:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-130",
             f"drawtext=text='{_esc_drawtext(config.media.visual.line3)}'{font_arg}:fontcolor=white:fontsize=30:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h-60",

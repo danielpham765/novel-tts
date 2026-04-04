@@ -11,6 +11,33 @@ from novel_tts.translate.novel import PLACEHOLDER_BROAD_RE
 
 LOGGER = get_logger(__name__)
 
+# Unicode line/paragraph separators → convert to newline to preserve structure.
+_LINE_SEP_RE = re.compile(r"[\u2028\u2029]")
+# Invisible/zero-width chars that add no content and can confuse TTS engines.
+_ZERO_WIDTH_RE = re.compile(r"[\u00AD\u200B\u200C\u200D\uFEFF]")
+# Non-standard space variants → normalize to regular ASCII space.
+_SPECIAL_SPACE_RE = re.compile(r"[\u00A0\u202F\u2009\u2007\u2008\u200A\u205F\u3000]")
+# Allowlist: printable ASCII + Vietnamese/Latin-Extended ranges + combining diacritics + whitespace.
+_INVALID_CHAR_RE = re.compile(
+    r"[^\n\r\t \x20-\x7E\u00C0-\u024F\u1E00-\u1EFF\u0300-\u036F]"
+)
+
+
+def _strip_invalid_chars(text: str) -> str:
+    """Strip hidden/stray characters that can break TTS.
+
+    Processing order:
+    1. Line/paragraph separators → newline (preserve structure).
+    2. Zero-width / invisible chars → deleted.
+    3. Non-standard spaces → regular space.
+    4. Anything outside Vietnamese+ASCII printable range → deleted.
+    """
+    text = _LINE_SEP_RE.sub("\n", text)
+    text = _ZERO_WIDTH_RE.sub("", text)
+    text = _SPECIAL_SPACE_RE.sub(" ", text)
+    return _INVALID_CHAR_RE.sub("", text)
+
+
 _ALLOWLIST_SINGLE_WORD_REPEATS = {
     # Common intentional emphasis/onomatopoeia in Vietnamese prose.
     "rất",
@@ -546,6 +573,7 @@ def normalize_text(
     *,
     force_title_fold: bool = False,
 ) -> str:
+    text = _strip_invalid_chars(text)
     text = text.replace("QZXBRQ", "\n\n")
     text = _normalize_heading(text, chapter_num)
     for src, dst in (replacements or {}).items():

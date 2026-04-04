@@ -48,15 +48,23 @@ def load_repair_meta(config: NovelConfig) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def init_repair(config: NovelConfig, chunk_size: int = DEFAULT_CHUNK_SIZE, *, force: bool = False) -> dict:
+def init_repair(
+    config: NovelConfig,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    *,
+    force: bool = False,
+    glossary_path: Path | str | None = None,
+) -> dict:
     """
     Chunk the glossary and write meta.json.
     Returns the meta dict with total_chunks.
 
     If force=True, removes existing chunk output files so all chunks are re-processed.
     Otherwise, existing chunk outputs are preserved (resume-friendly).
+
+    glossary_path overrides the path resolved from config (useful for .auto.json files).
     """
-    gpath = _resolve_glossary_path(config)
+    gpath = Path(glossary_path) if glossary_path else _resolve_glossary_path(config)
     if not gpath.exists():
         raise FileNotFoundError(f"Glossary not found: {gpath}")
 

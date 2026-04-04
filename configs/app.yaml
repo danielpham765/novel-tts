@@ -13,9 +13,23 @@ models:
   enabled_models:
   - gemini-3.1-flash-lite-preview
   - gemma-3-27b-it
+  # - gemma-4-31b-it
+  # - gemma-4-26b-it
   repair_model: gemma-3-27b-it
   glossary_model: 
   model_configs:
+    gemma-4-31b-it:
+      worker_count: 2
+      rpm_limit: 30
+      tpm_limit: 1500000
+      rpd_limit: 1500
+      chunk_max_len: 10000
+    gemma-4-26b-it:
+      worker_count: 2
+      rpm_limit: 30
+      tpm_limit: 1500000
+      rpd_limit: 1500
+      chunk_max_len: 10000
     gemma-3-27b-it:
       worker_count: 2
       rpm_limit: 30
