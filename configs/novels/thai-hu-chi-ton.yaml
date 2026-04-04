@@ -26,7 +26,7 @@ crawl:
     # Human-facing source page:
     # https://c1cb4a.bqg104.cc/#/book/188262/
 translation:
-  glossary_file: configs/glossaries/thai-hu-chi-ton.json
+  glossary_file: configs/glossaries/thai-hu-chi-ton/glossary.json
   blocked_glossary_targets:
   - Đào Phương Thần
   - Phù Phương Thần

@@ -20,7 +20,7 @@ crawl:
       - ".txtnav"
       - "#content"
 translation:
-  glossary_file: configs/glossaries/game.json
+  glossary_file: configs/glossaries/game/glossary.json
   line_token: QZXBRQ
   post_replacements: {}
   han_fallback_replacements: {}

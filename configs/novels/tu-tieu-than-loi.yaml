@@ -15,7 +15,7 @@ crawl:
   - source_id: ixdzs
     directory_url: https://ixdzs.hk/read/545646/
 translation:
-  glossary_file: configs/glossaries/tu-tieu-than-loi.json
+  glossary_file: configs/glossaries/tu-tieu-than-loi/glossary.json
   blocked_glossary_targets:
   line_token: QZXBRQ
   post_replacements:
@@ -62,9 +62,13 @@ media:
   media_batch:
     default_chapter_batch_size: 10
     chapter_batch_overrides:
-    - range: 1-2000
+    - range: 1-1100
       chapter_batch_size: 50
-    - range: 2001-2300
-      chapter_batch_size: 20
-    - range: 2301-2500
+    - range: 1101-1430
+      chapter_batch_size: 10
+    - range: 1431-1459  # P56
+      chapter_batch_size: 29
+    - range: 1460-1470  # P57
+      chapter_batch_size: 11
+    - range: 1471-2000
       chapter_batch_size: 10

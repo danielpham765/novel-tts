@@ -13,6 +13,8 @@ from ..types import ChapterEntry, ParsedChapter
 
 class IxdzsResolver(BaseResolver):
     source_id = "ixdzs"
+    _BOOK_PATH_PATTERN = re.compile(r"/read/(\d+)/?", re.I)
+    _CHAPTER_PATH_PATTERN = re.compile(r"/p(\d+)\.html", re.I)
     _NOISE_LINE_PATTERN = re.compile(
         r"(上一章|下一章|書籍頁|加入書架|看女頻小說每天能領現金紅包)",
         re.I,
@@ -21,30 +23,90 @@ class IxdzsResolver(BaseResolver):
     @staticmethod
     def _extract_book_id(base_url: str) -> str:
         parsed = urlparse(base_url)
-        match = re.search(r"/read/(\d+)/?", parsed.path)
+        match = IxdzsResolver._BOOK_PATH_PATTERN.search(parsed.path)
         return match.group(1) if match else ""
+
+    def _extract_book_id_from_soup(self, soup: BeautifulSoup, base_url: str) -> str:
+        book_id = self._extract_book_id(base_url)
+        if book_id:
+            return book_id
+
+        for selector in (
+            'meta[property="og:novel:read_url"]',
+            'meta[property="og:url"]',
+            'link[rel="alternate"][hreflang]',
+        ):
+            for node in soup.select(selector):
+                candidate = (node.get("content") or node.get("href") or "").strip()
+                match = self._BOOK_PATH_PATTERN.search(candidate)
+                if match:
+                    return match.group(1)
+
+        for anchor in soup.select('a[href*="/read/"]'):
+            href = (anchor.get("href") or "").strip()
+            match = self._BOOK_PATH_PATTERN.search(href)
+            if match:
+                return match.group(1)
+        return ""
+
+    def _extract_read_base_url(self, soup: BeautifulSoup, base_url: str, book_id: str) -> str:
+        if book_id:
+            direct_match = self._BOOK_PATH_PATTERN.search(base_url)
+            if direct_match and direct_match.group(1) == book_id:
+                return base_url
+
+        for selector in (
+            'meta[property="og:novel:read_url"]',
+            'meta[property="og:url"]',
+            'link[rel="alternate"][hreflang]',
+        ):
+            for node in soup.select(selector):
+                candidate = (node.get("content") or node.get("href") or "").strip()
+                match = self._BOOK_PATH_PATTERN.search(candidate)
+                if match and match.group(1) == book_id:
+                    return candidate
+
+        for anchor in soup.select('a[href*="/read/"]'):
+            href = (anchor.get("href") or "").strip()
+            match = self._BOOK_PATH_PATTERN.search(href)
+            if match and match.group(1) == book_id:
+                return href
+        return base_url
+
+    def _extract_latest_chapter(self, soup: BeautifulSoup) -> int:
+        latest = 0
+        for selector in (
+            'meta[property="og:novel:latest_chapter_url"]',
+            'meta[property="og:novel:latest_chapter_name"]',
+            ".sub-text-r",
+            ".n-text p",
+            ".u-chapter a",
+        ):
+            for node in soup.select(selector):
+                candidate = (
+                    node.get("content")
+                    if hasattr(node, "get")
+                    else None
+                ) or node.get_text(" ", strip=True)
+                if not candidate:
+                    continue
+                match = self._CHAPTER_PATH_PATTERN.search(candidate)
+                if match:
+                    latest = max(latest, int(match.group(1)))
+                    continue
+                parsed = parse_chapter_number(candidate)
+                if parsed:
+                    latest = max(latest, parsed)
+        return latest
 
     def parse_directory(self, html: str, base_url: str) -> dict[int, ChapterEntry]:
         soup = BeautifulSoup(html, "html.parser")
-        book_id = self._extract_book_id(base_url)
+        book_id = self._extract_book_id_from_soup(soup, base_url)
         if not book_id:
             return {}
+        read_base_url = self._extract_read_base_url(soup, base_url, book_id)
 
-        latest = 0
-        for url in (
-            soup.select_one('meta[property="og:novel:latest_chapter_url"]'),
-            soup.select_one('meta[property="og:url"]'),
-        ):
-            if not url:
-                continue
-            content = (url.get("content") or "").strip()
-            match = re.search(r"/p(\d+)\.html", content)
-            if match:
-                latest = max(latest, int(match.group(1)))
-
-        if latest <= 0:
-            title_node = soup.select_one(".sub-text-r")
-            latest = parse_chapter_number(title_node.get_text(" ", strip=True)) if title_node else 0
+        latest = self._extract_latest_chapter(soup)
         if latest <= 0:
             return {}
 
@@ -53,7 +115,7 @@ class IxdzsResolver(BaseResolver):
             entries[chapter_number] = ChapterEntry(
                 chapter_number=chapter_number,
                 title=f"第{chapter_number}章",
-                url=urljoin(base_url, f"/read/{book_id}/p{chapter_number}.html"),
+                url=urljoin(read_base_url, f"/read/{book_id}/p{chapter_number}.html"),
             )
         return entries
 

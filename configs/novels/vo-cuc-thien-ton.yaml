@@ -23,7 +23,7 @@ crawl:
       - ".chapter-content"
       - ".txtnav"
 translation:
-  glossary_file: configs/glossaries/vo-cuc-thien-ton.json
+  glossary_file: configs/glossaries/vo-cuc-thien-ton/glossary.json
   line_token: QZXBRQ
   post_replacements:
     bạn: ngươi

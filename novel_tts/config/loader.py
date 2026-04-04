@@ -59,7 +59,7 @@ def _source_config_path(source_id: str) -> Path:
 
 
 def _glossary_path(novel_id: str) -> Path:
-    return _root_dir() / "configs" / "glossaries" / f"{novel_id}.json"
+    return _root_dir() / "configs" / "glossaries" / novel_id / "glossary.json"
 
 
 def _auto_glossary_path(path: Path) -> Path:

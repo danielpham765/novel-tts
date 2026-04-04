@@ -41,7 +41,7 @@ crawl:
     debug_image_dir: debug/img
 
 translation:
-  glossary_file: configs/glossaries/example.json
+  glossary_file: configs/glossaries/example/glossary.json
   auto_update_glossary: true
   line_token: QZXBRQ
   post_replacements: {}

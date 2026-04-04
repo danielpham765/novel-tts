@@ -53,7 +53,7 @@ Source of truth: `docs/agents/context-map.yaml`
 - `configs/novels/<novel_id>.json` (required root)
 - `configs/sources/<source_id>.json`
 - `configs/app.yaml` (app-level defaults)
-- `configs/glossaries/<novel_id>.json`
+- `configs/glossaries/<novel_id>/glossary.json`
 - `configs/polish_replacement/common.json` + `configs/polish_replacement/<novel_id>.json`
 
 Result is a typed `NovelConfig` dataclass graph (`novel_tts/config/models.py`).

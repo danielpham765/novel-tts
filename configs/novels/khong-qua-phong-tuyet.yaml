@@ -11,7 +11,7 @@ storage:
   logs_dir: ".logs"
   tmp_dir: tmp
 translation:
-  glossary_file: configs/glossaries/khong-qua-phong-tuyet.json
+  glossary_file: configs/glossaries/khong-qua-phong-tuyet/glossary.json
   line_token: QZXBRQ
   post_replacements:
     bạn: ngươi

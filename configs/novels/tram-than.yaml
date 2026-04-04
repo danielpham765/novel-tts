@@ -15,7 +15,7 @@ crawl:
   - source_id: spudnovel
     directory_url: https://spudnovel.com/site/detail?id=3
 translation:
-  glossary_file: configs/glossaries/tram-than.json
+  glossary_file: configs/glossaries/tram-than/glossary.json
   line_token: QZXBRQ
   post_replacements: {}
   han_fallback_replacements: {}

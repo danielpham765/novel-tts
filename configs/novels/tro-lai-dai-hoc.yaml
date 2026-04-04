@@ -15,7 +15,7 @@ crawl:
   - source_id: ttkan
     directory_url: https://twkan.com/book/76284/index.html
 translation:
-  glossary_file: configs/glossaries/tro-lai-dai-hoc.json
+  glossary_file: configs/glossaries/tro-lai-dai-hoc/glossary.json
   line_token: QZXBRQ
   post_replacements: {}
   han_fallback_replacements: {}
