@@ -137,6 +137,8 @@ Workflow docs live in `docs/agents/codex/workflows/`.
 Current workflows:
 
 - `update-project-docs.md`
+- `create-image-prompts-from-opening-chapters.md`
+- `optimize-background-video.md`
 
 ## Main Modules
 
@@ -149,6 +151,7 @@ Dispatch only. Do not add business logic here unless argument parsing or orchest
 Current top-level command families include:
 
 - `crawl`, `translate`, `queue`
+- `background`
 - `tts`, `create-menu`, `visual`, `video`
 - `upload`, `youtube`
 - `pipeline`, `quota-supervisor`, `ai-key`

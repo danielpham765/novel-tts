@@ -501,6 +501,22 @@ uv run novel-tts tts <novel_id> --range 701-800 --re-generate-menu
 uv run novel-tts tts <novel_id> --re-generate-menu --all
 ```
 
+### Background
+
+Optimizes `image/<novel_id>/background.mp4` in place for lighter production assets while keeping the approved background-friendly quality profile.
+
+Behavior notes:
+
+- rewrites `background.mp4` in place after encoding to a temporary file
+- keeps only the main video stream
+- keeps the original resolution and frame rate
+- defaults to HEVC/H.265 with `CRF 24` and `preset slow`
+
+```bash
+uv run novel-tts background optimize <novel_id>
+uv run novel-tts background optimize <novel_id> --crf 24 --preset slow
+```
+
 ### Create Menu
 
 Builds or refreshes chapter menu files under `output/<novel_id>/subtitle/` from translated chapter headings without re-running TTS.

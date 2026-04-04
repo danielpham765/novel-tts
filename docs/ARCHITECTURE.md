@@ -93,6 +93,7 @@ Current top-level command families:
 - `crawl`
 - `translate`
 - `queue`
+- `background`
 - `tts`
 - `create-menu`
 - `visual`

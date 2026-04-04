@@ -532,6 +532,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Remove all pending (non-inflight) jobs from the queue.",
     )
 
+    background_parser = subparsers.add_parser("background")
+    background_sub = background_parser.add_subparsers(dest="background_command", required=True)
+    background_optimize_parser = background_sub.add_parser("optimize")
+    background_optimize_parser.add_argument("novel_id")
+    background_optimize_parser.add_argument(
+        "--crf",
+        type=int,
+        default=24,
+        help="HEVC CRF target for the rewritten background.mp4 (default: 24).",
+    )
+    background_optimize_parser.add_argument(
+        "--preset",
+        default="slow",
+        help="ffmpeg/x265 preset for the rewritten background.mp4 (default: slow).",
+    )
+
     tts_parser = subparsers.add_parser("tts")
     tts_parser.add_argument("novel_id")
     tts_parser.add_argument("--range")
@@ -972,6 +988,9 @@ def _default_log_path(args) -> Path | None:
             log_name = f"queue/workers/k{args.key_index}-{safe_model}.log"
         else:
             log_name = f"queue/{queue_command}.log"
+    elif command == "background":
+        background_command = getattr(args, "background_command", None) or "optimize"
+        log_name = f"media/background-{background_command}.log"
     elif command == "tts":
         log_name = "tts/tts.log"
     elif command == "visual":
@@ -1679,6 +1698,34 @@ def main(argv: list[str] | None = None) -> int:
                     f"chunk_size={status['chunk_size']}"
                 )
                 return 0
+
+        if args.command == "background":
+            from novel_tts.background import optimize_background_video
+
+            config = load_novel_config(args.novel_id)
+            if args.background_command != "optimize":
+                parser.error("background: unsupported subcommand")
+            result = optimize_background_video(
+                config,
+                crf=int(getattr(args, "crf", 24) or 24),
+                preset=str(getattr(args, "preset", "slow") or "slow"),
+            )
+            LOGGER.info(
+                "Optimized background video | path=%s original_size=%s optimized_size=%s saved=%s codec=%s bitrate=%s "
+                "resolution=%sx%s fps=%s duration=%.3f",
+                _format_click_path(result.path),
+                result.original_size_bytes,
+                result.optimized_size_bytes,
+                result.bytes_saved,
+                result.codec_name,
+                result.bitrate_bps,
+                result.width,
+                result.height,
+                result.frame_rate,
+                result.duration_seconds,
+            )
+            print(_format_click_path(result.path))
+            return 0
 
         if args.command == "tts":
             from novel_tts.tts import regenerate_menu, run_tts
