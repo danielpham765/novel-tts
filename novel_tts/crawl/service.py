@@ -1982,6 +1982,28 @@ def _fetch_chapter(entry: ChapterEntry, config: NovelConfig, resolver, strategy_
                 time.sleep(backoff)
                 continue
 
+            if parsed.chapter_number != entry.chapter_number:
+                corrected_url = resolver.correct_chapter_url(
+                    result.final_url,
+                    entry.chapter_number,
+                    parsed.chapter_number,
+                )
+                if corrected_url and corrected_url not in visited and corrected_url != url:
+                    LOGGER.warning(
+                        "Chapter number mismatch; retrying corrected URL | novel=%s source=%s expected=%s actual=%s from=%s to=%s attempt=%s/%s",
+                        config.novel_id,
+                        config.crawl.site_id,
+                        entry.chapter_number,
+                        parsed.chapter_number,
+                        result.final_url,
+                        corrected_url,
+                        attempt,
+                        max_attempts,
+                    )
+                    url = corrected_url
+                    time.sleep(0.1)
+                    continue
+
             if parsed.content.strip():
                 validation_error = _validate_chapter_content(parsed.title, parsed.content)
                 if validation_error is None:

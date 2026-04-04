@@ -203,6 +203,10 @@ def _parse_numbers(text: str) -> list[int]:
 
 def _source_id_for_url(url: str) -> str:
     lower = (url or "").lower()
+    if "ixdzs.hk" in lower or "ixdzs.tw" in lower or "ixdzs8.com" in lower:
+        return "ixdzs"
+    if "bqg104.cc" in lower:
+        return "bqg104"
     if "m.1qxs.com" in lower or ".1qxs.com" in lower:
         return "1qxs"
     if "wa01.com" in lower:

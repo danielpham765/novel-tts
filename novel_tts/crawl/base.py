@@ -23,6 +23,9 @@ class SourceResolver(Protocol):
     def find_next_part_url(self, html: str, current_url: str, chapter_number: int) -> str | None:
         ...
 
+    def correct_chapter_url(self, current_url: str, expected_chapter_number: int, actual_chapter_number: int) -> str | None:
+        ...
+
 
 class BaseResolver:
     source_id: str
@@ -37,6 +40,9 @@ class BaseResolver:
         raise NotImplementedError
 
     def find_next_part_url(self, html: str, current_url: str, chapter_number: int) -> str | None:
+        return None
+
+    def correct_chapter_url(self, current_url: str, expected_chapter_number: int, actual_chapter_number: int) -> str | None:
         return None
 
 

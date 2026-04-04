@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from .base import SourceResolver
 from .resolvers import (
+    Bqg104Resolver,
     HjwzwResolver,
+    IxdzsResolver,
     Novel543Resolver,
     OneQxsResolver,
     Shuba69Resolver,
@@ -28,7 +30,9 @@ class ResolverRegistry:
 
 def build_default_registry() -> ResolverRegistry:
     registry = ResolverRegistry()
+    registry.register(Bqg104Resolver())
     registry.register(HjwzwResolver())
+    registry.register(IxdzsResolver())
     registry.register(Novel543Resolver())
     registry.register(OneQxsResolver())
     registry.register(Shuba69Resolver())

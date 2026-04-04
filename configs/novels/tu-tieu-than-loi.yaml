@@ -1,58 +1,22 @@
 ---
-novel_id: thai-hu-chi-ton
-title: Thai Hu Chi Ton
-slug: thai-hu-chi-ton
+novel_id: tu-tieu-than-loi
+title: Tu Tieu Than Loi
+slug: tu-tieu-than-loi
 source_language: zh
 target_language: vi
 storage:
-  input_dir: input/thai-hu-chi-ton
-  output_dir: output/thai-hu-chi-ton
-  image_dir: image/thai-hu-chi-ton
+  input_dir: input/tu-tieu-than-loi
+  output_dir: output/tu-tieu-than-loi
+  image_dir: image/tu-tieu-than-loi
   logs_dir: ".logs"
   tmp_dir: tmp
 crawl:
   sources:
-
-  - source_id: ttkan
-    directory_url: https://cn.ttkan.co/novel/chapters/taixuzhizun-cangtianbazhu
-  - source_id: wa01
-    directory_url: https://cn.wa01.com/novel/chapters/taixuzhizun-cangtianbazhu
-  # - source_id: hjwzw
-  #   directory_url: https://tw.hjwzw.com/Book/Chapter/49948
-  # - source_id: 1qxs
-  #   directory_url: https://m.1qxs.com/xs_1/86279
-  # - source_id: bqg104
-  #   directory_url: https://c1cb4a.bqg104.cc/api/booklist?id=188262
-    # Human-facing source page:
-    # https://c1cb4a.bqg104.cc/#/book/188262/
+  - source_id: ixdzs
+    directory_url: https://ixdzs.hk/read/545646/
 translation:
-  glossary_file: configs/glossaries/thai-hu-chi-ton.json
+  glossary_file: configs/glossaries/tu-tieu-than-loi.json
   blocked_glossary_targets:
-  - Đào Phương Thần
-  - Phù Phương Thần
-  - Phu Quân Phương Thần
-  - Thiên Chu Phương Thần
-  - Từ Phương Thần
-  - Phương Thần Tà Nha
-  - Phương Thần Tông
-  - Thung Lũng Phương Thần
-  - Phương Thần Tiên Tử
-  - người phụ nữ của Phương Thần
-  - Phương Thần và nương
-  - Hỏa Phương Thần
-  - Bạch Phương Thần
-  - Lão Phương Thần
-  - Hứa Phương Thần
-  - Chung Phương Thần
-  - Mẫn Phương Thần
-  - Mạch Sát Phương Thần
-  - Lôi Đình Phương Thần
-  - Cao Phương Thần
-  - Lương Phương Thần
-  - Vân Hỏa Phương Thần
-  - Cụm Sao Sơn
-  - Không Thanh Chử
-  - tiên tử Vi
   line_token: QZXBRQ
   post_replacements:
     bạn: người
@@ -70,7 +34,7 @@ translation:
   chapter:
     chapter_regex: "^(?:第|Chuong\\s+)(\\d+)(?:章|:)\\s*([^\\n]*)"
     base_rules: |
-      Ngươi là chuyên gia dịch tiểu thuyết tu tiên, huyền huyễn mạng sang tiếng Việt.
+      Ngươi là chuyên gia dịch tiểu thuyết mạng sang tiếng Việt.
       Yêu cầu bắt buộc:
       - Chỉ trả về đúng phần nội dung đã dịch. Không giải thích. Không ghi chú.
       - Dịch mượt, tự nhiên, nghe như văn truyện.
@@ -85,14 +49,6 @@ translation:
       - Giữ nguyên thứ tự nội dung, không thêm bớt ý.
       - Tuyệt đối không phiên âm nửa Hán Việt nửa pinyin hay chữ đệm máy kiểu 'tha', 'ngã', 'nhĩ', 'liễu', 'thập ma', 'chẩm hội'. Nếu gặp chỗ khó thì vẫn phải diễn đạt thành tiếng Việt tự nhiên, không chép âm.
       - Phải giữ nguyên mọi token placeholder dạng ZXQ<digits>QXZ hoặc QZX<digits>QXZ (ví dụ ZXQ000QXZ) và token xuống dòng QZXBRQ; không tạo token mới; không đổi chữ số.
-  captions:
-    chunk_size: 120
-    chunk_concurrency: 1
-    request_timeout_ms: 90000
-    prompt_debug_dir: tmp/translate-captions-prompts
-    response_dump_dir: tmp/translate-captions-responses
-    input_file: caption_cn.srt
-    output_file: caption_vn.srt
 queue: {}
 tts: {}
 media:
@@ -100,14 +56,9 @@ media:
     background_video: background.mp4
     font_file: ''
     tag_text: Đan Tu Chân
-    line1: Thanh Niên Giả Câm Suốt 18 Năm
-    line2: Giấu Trong Người Hạt Giống Thái Hư Thần Thụ
-    line3: Thái Hư Chí Tôn
-  video:
-    video_codec: libx264
-    audio_codec: aac
-    preset: veryfast
-    audio_bitrate: 96k
+    line1: Thức Tỉnh Hệ Thống Tối Thượng Tử Tiêu Thần Lôi Cấp SSS
+    line2: Từ Phế Nhân Ta Hóa Bá Chủ Thiên Hạ
+    line3: Đô thị | Dị Năng | Hệ thống
   media_batch:
     default_chapter_batch_size: 10
     chapter_batch_overrides:
