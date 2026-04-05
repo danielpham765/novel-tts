@@ -792,3 +792,52 @@ def load_novel_config(novel_id: str) -> NovelConfig:
         upload=upload_cfg,
         pipeline=pipeline_cfg,
     )
+
+
+def load_queue_config() -> QueueConfig:
+    """Load the shared queue config from configs/app.yaml (queue + models sections).
+
+    This is used by global queue commands (supervisor, worker, launch, stop)
+    that are not tied to a specific novel.
+    """
+    app_raw = _load_app_config()
+
+    queue_raw = dict(app_raw.get("queue", {}) or {})
+    models_raw = dict(app_raw.get("models", {}) or {})
+
+    # Merge enabled_models and model_configs from models section into queue config.
+    if isinstance(models_raw.get("enabled_models"), list) and models_raw["enabled_models"]:
+        queue_raw["enabled_models"] = models_raw["enabled_models"]
+    if isinstance(models_raw.get("model_configs"), dict) and models_raw["model_configs"]:
+        queue_raw["model_configs"] = models_raw["model_configs"]
+
+    # Apply shared model defaults (repair_model, glossary_model) to model_configs.
+    models_glossary_model = _clean_text(models_raw.get("glossary_model", ""))
+    models_repair_model = _clean_text(models_raw.get("repair_model", ""))
+    raw_model_configs = queue_raw.get("model_configs", {})
+    if isinstance(raw_model_configs, dict):
+        for _cfg in raw_model_configs.values():
+            if not isinstance(_cfg, dict):
+                continue
+            if models_glossary_model and not str(_cfg.get("glossary_model", "")).strip():
+                _cfg["glossary_model"] = models_glossary_model
+            if models_repair_model and not str(_cfg.get("repair_model", "")).strip():
+                _cfg["repair_model"] = models_repair_model
+
+    normalized = _normalize_queue_config(queue_raw, strict=True)
+    raw_model_configs = normalized.pop("model_configs", {})
+    queue_model_configs = {
+        model: QueueModelConfig(**cfg) for model, cfg in raw_model_configs.items() if isinstance(cfg, dict)
+    }
+    return QueueConfig(
+        redis=RedisConfig(**normalized.pop("redis", {})),
+        model_configs=queue_model_configs,
+        **normalized,
+    )
+
+
+def load_proxy_gateway_config() -> ProxyGatewayConfig:
+    """Load proxy gateway config from configs/app.yaml."""
+    app_raw = _load_app_config()
+    proxy_raw = dict(app_raw.get("proxy_gateway", {}) or {})
+    return ProxyGatewayConfig(**proxy_raw)

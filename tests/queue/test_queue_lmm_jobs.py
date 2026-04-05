@@ -92,11 +92,12 @@ def _write_part_ch1(config: NovelConfig, origin_path: Path) -> Path:
     return part_path
 
 
-def test_job_id_parsing_legacy_and_captions() -> None:
-    assert translation_queue._parse_job_id("file.txt::0005") == ("file.txt", "5")
-    assert translation_queue._is_captions_job("captions") is True
-    assert translation_queue._is_captions_job("CAPTIONS") is True
-    assert translation_queue._is_captions_job("file.txt::0005") is False
+def test_job_id_parsing_and_captions() -> None:
+    assert translation_queue._parse_job_id("novel::file.txt::0005") == ("novel", "file.txt", "5")
+    assert translation_queue._is_captions_job("novel::captions") is True
+    assert translation_queue._is_captions_job("novel::CAPTIONS") is False  # case-sensitive
+    assert translation_queue._is_captions_job("novel::file.txt::0005") is False
+    assert translation_queue._extract_novel_id("novel::file.txt::0005") == "novel"
 
 
 def test_chapter_needs_work_glossary_pending(tmp_path: Path) -> None:

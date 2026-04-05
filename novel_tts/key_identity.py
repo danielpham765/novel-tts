@@ -20,3 +20,11 @@ def build_key_prefix(*, prefix: str, novel_id: str, raw_key: str) -> str:
         raise ValueError("novel_id is required")
     return f"{safe_prefix}:{safe_novel_id}:{key_token_from_raw(raw_key)}"
 
+
+def build_global_key_prefix(*, prefix: str, raw_key: str) -> str:
+    """Build a key prefix without novel_id for shared (cross-novel) rate limit keys."""
+    safe_prefix = str(prefix or "").strip()
+    if not safe_prefix:
+        raise ValueError("prefix is required")
+    return f"{safe_prefix}:{key_token_from_raw(raw_key)}"
+

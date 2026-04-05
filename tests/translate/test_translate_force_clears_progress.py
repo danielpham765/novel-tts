@@ -45,6 +45,10 @@ def test_translate_chapter_force_clears_progress(monkeypatch, tmp_path: Path) ->
 
     out = novel_mod.translate_chapter(cfg, source_path, "1", force=True)
 
-    assert set(cleared) == {"chuong_1-10.txt__1", "placeholders__chuong_1-10.txt__1"}
+    assert set(cleared) == {
+        "chuong_1-10.txt__1",
+        "placeholders__chuong_1-10.txt__1",
+        "translated_stage__chuong_1-10.txt__1",
+    }
     assert out.exists()
     assert out.read_text(encoding="utf-8") == "ok\n"

@@ -14,6 +14,7 @@ from novel_tts.crawl.service import config_with_source, discover_source_entries
 from novel_tts.media import create_video, generate_visual
 from novel_tts.media_batch import collect_media_batch_ranges, media_range_key
 from novel_tts.queue import add_jobs_to_queue, launch_queue_stack, wait_for_range_completion
+from novel_tts.config.loader import load_queue_config
 from novel_tts.translate import polish_translations
 from novel_tts.translate.repair import enqueue_repair_jobs, find_repair_jobs_in_range
 from novel_tts.tts import run_tts
@@ -358,7 +359,7 @@ def _process_novel(
         LOGGER.info("Watch crawl start | novel=%s range=%s-%s", config.novel_id, crawl_start, crawl_end)
         crawl_range(source_bound_config, crawl_start, crawl_end, source_configs=source_configs)
         if not skip_translate:
-            launch_queue_stack(source_bound_config, restart=effective_restart_queue, add_queue=False)
+            launch_queue_stack(load_queue_config(), restart=effective_restart_queue, add_queue=False)
             add_jobs_to_queue(source_bound_config, crawl_start, crawl_end)
             wait_for_range_completion(source_bound_config, crawl_start, crawl_end)
         if not skip_repair:

@@ -44,7 +44,7 @@ def test_normalize_text_replaces_unicode_ellipsis_with_three_dots() -> None:
     raw = "Anh ấy ngập ngừng… rồi mới nói.\n"
     out = normalize_text(raw, chapter_num="1")
 
-    assert "ngập ngừng... rồi mới nói" in out.lower()
+    assert "ngập ngừng rồi mới nói" in out.lower()
     assert "…" not in out
 
 

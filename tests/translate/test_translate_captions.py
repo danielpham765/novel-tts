@@ -93,9 +93,15 @@ def test_translate_captions_prompt_is_natural_and_updates_glossary(tmp_path: Pat
                 return json.dumps({"阿伟": "A Vỹ"}, ensure_ascii=False)
             return json.dumps({"translations": ["A Vỹ đến rồi!"]}, ensure_ascii=False)
 
+    glossary_updates: list[tuple[str, str]] = []
     dummy_provider = _DummyProvider()
     monkeypatch.setattr(captions_translate, "get_translation_provider", lambda _name, *, config=None: dummy_provider)
     monkeypatch.setattr(novel_translate, "get_translation_provider", lambda _name, *, config=None: dummy_provider)
+    monkeypatch.setattr(
+        captions_translate,
+        "update_glossary_from_chapter",
+        lambda _cfg, source_text, translated_text: glossary_updates.append((source_text, translated_text)),
+    )
 
     out_path = captions_translate.translate_captions(config)
 
@@ -107,10 +113,7 @@ def test_translate_captions_prompt_is_natural_and_updates_glossary(tmp_path: Pat
     assert "GLOSSARY:" in first_prompt
     assert "- 阿伟 = A Vỹ" in first_prompt
 
-    glossary_path = config.storage.root / "configs" / "glossaries" / "captions-only.json"
-    assert glossary_path.exists()
-    glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
-    assert glossary.get("阿伟") == "A Vỹ"
+    assert glossary_updates == [("阿伟来了", "A Vỹ đến rồi!")]
 
 
 def test_translate_captions_skips_glossary_update_in_queue_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

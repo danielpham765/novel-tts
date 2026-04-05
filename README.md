@@ -186,8 +186,8 @@ uv run novel-tts quota-supervisor
 # or:
 uv run novel-tts quota-supervisor -d
 
-# 4) Launch queue stack for a novel
-uv run novel-tts queue launch <novel_id>
+# 4) Launch the shared queue stack
+uv run novel-tts queue launch
 
 # 5) Enqueue chapters for translation
 uv run novel-tts queue add <novel_id> --range <start>-<end>
@@ -195,8 +195,9 @@ uv run novel-tts queue add <novel_id> --range <start>-<end>
 uv run novel-tts queue add <novel_id> --all
 
 # 6) Monitor progress
-uv run novel-tts queue monitor <novel_id>
+uv run novel-tts queue monitor
 uv run novel-tts queue ps <novel_id>
+uv run novel-tts queue ps-all
 
 # 7) TTS + media
 uv run novel-tts tts <novel_id> --range <start>-<end>
@@ -361,11 +362,19 @@ Queue translation produces the same on-disk artifacts as direct translation:
 - `.parts`
 - rebuilt `translated` batch files
 
+The queue runtime is now shared across all novels.
+
 `queue launch` reads `.secrets/gemini-keys.txt` and spawns:
 
 - a supervisor
 - a status monitor
 - workers for configured models/keys
+
+Workers pick jobs from one shared Redis queue and load the matching `NovelConfig` per job based on the job id prefix:
+
+- chapter job: `{novel_id}::{file_name}::{chapter}`
+- captions job: `{novel_id}::captions`
+- glossary repair job: `{novel_id}::repair-glossary::{chunk}`
 
 Queue workers use the centralized quota gate (central quota v2) to coordinate rate-limit and quota waits across processes.
 
@@ -392,23 +401,33 @@ uv run novel-tts quota-supervisor --restart
 Process-control commands manage running queue processes.
 
 ```bash
-# Launch queue stack
-uv run novel-tts queue launch <novel_id>
-uv run novel-tts queue launch <novel_id> --restart
-uv run novel-tts queue launch <novel_id> --add-queue
+# Launch or restart the shared queue stack
+uv run novel-tts queue launch
+uv run novel-tts queue launch --restart
+
+# Launch and immediately enqueue one or more novels
+uv run novel-tts queue launch --add-queue --novel <novel_id>
+uv run novel-tts queue launch --add-queue --novel <novel_a> --novel <novel_b>
 
 # Monitor/status
-uv run novel-tts queue monitor <novel_id>
+uv run novel-tts queue monitor
 uv run novel-tts queue ps <novel_id>
 uv run novel-tts queue ps <novel_id> --all
 uv run novel-tts queue ps-all
 uv run novel-tts queue ps-all --all -f
 
-# Stop queue processes for a novel
-uv run novel-tts queue stop <novel_id>
-uv run novel-tts queue stop <novel_id> --role supervisor,worker
-uv run novel-tts queue stop <novel_id> --pid 1234
+# Stop shared queue processes
+uv run novel-tts queue stop
+uv run novel-tts queue stop --role supervisor,worker
+uv run novel-tts queue stop --pid 1234
 ```
+
+Behavior notes:
+
+- `queue launch`, `queue supervisor`, `queue monitor`, `queue worker`, `queue stop`, and `queue reset-key` are global
+- `queue add`, `queue remove`, `queue repair`, `queue requeue-untranslated-exhausted`, `queue drain`, and `queue ps` still target one novel
+- `queue ps-all` shows one consolidated table for the shared worker pool plus a per-novel summary
+- shared queue logs live under `.logs/_shared/queue/`
 
 #### Queue scheduling commands
 
@@ -435,10 +454,10 @@ uv run novel-tts queue add <novel_id> --all
 Reset per-key Redis state when a key gets stuck in cooldown/quota/throttle state.
 
 ```bash
-uv run novel-tts queue reset-key <novel_id> --key k5
-uv run novel-tts queue reset-key <novel_id> --key k5 --model gemini-3.1-flash-lite-preview
-uv run novel-tts queue reset-key <novel_id> --key k5,k6 --model gemma-3-27b-it,gemma-3-12b-it
-uv run novel-tts queue reset-key <novel_id> --all
+uv run novel-tts queue reset-key --key k5
+uv run novel-tts queue reset-key --key k5 --model gemini-3.1-flash-lite-preview
+uv run novel-tts queue reset-key --key k5,k6 --model gemma-3-27b-it,gemma-3-12b-it
+uv run novel-tts queue reset-key --all
 ```
 
 #### `queue repair`
@@ -452,7 +471,7 @@ Typical reasons:
 - missing or empty parts
 - stale parts where origin is newer
 
-If you do not see changes on disk after running this, ensure the queue stack is running and watch progress via `queue monitor`.
+If you do not see changes on disk after running this, ensure the shared queue stack is running and watch progress via `queue monitor` or `queue ps <novel_id>`.
 
 ```bash
 uv run novel-tts queue repair <novel_id> --range 1401-1410
@@ -475,6 +494,14 @@ Removes pending jobs from Redis without touching inflight work or on-disk transl
 uv run novel-tts queue remove <novel_id> --range 1401-1410
 uv run novel-tts queue remove <novel_id> --chapters 1205,1214
 uv run novel-tts queue remove <novel_id> --all
+```
+
+#### `queue drain`
+
+Removes all pending jobs for one novel from the shared queue without touching inflight jobs or on-disk translations.
+
+```bash
+uv run novel-tts queue drain <novel_id>
 ```
 
 ### Glossary
@@ -816,7 +843,7 @@ uv run novel-tts pipeline watch <novel_id> --from-stage tts --to-stage upload
   - `uv run novel-tts quota-supervisor`
   - or `uv run novel-tts quota-supervisor -d`
 - if a specific key gets stuck in cooldown/quota state:
-  - `uv run novel-tts queue reset-key <novel_id> --key kN [--model ...]`
+  - `uv run novel-tts queue reset-key --key kN [--model ...]`
 - if translated outputs look poisoned:
   - `uv run novel-tts queue repair <novel_id> --range <start>-<end>`
 

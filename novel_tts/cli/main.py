@@ -376,9 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     queue_parser = subparsers.add_parser("queue")
     queue_sub = queue_parser.add_subparsers(dest="queue_command", required=True)
     queue_supervisor_parser = queue_sub.add_parser("supervisor")
-    queue_supervisor_parser.add_argument("novel_id")
     queue_monitor_parser = queue_sub.add_parser("monitor")
-    queue_monitor_parser.add_argument("novel_id")
     queue_ps_parser = queue_sub.add_parser("ps")
     queue_ps_parser.add_argument("novel_id")
     queue_ps_parser.add_argument(
@@ -418,7 +416,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Watch mode (refresh every 1s). Ctrl+P to pause/resume, Ctrl+C to stop.",
     )
     queue_reset_key_parser = queue_sub.add_parser("reset-key")
-    queue_reset_key_parser.add_argument("novel_id")
     queue_reset_key_group = queue_reset_key_parser.add_mutually_exclusive_group(required=True)
     queue_reset_key_group.add_argument(
         "--key",
@@ -443,6 +440,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Defaults to all queue.enabled_models for the selected key(s)."
         ),
     )
+    queue_drain_parser = queue_sub.add_parser("drain")
+    queue_drain_parser.add_argument("novel_id")
 
     queue_repair_parser = queue_sub.add_parser("repair")
     queue_repair_parser.add_argument("novel_id")
@@ -457,7 +456,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Scan all chapters in origin files and enqueue only the ones that likely need repair.",
     )
     queue_stop_parser = queue_sub.add_parser("stop")
-    queue_stop_parser.add_argument("novel_id")
     queue_stop_parser.add_argument(
         "--pid",
         action="append",
@@ -480,16 +478,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Immediately SIGTERM all processes instead of waiting for current jobs to finish.",
     )
     queue_worker_parser = queue_sub.add_parser("worker")
-    queue_worker_parser.add_argument("novel_id")
     queue_worker_parser.add_argument("--key-index", type=int, required=True)
     queue_worker_parser.add_argument("--model", required=True)
     queue_launch_parser = queue_sub.add_parser("launch")
-    queue_launch_parser.add_argument("novel_id")
     queue_launch_parser.add_argument("--restart", action="store_true")
     queue_launch_parser.add_argument(
         "--add-queue",
         action="store_true",
         help="Scan origin files and enqueue all chapters that still need translation.",
+    )
+    queue_launch_parser.add_argument(
+        "--novel",
+        action="append",
+        default=[],
+        help="Novel ID(s) to enqueue when using --add-queue. Repeatable.",
     )
 
     queue_add_parser = queue_sub.add_parser("add")
@@ -1422,6 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
                 add_all_jobs_to_queue,
                 add_chapters_to_queue,
                 add_jobs_to_queue,
+                drain_novel_from_queue,
                 launch_queue_stack,
                 list_all_queue_processes,
                 list_queue_processes,
@@ -1434,17 +1437,16 @@ def main(argv: list[str] | None = None) -> int:
                 stop_queue_processes,
             )
             from novel_tts.translate.repair import enqueue_repair_jobs, find_repair_jobs_all, find_repair_jobs_in_range
+            from novel_tts.config.loader import load_queue_config
 
             novel_id = getattr(args, "novel_id", None)
             config = load_novel_config(novel_id) if novel_id else None
+            # Shared queue commands use QueueConfig (no novel_id).
+            queue_config = load_queue_config()
             if args.queue_command == "supervisor":
-                if config is None:
-                    parser.error("queue supervisor requires a novel_id")
-                return run_supervisor(config)
+                return run_supervisor(queue_config)
             if args.queue_command == "monitor":
-                if config is None:
-                    parser.error("queue monitor requires a novel_id")
-                return run_status_monitor(config)
+                return run_status_monitor(queue_config)
             if args.queue_command == "ps":
                 if config is None:
                     parser.error("queue ps requires a novel_id")
@@ -1464,17 +1466,19 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 return list_all_queue_processes(include_all=include_all)
             if args.queue_command == "reset-key":
-                if config is None:
-                    parser.error("queue reset-key requires a novel_id")
                 try:
                     return reset_queue_key_state(
-                        config,
+                        queue_config,
                         key_selectors=(getattr(args, "key", None) or []),
                         all_keys=bool(getattr(args, "all", False)),
                         model_selectors=(getattr(args, "model", None) or []),
                     )
                 except ValueError as exc:
                     parser.error(str(exc))
+            if args.queue_command == "drain":
+                if config is None:
+                    parser.error("queue drain requires a novel_id")
+                return drain_novel_from_queue(config)
             if args.queue_command == "repair":
                 if config is None:
                     parser.error("queue repair requires a novel_id")
@@ -1503,8 +1507,6 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"... and {len(jobs) - 50} more")
                 return enqueue_repair_jobs(config, jobs, label="queue repair")
             if args.queue_command == "stop":
-                if config is None:
-                    parser.error("queue stop requires a novel_id")
                 raw_pids = getattr(args, "pid", None) or []
                 pids: list[int] | None = None
                 if raw_pids:
@@ -1531,19 +1533,21 @@ def main(argv: list[str] | None = None) -> int:
                                 roles.append(part)
                 force = bool(getattr(args, "force", False))
                 return stop_queue_processes(
-                    config,
+                    queue_config,
                     pids=pids,
                     roles=roles,
                     force=force,
                 )
             if args.queue_command == "worker":
-                if config is None:
-                    parser.error("queue worker requires a novel_id")
-                return run_worker(config, key_index=args.key_index, model=args.model)
+                return run_worker(queue_config, key_index=args.key_index, model=args.model)
             if args.queue_command == "launch":
-                if config is None:
-                    parser.error("queue launch requires a novel_id")
-                return launch_queue_stack(config, restart=args.restart, add_queue=bool(getattr(args, "add_queue", False)))
+                novel_ids = getattr(args, "novel", None) or []
+                return launch_queue_stack(
+                    queue_config,
+                    restart=args.restart,
+                    add_queue=bool(getattr(args, "add_queue", False)),
+                    add_queue_novel_ids=novel_ids or None,
+                )
             if args.queue_command == "add":
                 if config is None:
                     parser.error("queue add requires a novel_id")

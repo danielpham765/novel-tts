@@ -79,7 +79,22 @@ Translation is chapter-granular even when crawl inputs are batch-granular.
 
 ### Queue mode (preferred for production)
 
-Workers spawn `python -m novel_tts translate chapter ...` subprocesses. Exit codes `75` (rate-limit) and `76` (quota gate) feed back into worker retry/hold logic. The global `quota-supervisor` process coordinates RPM/TPM/RPD across all workers via Redis Lua-based grant logic—run it whenever queue workers are active.
+All novels share **one queue, one supervisor, one set of workers**. Workers pick any job from the shared queue and load the appropriate `NovelConfig` per job (60s LRU cache).
+
+**Job ID format:** `{novel_id}::{file}::{chapter}` (e.g. `tram-than::book1.txt::0042`)
+
+**Redis key layout:**
+- Global keys (shared): `{prefix}:pending`, `{prefix}:queued`, `{prefix}:inflight`, `{prefix}:force`, `{prefix}:stopping`
+- Per-novel keys: `{prefix}:novel:{novel_id}:done`, `{prefix}:novel:{novel_id}:retries`, etc.
+- Rate-limit/quota keys: indexed by worker key slot, not by novel
+
+**CLI commands** (`queue supervisor/monitor/worker/launch/stop/reset-key`) no longer take a novel_id positional arg. Use `queue launch --novel <id>` to enqueue jobs for a novel on start.
+
+**`queue ps-all` output:** Global stats header → per-novel done/retries lines → single unified worker table.
+
+Workers spawn `python -m novel_tts translate chapter <novel_id> ...` subprocesses. Exit codes `75` (rate-limit) and `76` (quota gate) feed back into worker retry/hold logic. The global `quota-supervisor` process coordinates RPM/TPM/RPD across all workers via Redis Lua-based grant logic—run it whenever queue workers are active.
+
+**Shared log dir:** `.logs/_shared/queue/` (supervisor, monitor, workers all log here)
 
 ### Heading format contract
 

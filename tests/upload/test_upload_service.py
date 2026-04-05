@@ -48,6 +48,32 @@ def _patch_default_youtube_client(monkeypatch: pytest.MonkeyPatch, client) -> No
     monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda _account: client)
 
 
+def _patch_youtube_account_ordering(monkeypatch: pytest.MonkeyPatch, accounts) -> None:
+    chosen = accounts[0]
+    monkeypatch.setattr(
+        "novel_tts.upload.service._get_or_refresh_youtube_quota_for_slot",
+        lambda _slot: {
+            "remaining": 100_000,
+            "current_usage": 0,
+            "effective_limit": 100_000,
+        },
+    )
+    monkeypatch.setattr("novel_tts.upload.service._sync_or_estimate_after_spend", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "novel_tts.upload.service._order_youtube_accounts_for_upload",
+        lambda _config, _spec, *, force=False: (
+            list(accounts),
+            {
+                "chosen_slot": chosen.index,
+                "chosen_label": chosen.label,
+                "required_quota": 0,
+                "estimate": {},
+                "quota_by_slot": [],
+            },
+        ),
+    )
+
+
 def _make_config(tmp_path: Path) -> NovelConfig:
     root = tmp_path
     storage = StorageConfig(
@@ -114,10 +140,11 @@ def _prepare_translated_file(config: NovelConfig, *, range_key: str = "chuong_1-
     (config.storage.translated_dir / f"{range_key}.txt").write_text("Noi dung", encoding="utf-8")
 
 
-def test_run_upload_youtube_dry_run_builds_metadata(tmp_path: Path) -> None:
+def test_run_upload_youtube_dry_run_builds_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _make_config(tmp_path)
     _prepare_output_files(config)
-
+    account = type("Account", (), {"index": 1, "label": "account-1"})()
+    _patch_youtube_account_ordering(monkeypatch, [account])
     result = run_upload(config, 1, 10, platform="youtube", dry_run=True)
 
     assert result["platform"] == "youtube"
@@ -145,12 +172,13 @@ def test_run_upload_tiktok_dry_run(tmp_path: Path) -> None:
     assert result["status"] == "dry-run"
 
 
-def test_run_upload_youtube_dry_run_does_not_require_media_files(tmp_path: Path) -> None:
+def test_run_upload_youtube_dry_run_does_not_require_media_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _make_config(tmp_path)
     _prepare_output_files(config)
     (config.storage.video_dir / "chuong_1-10.mp4").unlink()
     (config.storage.visual_dir / "chuong_1-10.png").unlink()
-
+    account = type("Account", (), {"index": 1, "label": "account-1"})()
+    _patch_youtube_account_ordering(monkeypatch, [account])
     result = run_upload(config, 1, 10, platform="youtube", dry_run=True)
 
     assert result["status"] == "dry-run"
@@ -349,7 +377,7 @@ def test_run_upload_youtube_rotates_account_on_quota_exceeded_before_video_inser
         "account-1": _YoutubeClient("account-1"),
         "account-2": _YoutubeClient("account-2"),
     }
-    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    _patch_youtube_account_ordering(monkeypatch, accounts)
     monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda account: clients[account.label])
 
     result = run_upload(config, 1, 10, platform="youtube", dry_run=False)
@@ -444,7 +472,7 @@ def test_run_upload_youtube_uses_selected_fixed_account_and_logs_it(
         "account-1": _YoutubeClient("account-1"),
         "account-2": _YoutubeClient("account-2"),
     }
-    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    _patch_youtube_account_ordering(monkeypatch, [accounts[1]])
     monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda account: clients[account.label])
 
     result = run_upload(config, 1, 10, platform="youtube", dry_run=False)
@@ -543,7 +571,7 @@ def test_run_upload_youtube_skips_when_title_already_exists_in_playlist(
             return _ThumbnailsResource()
 
     accounts = [type("Account", (), {"index": 1, "label": "account-1"})()]
-    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    _patch_youtube_account_ordering(monkeypatch, accounts)
     monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda _account: _YoutubeClient())
 
     result = run_upload(config, 1, 10, platform="youtube", dry_run=False)
@@ -635,7 +663,7 @@ def test_run_upload_youtube_force_uploads_even_when_title_exists_in_playlist(
             return _ThumbnailsResource()
 
     accounts = [type("Account", (), {"index": 1, "label": "account-1"})()]
-    monkeypatch.setattr("novel_tts.upload.service._youtube_accounts_from_config", lambda _config: accounts)
+    _patch_youtube_account_ordering(monkeypatch, accounts)
     monkeypatch.setattr("novel_tts.upload.service._build_youtube_client_for_account", lambda _account: _YoutubeClient())
 
     result = run_upload(config, 1, 10, platform="youtube", dry_run=False, force=True)
