@@ -73,8 +73,8 @@ When answering questions or making edits, **anchor your reasoning** to these fil
 - **Sources**:
   - `configs/novels/<novel>.yaml`
   - `configs/sources/<source>.json`
-  - `configs/app.yaml`
-  - `configs/glossaries/<novel>.json` (or explicit glossary file)
+  - `configs/app.yaml` and optional `configs/app.local.yaml`
+  - `configs/glossaries/<novel>/glossary.json` (or explicit glossary file)
   - selected environment variables
 - **Dataclass root**: `NovelConfig` with key sections:
   - `storage`, `crawl`, `crawl.browser_debug`, `models`, `translation`, `captions`, `queue`, `tts`, `media`, `media.visual`, `media.video`, `media.media_batch`, `upload`, `pipeline`, `proxy_gateway`
@@ -105,7 +105,7 @@ When modifying behavior, **preserve these directory and filename contracts** or 
 
 - File: `novel_tts/cli/main.py`
 - Role: thin dispatcher:
-  - Parses commands: `crawl`, `translate`, `queue`, `ai-key`, `quota-supervisor`, `tts`, `create-menu`, `visual`, `video`, `upload`, `youtube`, `pipeline`.
+  - Parses commands: `crawl`, `translate`, `queue`, `background`, `glossary`, `ai-key`, `quota-supervisor`, `tts`, `create-menu`, `visual`, `video`, `upload`, `youtube`, `pipeline`.
   - Computes default log file (`_default_log_path`).
   - Loads `NovelConfig` and calls the right service function.
   - Keeps backward compatibility for old `crawl <novel>` syntax.
@@ -147,6 +147,7 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Enqueue jobs in Redis (`pending/queued/inflight/retries/done`).
   - Spawn workers that run `python -m novel_tts translate chapter ...`.
   - Optionally enqueue a special captions job id: `captions` (runs `translate captions`).
+  - Also carry chunked glossary repair jobs launched by `glossary repair`.
   - Enable the central quota gate for translate subprocesses (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`).
   - Re-enqueue suspicious translated chapters via `queue repair`.
   - Recover exhausted-but-still-untranslated jobs via `queue requeue-untranslated-exhausted`.
@@ -185,6 +186,14 @@ When modifying behavior, **preserve these directory and filename contracts** or 
   - Provide TikTok dry-run validation.
   - Expose YouTube playlist/video admin commands plus quota capture/read helpers.
   - Keep upload selection quota-aware across configured YouTube project slots.
+
+### Pipeline / Watch
+
+- Files: `novel_tts/pipeline/__init__.py`, `novel_tts/pipeline/watch.py`
+- Responsibilities:
+  - Watch one or more novels for new remote chapters.
+  - Orchestrate crawl -> queue translate -> repair -> polish -> downstream media/upload handoff.
+  - Support stage-window execution (`--from-stage` / `--to-stage`) and bootstrap runs for uncrawled novels.
 
 ### Common Utilities
 
@@ -265,6 +274,18 @@ If a change touches any of the above, you must **inspect and update all dependen
   - Expected presence of translated range file.
   - Menu file format (timestamps + labels).
   - FFmpeg filters and bitrate/tempo options.
+
+### 5. Adjust Glossary Repair or Pipeline Watch Behavior
+
+- Likely files:
+  - `novel_tts/translate/glossary_repair.py`
+  - `novel_tts/translate/glossary.py`
+  - `novel_tts/pipeline/watch.py`
+  - `novel_tts/cli/main.py`
+- Be careful about:
+  - queue job compatibility for glossary chunks
+  - preserving the target glossary file path and merge semantics
+  - keeping watch-stage ordering aligned with the CLI flags
 
 ---
 

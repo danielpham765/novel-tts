@@ -151,7 +151,7 @@ Dispatch only. Do not add business logic here unless argument parsing or orchest
 Current top-level command families include:
 
 - `crawl`, `translate`, `queue`
-- `background`
+- `background`, `glossary`
 - `tts`, `create-menu`, `visual`, `video`
 - `upload`, `youtube`
 - `pipeline`, `quota-supervisor`, `ai-key`
@@ -240,6 +240,7 @@ Important facts:
 - queue workers enable central quota for their translate subprocesses (`NOVEL_TTS_CENTRAL_QUOTA=1`, `GEMINI_REDIS_*`)
 - queue add supports `--repair-report` in addition to direct chapter/range selection
 - `queue repair` scans translated outputs and re-enqueues only suspicious chapters
+- glossary repair uses the queue stack for chunked glossary maintenance jobs
 - queue has a maintenance path to requeue exhausted-but-still-untranslated jobs
 
 Operator UX:
@@ -291,6 +292,17 @@ Important facts:
 - `create-menu` can rebuild chapter menu text without re-running TTS
 - `tts --re-generate-menu` preserves existing timestamps and refreshes labels from current translated text
 - upload includes both publish commands and YouTube admin/quota utilities from the same service module
+
+### Glossary Repair
+
+- `novel_tts/translate/glossary.py`
+- `novel_tts/translate/glossary_repair.py`
+
+Important facts:
+
+- `glossary repair` splits a glossary file into queue-driven chunk jobs
+- `glossary repair-merge` writes successful chunk outputs back into the target glossary file
+- this path is maintenance-oriented and should preserve the on-disk glossary contract
 
 ### AI Key Telemetry
 

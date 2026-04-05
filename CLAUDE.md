@@ -42,21 +42,33 @@ Source of truth: `docs/agents/context-map.yaml`
 
 1. **Crawl** → `input/<novel>/origin/*.txt`
 2. **Translate** → `input/<novel>/.parts/<batch>/<chapter>.txt` (canonical), rebuilt to `input/<novel>/translated/*.txt`
-3. **TTS** → `output/<novel>/audio/<range>/`
-4. **Visual** → `output/<novel>/visual/`
-5. **Video** (mux) → `output/<novel>/video/`
-6. **Upload** → YouTube (real) or TikTok (dry-run)
+3. **Queue / quota** → Redis-backed job + quota bookkeeping only; translated text still lives on disk
+4. **TTS** → `output/<novel>/audio/<range>/`
+5. **Visual** → `output/<novel>/visual/`
+6. **Video** (mux) → `output/<novel>/video/`
+7. **Upload** → YouTube (real) or TikTok (dry-run)
+
+Top-level CLI command families currently include:
+
+- `crawl`, `translate`, `queue`, `background`, `tts`, `create-menu`, `visual`, `video`
+- `upload`, `youtube`, `pipeline`, `glossary`, `quota-supervisor`, `ai-key`
 
 ### Config assembly
 
 `novel_tts.config.loader.load_novel_config()` merges:
-- `configs/novels/<novel_id>.json` (required root)
+- `configs/novels/<novel_id>.yaml` (required root)
 - `configs/sources/<source_id>.json`
-- `configs/app.yaml` (app-level defaults)
+- `configs/app.yaml` + optional `configs/app.local.yaml`
 - `configs/glossaries/<novel_id>/glossary.json`
 - `configs/polish_replacement/common.json` + `configs/polish_replacement/<novel_id>.json`
+- selected environment variables
 
 Result is a typed `NovelConfig` dataclass graph (`novel_tts/config/models.py`).
+
+Important runtime sections:
+
+- `storage`, `crawl`, `models`, `translation`, `captions`, `queue`
+- `tts`, `media`, `upload`, `pipeline`, `proxy_gateway`
 
 ### Translation truth and `.parts` canonical state
 
@@ -84,6 +96,7 @@ Changing heading formats cascades to: chapter splitting, translated rebuild, TTS
 | queue | `novel_tts/queue/translation_queue.py`, `novel_tts/translate/novel.py` |
 | tts | `novel_tts/tts/service.py`, `novel_tts/tts/providers.py` |
 | media/upload | `novel_tts/media/service.py`, `novel_tts/upload/service.py` |
+| glossary/pipeline | `novel_tts/translate/glossary.py`, `novel_tts/pipeline/watch.py` |
 | config/CLI wiring | `novel_tts/config/loader.py`, `novel_tts/config/models.py`, `novel_tts/cli/main.py` |
 
 Large files to load only when the bug clearly points there: `novel_tts/cli/main.py`, `novel_tts/translate/novel.py`, `novel_tts/queue/translation_queue.py`, `novel_tts/config/loader.py`.

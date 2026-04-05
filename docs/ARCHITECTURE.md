@@ -94,6 +94,7 @@ Current top-level command families:
 - `translate`
 - `queue`
 - `background`
+- `glossary`
 - `tts`
 - `create-menu`
 - `visual`
@@ -108,7 +109,9 @@ Important subcommands:
 
 - `crawl run`, `crawl verify`, `crawl repair`
 - `translate novel`, `translate chapter`, `translate polish`, `translate captions`
-- `queue launch`, `queue add`, `queue worker`, `queue supervisor`, `queue monitor`, `queue ps`, `queue ps-all`, `queue repair`, `queue requeue-untranslated-exhausted`, `queue reset-key`, `queue stop`
+- `queue launch`, `queue add`, `queue remove`, `queue worker`, `queue supervisor`, `queue monitor`, `queue ps`, `queue ps-all`, `queue repair`, `queue requeue-untranslated-exhausted`, `queue reset-key`, `queue stop`
+- `background optimize`
+- `glossary repair`, `glossary repair-chunk`, `glossary repair-merge`, `glossary repair-status`
 - `create-menu`
 - `youtube playlist`, `youtube playlist update`, `youtube video`, `youtube video update`, `youtube quota`, `youtube quota capture`, `youtube quota redis`, `youtube all`
 - `pipeline run`
@@ -129,7 +132,8 @@ The loader merges:
 - `configs/novels/<novel_id>.yaml`
 - `configs/sources/<source_id>.json`
 - `configs/app.yaml`
-- `configs/glossaries/<novel_id>.json` or an explicit glossary file
+- optional `configs/app.local.yaml`
+- `configs/glossaries/<novel_id>/glossary.json` or an explicit glossary file
 - `configs/polish_replacement/common.json`
 - `configs/polish_replacement/<novel_id>.json`
 - selected environment variables
@@ -870,11 +874,18 @@ The same module also backs read/update admin commands:
 
 The `pipeline` commands are intentionally light orchestration, not a separate subsystem.
 
+Primary files:
+
+- `novel_tts/pipeline/__init__.py`
+- `novel_tts/pipeline/watch.py`
+
 It can:
 
 - crawl a range
 - launch queue translation for the requested chapter range and wait until it completes
 - resolve downstream media batch ranges from `media.media_batch`
+- run continuous serialized-novel polling via `pipeline watch`
+- optionally bootstrap a novel that has no local crawl artifacts yet
 - execute downstream media in one of two modes:
   - `per-stage`
   - `per-video`

@@ -467,6 +467,36 @@ Re-enqueues jobs that exhausted retries but still do not have valid translated o
 uv run novel-tts queue requeue-untranslated-exhausted <novel_id>
 ```
 
+#### `queue remove`
+
+Removes pending jobs from Redis without touching inflight work or on-disk translations.
+
+```bash
+uv run novel-tts queue remove <novel_id> --range 1401-1410
+uv run novel-tts queue remove <novel_id> --chapters 1205,1214
+uv run novel-tts queue remove <novel_id> --all
+```
+
+### Glossary
+
+Glossary repair is a queue-backed maintenance workflow for cleaning or rebuilding large glossary files in chunks.
+
+Typical flow:
+
+1. enqueue chunk jobs with `glossary repair`
+2. inspect progress with `glossary repair-status`
+3. merge completed chunk outputs back with `glossary repair-merge`
+
+By default it uses the novel glossary from `translation.glossary_file` or `configs/glossaries/<novel_id>/glossary.json`. Use `--glossary-file` to target another file such as an auto glossary.
+
+```bash
+uv run novel-tts glossary repair <novel_id>
+uv run novel-tts glossary repair <novel_id> --chunk-size 200 --force
+uv run novel-tts glossary repair-status <novel_id>
+uv run novel-tts glossary repair-merge <novel_id>
+uv run novel-tts glossary repair-merge <novel_id> --dry-run
+```
+
 ### AI key telemetry
 
 Reads `.secrets/gemini-keys.txt` and inspects Redis metrics emitted by queue workers.
