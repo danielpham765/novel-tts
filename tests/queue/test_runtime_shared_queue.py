@@ -69,6 +69,18 @@ class _NovelCountsRedis:
         return {}
 
 
+class _LaunchQueueRedis:
+    def __init__(self, ack_raw: str) -> None:
+        self.ack_raw = ack_raw
+        self.requests: list[tuple[str, str]] = []
+
+    def rpush(self, key: str, payload: str) -> None:
+        self.requests.append((key, payload))
+
+    def get(self, key: str):
+        return self.ack_raw
+
+
 def test_queue_remove_all_only_removes_selected_novel_jobs(monkeypatch, capsys) -> None:
     config = load_novel_config("tram-than")
     other_novel = "vo-cuc-thien-ton"
@@ -194,3 +206,57 @@ def test_reap_workers_stops_out_of_range_and_excess(monkeypatch) -> None:
 
     assert killed_count == 2
     assert set(killed) == {"19625", "19627"}
+
+
+def test_ps_all_renders_empty_table_when_no_processes(monkeypatch, capsys) -> None:
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:3] == ["ps", "ax", "-o"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess.run: {cmd}")
+
+    monkeypatch.setattr(translation_queue.subprocess, "run", fake_run)
+    monkeypatch.setattr(translation_queue, "_client", lambda _config: (_ for _ in ()).throw(RuntimeError("no redis")))
+
+    rc = translation_queue.list_all_queue_processes(include_all=True)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Queue: pending=0 queued=0 inflight=0" in out
+    assert "No queue processes found" in out
+    assert "PID" in out
+    assert "ROLE" in out
+
+
+def test_queue_launch_continues_when_logrotate_ack_fails(monkeypatch, capsys, tmp_path) -> None:
+    config = load_novel_config("tram-than")
+    client = _LaunchQueueRedis(
+        ack_raw='{"ok": false, "cmd": "rotate_queue_logs", "novel_id": "", "rotated": 0, "request_id": "abc", "ts": 1.0}'
+    )
+    spawned: list[tuple[list[str], str]] = []
+    rotated: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(translation_queue, "_client", lambda _config: client)
+    monkeypatch.setattr(translation_queue, "_load_keys", lambda _config: ["k1"])
+    monkeypatch.setattr(translation_queue, "_effective_worker_key_limit", lambda _config, total_keys: (1, ""))
+    monkeypatch.setattr(translation_queue, "_clear_stopping", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(translation_queue, "_requeue_stale_inflight", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(translation_queue, "_shared_queue_log_dir", lambda: tmp_path / "_shared" / "queue")
+    monkeypatch.setattr(
+        translation_queue.logrotate,
+        "rotate_log_file_to_today",
+        lambda *, logs_root, src: rotated.append((str(logs_root), str(src))) or src,
+    )
+    monkeypatch.setattr(translation_queue.os, "walk", lambda _root: [(str(tmp_path / "_shared" / "queue"), [], ["supervisor.log"])])
+    monkeypatch.setattr(
+        translation_queue,
+        "_spawn_process",
+        lambda cmd, log_path, cwd: spawned.append((cmd, str(log_path))) or (1000 + len(spawned)),
+    )
+
+    rc = translation_queue.launch_queue_stack(config, restart=False)
+
+    assert rc == 0
+    assert len(spawned) == 2
+    assert rotated
+    err = capsys.readouterr().err
+    assert "continuing with local fallback" in err

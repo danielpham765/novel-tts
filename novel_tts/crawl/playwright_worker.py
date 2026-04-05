@@ -1,11 +1,35 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 _ATTACHED_WORKER_NAME = "novel-tts-watch-worker"
+_CHALLENGE_TITLE_TOKENS = ("just a moment", "chờ một chút")
+_CHALLENGE_BODY_TOKENS = (
+    "verify you are human",
+    "performing security verification",
+    "enable javascript and cookies",
+    "xác minh bạn không phải là bot",
+    "网络错误,请点击刷新按钮重试",
+)
+_RATE_LIMIT_TITLE_TOKENS = (
+    "error 1015",
+    "access denied",
+    "出错了",
+)
+_RATE_LIMIT_BODY_TOKENS = (
+    "you are being rate limited",
+    "banned you temporarily",
+    "temporarily from accessing this website",
+    "访问太频繁了",
+    "请30秒过后刷新重试",
+)
 
 
 def _emit(payload: dict[str, object], *, code: int = 0) -> int:
@@ -38,6 +62,86 @@ def _browser_executable_candidates(explicit_path: str) -> list[str]:
         if candidate not in items and Path(candidate).exists():
             items.append(candidate)
     return items
+
+
+def _resolve_browser_executable(explicit_path: str) -> str:
+    for candidate in _browser_executable_candidates(explicit_path):
+        path = Path(candidate)
+        if path.exists():
+            return str(path)
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return ""
+
+
+def _default_debug_user_data_dir() -> str:
+    path = Path.home() / ".novel_tts_chrome_debug"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _ensure_debug_browser_running(
+    remote_debugging_url: str,
+    *,
+    executable_path: str,
+    user_data_dir: str,
+    profile_directory: str,
+) -> subprocess.Popen | None:
+    parsed = urlparse(remote_debugging_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 9222
+    probe_url = f"http://{host}:{port}/json/version"
+
+    try:
+        with urlopen(probe_url, timeout=2):
+            return None
+    except Exception:
+        pass
+
+    binary = _resolve_browser_executable(executable_path)
+    if not binary:
+        return None
+
+    launch_user_data_dir = str(user_data_dir or "").strip() or _default_debug_user_data_dir()
+    cmd = [
+        binary,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={launch_user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+    ]
+    if profile_directory:
+        cmd.append(f"--profile-directory={profile_directory}")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        try:
+            with urlopen(probe_url, timeout=1):
+                return proc
+        except Exception:
+            time.sleep(0.5)
+    return proc
+
+
+def _classify_blocked_page(html: str, title: str) -> str:
+    lower_title = str(title or "").lower()
+    lower_html = str(html or "").lower()
+    if any(token in lower_title for token in _RATE_LIMIT_TITLE_TOKENS):
+        return "rate_limited"
+    if any(token in lower_html for token in _RATE_LIMIT_BODY_TOKENS):
+        return "rate_limited"
+    if any(token in lower_title for token in _CHALLENGE_TITLE_TOKENS):
+        return "challenge"
+    if any(token in lower_html for token in _CHALLENGE_BODY_TOKENS):
+        return "challenge"
+    return ""
 
 
 def _expand_directory(page, candidates: list[str], stabilize_wait_ms: int) -> None:
@@ -81,6 +185,7 @@ def _connect_or_launch(playwright, browser_config: dict[str, object], *, allow_f
     remote_debugging_url = str(browser_config.get("remote_debugging_url", "") or "").strip()
     executable_path = str(browser_config.get("executable_path", "") or "").strip()
     user_data_dir = str(browser_config.get("user_data_dir", "") or "").strip()
+    profile_directory = str(browser_config.get("profile_directory", "") or "").strip()
     headless = bool(browser_config.get("headless", False))
     browser_proxy_server = str(browser_config.get("proxy_server", "") or "").strip()
 
@@ -92,6 +197,20 @@ def _connect_or_launch(playwright, browser_config: dict[str, object], *, allow_f
             mode_used = "debug-attach:new-tab" if created else "debug-attach:reuse-tab"
             return browser, context, page, mode_used
         except Exception as exc:
+            _ensure_debug_browser_running(
+                remote_debugging_url,
+                executable_path=executable_path,
+                user_data_dir=user_data_dir,
+                profile_directory=profile_directory,
+            )
+            try:
+                browser = playwright.chromium.connect_over_cdp(remote_debugging_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page, created = _find_or_create_attached_page(context)
+                mode_used = "debug-attach:new-tab" if created else "debug-attach:reuse-tab"
+                return browser, context, page, mode_used
+            except Exception:
+                pass
             if not allow_fallback:
                 raise
             fallback_reason = str(exc)
@@ -143,6 +262,8 @@ def _handle_fetch(payload: dict[str, object]) -> int:
     stabilize_wait_ms = int(payload.get("stabilize_wait_ms", 5000))
     screenshot_path = str(payload.get("screenshot_path", "") or "").strip()
     expand_text_candidates = [str(item) for item in (payload.get("expand_text_candidates", []) or [])]
+    challenge_wait_timeout_ms = int(payload.get("challenge_wait_timeout_ms", 0) or 0)
+    challenge_poll_interval_ms = int(payload.get("challenge_poll_interval_ms", 1000) or 1000)
     browser_config = dict(payload.get("browser_config", {}) or {})
     allow_fallback = bool(payload.get("allow_fallback", True))
 
@@ -158,6 +279,14 @@ def _handle_fetch(payload: dict[str, object]) -> int:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_timeout(stabilize_wait_ms)
         _expand_directory(page, expand_text_candidates, stabilize_wait_ms)
+        if challenge_wait_timeout_ms > 0 and str(mode_used).startswith("debug-attach:"):
+            deadline = time.time() + (challenge_wait_timeout_ms / 1000.0)
+            while time.time() < deadline:
+                html = page.content()
+                title = page.title()
+                if not _classify_blocked_page(html, title):
+                    break
+                page.wait_for_timeout(challenge_poll_interval_ms)
         if screenshot_path:
             path = Path(screenshot_path)
             path.parent.mkdir(parents=True, exist_ok=True)

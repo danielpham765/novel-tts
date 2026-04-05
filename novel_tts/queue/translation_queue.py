@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from novel_tts.common import logrotate
 from novel_tts.common.logging import get_logger, get_novel_log_path
 from novel_tts.config.models import NovelConfig, QueueConfig, RedisConfig
 from novel_tts.key_identity import build_global_key_prefix, build_key_prefix
@@ -4057,7 +4058,8 @@ def launch_queue_stack(config: NovelConfig | QueueConfig, restart: bool = False,
     _clear_stopping(config, client)
     _requeue_stale_inflight(config, client)
 
-    # Ask the global quota-supervisor to rotate queue logs.
+    # Ask the global quota-supervisor to rotate queue logs. If that control-plane request fails,
+    # fall back to a local best-effort rotation so queue launch itself is not blocked by log upkeep.
     requests_key = f"{prefix}:logrotate:requests"
     request_id = uuid.uuid4().hex
     reply_key = f"{prefix}:logrotate:reply:{request_id}"
@@ -4071,35 +4073,53 @@ def launch_queue_stack(config: NovelConfig | QueueConfig, restart: bool = False,
         },
         ensure_ascii=False,
     )
+    rotate_warning: str | None = None
     try:
         client.rpush(requests_key, payload)
     except Exception as exc:
-        print(f"queue launch: unable to send logrotate request to quota-supervisor: {exc}", file=sys.stderr)
-        print("queue launch: please run `uv run novel-tts quota-supervisor` first", file=sys.stderr)
-        return 1
+        rotate_warning = f"queue launch: unable to send logrotate request to quota-supervisor: {exc}"
+    else:
+        deadline = time.time() + 5.0
+        ack_raw = ""
+        while time.time() < deadline:
+            try:
+                ack_raw = str(client.get(reply_key) or "").strip()
+            except Exception:
+                ack_raw = ""
+            if ack_raw:
+                break
+            time.sleep(0.05)
+        if not ack_raw:
+            rotate_warning = "queue launch: logrotate ack timeout (continuing with local fallback)"
+        else:
+            try:
+                ack = json.loads(ack_raw)
+            except Exception:
+                ack = {}
+            ok = bool(ack.get("ok")) if isinstance(ack, dict) else False
+            if not ok:
+                rotate_warning = f"queue launch: logrotate failed (ack={ack_raw!r}); continuing with local fallback"
 
-    deadline = time.time() + 5.0
-    ack_raw = ""
-    while time.time() < deadline:
+    if rotate_warning:
+        print(rotate_warning, file=sys.stderr)
         try:
-            ack_raw = str(client.get(reply_key) or "").strip()
-        except Exception:
-            ack_raw = ""
-        if ack_raw:
-            break
-        time.sleep(0.05)
-    if not ack_raw:
-        print("queue launch: logrotate ack timeout (quota-supervisor may not be running)", file=sys.stderr)
-        print("queue launch: please run `uv run novel-tts quota-supervisor` first", file=sys.stderr)
-        return 1
-    try:
-        ack = json.loads(ack_raw)
-    except Exception:
-        ack = {}
-    ok = bool(ack.get("ok")) if isinstance(ack, dict) else False
-    if not ok:
-        print(f"queue launch: logrotate failed (ack={ack_raw!r})", file=sys.stderr)
-        return 1
+            queue_log_root = _shared_queue_log_dir()
+            rotated = 0
+            for root, _dirs, files in os.walk(queue_log_root):
+                root_path = Path(root)
+                for name in files:
+                    if not name.endswith(".log"):
+                        continue
+                    moved = logrotate.rotate_log_file_to_today(
+                        logs_root=queue_log_root.parents[1],
+                        src=root_path / name,
+                    )
+                    if moved is not None:
+                        rotated += 1
+            LOGGER.warning("Queue launch used local logrotate fallback | rotated=%s warning=%s", rotated, rotate_warning)
+        except Exception as exc:
+            LOGGER.warning("Queue launch local logrotate fallback failed: %s", exc)
+            print(f"queue launch: local logrotate fallback failed: {exc}", file=sys.stderr)
 
     log_dir = _shared_queue_log_dir()
     supervisor_log = log_dir / "supervisor.log"
@@ -4434,6 +4454,11 @@ def _render_queue_table(rows: list[dict[str, str]], *, target_count: int, root: 
     print(_hr())
 
 
+def _render_empty_queue_table(*, root: Path | None = None) -> None:
+    del root
+    _render_queue_table([], target_count=0)
+
+
 def _sort_queue_rows(rows: list[dict[str, str]]) -> None:
     def _role_rank(role: str) -> int:
         order = {
@@ -4636,6 +4661,7 @@ def list_queue_processes(config: NovelConfig, include_all: bool = False) -> int:
     ]
     if not rows:
         print(f"No queue processes found for novel {config.novel_id}")
+        _render_empty_queue_table(root=config.storage.root)
         return 0
 
     _enrich_translate_chapter_meta(rows, ppid_by_pid=ppid_by_pid, worker_meta_by_pid=worker_meta_by_pid)
@@ -4764,6 +4790,7 @@ def list_all_queue_processes(include_all: bool = False) -> int:
 
     if not all_rows:
         print("No queue processes found")
+        _render_empty_queue_table()
         return 0
 
     # --- Single unified worker table ---

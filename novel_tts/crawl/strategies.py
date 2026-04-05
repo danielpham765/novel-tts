@@ -898,6 +898,8 @@ class BrowserFetchStrategy(FetchStrategy):
                         "url": url,
                         "timeout_ms": timeout_seconds * 1000,
                         "stabilize_wait_ms": self._stabilize_wait_ms,
+                        "challenge_wait_timeout_ms": timeout_seconds * 1000,
+                        "challenge_poll_interval_ms": 1000,
                         "screenshot_path": str(screenshot_path),
                         "expand_text_candidates": list(self._expand_text_candidates),
                         "allow_fallback": True,

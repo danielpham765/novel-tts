@@ -17,8 +17,8 @@
       "remote_debugging_url": "http://127.0.0.1:9222",
       "remote_debugging_port": 9222,
       "executable_path": "",
-      "user_data_dir": "",
-      "profile_directory": "",
+      "user_data_dir": "tmp/chrome-ttkan",
+      "profile_directory": "Default",
       "headless": false,
       "debug_image_dir": "debug/img"
     }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -12,7 +13,7 @@ import redis
 import requests
 
 from novel_tts.common import logrotate
-from novel_tts.config.loader import _load_app_config, load_novel_config
+from novel_tts.config.loader import _load_app_config, load_novel_config, load_queue_config
 from novel_tts.config.models import ProxyGatewayConfig
 from novel_tts.quota import keys as quota_keys
 from novel_tts.quota.lua_scripts import TRY_GRANT_LUA
@@ -189,9 +190,9 @@ def _client(cfg: RedisCfg) -> redis.Redis:
 
 
 def _parse_alloc_queue_key(key: str) -> tuple[str, str, str] | None:
-    # Expected: {prefix}:{novel_id}:{key_token}:{model}:quota:alloc:queue
+    # Expected shared format: {prefix}:{key_token}:{model}:quota:alloc:queue
     parts = [p for p in str(key).split(":") if p]
-    if len(parts) < 7:
+    if len(parts) != 6:
         return None
     if parts[-3:] != ["quota", "alloc", "queue"]:
         return None
@@ -199,14 +200,17 @@ def _parse_alloc_queue_key(key: str) -> tuple[str, str, str] | None:
     if not key_prefix:
         return None
     model = parts[-4]
-    novel_id = parts[-6]
+    novel_id = "__shared__"
     return novel_id, key_prefix, model
 
 
 @lru_cache(maxsize=256)
 def _model_limits_for(novel_id: str, model: str) -> tuple[int, int, int]:
-    config = load_novel_config(novel_id)
-    cfg = config.queue.model_configs.get(model)
+    if novel_id == "__shared__":
+        cfg = load_queue_config().model_configs.get(model)
+    else:
+        config = load_novel_config(novel_id)
+        cfg = config.queue.model_configs.get(model)
     if cfg is None:
         return 0, 0, 0
     return int(cfg.rpm_limit or 0), int(cfg.tpm_limit or 0), int(cfg.rpd_limit or 0)
@@ -382,7 +386,7 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
     client = _client(cfg)
     proxy_cfg = _load_proxy_gateway_cfg()
 
-    pattern = f"{cfg.prefix}:*:*:*:quota:alloc:queue"
+    pattern = f"{cfg.prefix}:*:*:quota:alloc:queue"
     rotate_requests_key = f"{cfg.prefix}:logrotate:requests"
     LOGGER.info(
         "quota-supervisor started | redis=%s:%s db=%s prefix=%s pattern=%s",
@@ -489,6 +493,34 @@ def run_quota_supervisor(*, poll_interval_seconds: float = 0.05) -> int:
                             "logrotate request failed | request_id=%s novel=%s err=%s",
                             request_id,
                             novel_id,
+                            exc,
+                        )
+                        ok = False
+                elif cmd == "rotate_queue_logs":
+                    try:
+                        queue_log_root = logs_root / "_shared" / "queue"
+                        rotated = 0
+                        for root, _dirs, files in os.walk(queue_log_root):
+                            root_path = Path(root)
+                            for name in files:
+                                if not name.endswith(".log"):
+                                    continue
+                                moved = logrotate.rotate_log_file_to_today(
+                                    logs_root=logs_root,
+                                    src=root_path / name,
+                                )
+                                if moved is not None:
+                                    rotated += 1
+                        ok = True
+                        LOGGER.info(
+                            "logrotate queue request ok | request_id=%s rotated=%s",
+                            request_id,
+                            rotated,
+                        )
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "logrotate queue request failed | request_id=%s err=%s",
+                            request_id,
                             exc,
                         )
                         ok = False

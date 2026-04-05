@@ -154,6 +154,12 @@ class GradioTtsProvider:
         return self.model_config.as_gradio_payload()
 
     @staticmethod
+    def _client_httpx_kwargs() -> dict[str, object]:
+        # Keep Gradio bootstrap traffic independent from ambient proxy env so
+        # local/LAN TTS servers behave the same across shells and uv re-execs.
+        return {"trust_env": False}
+
+    @staticmethod
     def _normalize_generation_mode(value: object) -> str:
         text = str(value or "").strip()
         normalized = text.casefold()
@@ -184,7 +190,12 @@ class GradioTtsProvider:
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return Client(self.server_url, verbose=False, download_files=False)
+                return Client(
+                    self.server_url,
+                    verbose=False,
+                    download_files=False,
+                    httpx_kwargs=self._client_httpx_kwargs(),
+                )
             except (httpx.ConnectError, httpcore.ConnectError, OSError) as exc:
                 last_exc = exc
                 debug_snapshot = _network_debug_snapshot(self.server_url)
